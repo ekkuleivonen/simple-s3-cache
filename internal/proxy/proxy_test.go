@@ -197,6 +197,97 @@ func TestProxyReSignsInsteadOfForwardingClientSigV4Headers(t *testing.T) {
 	}
 }
 
+func TestProxyForwardsStreamingPutBodyWithContentLength(t *testing.T) {
+	body := []byte("streamed through chunked transfer encoding")
+	var gotBody []byte
+	var gotContentLength int64
+	var gotTransferEncoding []string
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var err error
+		gotContentLength = r.ContentLength
+		gotTransferEncoding = append([]string(nil), r.TransferEncoding...)
+		gotBody, err = io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read upstream body: %v", err)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	p := testProxy(t, upstream.URL)
+	req := httptest.NewRequest(http.MethodPut, "/bucket/chunked.bin", newChunkedTestReader(
+		[]byte("streamed "),
+		[]byte("through "),
+		[]byte("chunked transfer encoding"),
+	))
+	rec := httptest.NewRecorder()
+
+	p.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%q", rec.Code, rec.Body.String())
+	}
+	if !bytes.Equal(gotBody, body) {
+		t.Fatalf("upstream body = %q, want %q", gotBody, body)
+	}
+	if gotContentLength != int64(len(body)) {
+		t.Fatalf("upstream ContentLength = %d, want %d", gotContentLength, len(body))
+	}
+	if len(gotTransferEncoding) != 0 {
+		t.Fatalf("upstream TransferEncoding = %q, want none after proxy frames body", gotTransferEncoding)
+	}
+}
+
+func TestProxyDecodesAWSChunkedPutBodyBeforeResigning(t *testing.T) {
+	body := []byte("decoded aws chunked payload")
+	var gotBody []byte
+	var gotContentEncoding string
+	var gotDecodedContentLength string
+	var gotContentSHA256 string
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var err error
+		gotContentEncoding = r.Header.Get("Content-Encoding")
+		gotDecodedContentLength = r.Header.Get("X-Amz-Decoded-Content-Length")
+		gotContentSHA256 = r.Header.Get("X-Amz-Content-Sha256")
+		gotBody, err = io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read upstream body: %v", err)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	p := testProxy(t, upstream.URL)
+	req := httptest.NewRequest(http.MethodPut, "/bucket/aws-chunked.bin", bytes.NewReader(awsChunkedBody(
+		[]byte("decoded aws "),
+		[]byte("chunked payload"),
+	)))
+	req.Header.Set("Content-Encoding", "aws-chunked")
+	req.Header.Set("X-Amz-Decoded-Content-Length", strconv.Itoa(len(body)))
+	req.Header.Set("X-Amz-Content-Sha256", "STREAMING-AWS4-HMAC-SHA256-PAYLOAD")
+	rec := httptest.NewRecorder()
+
+	p.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%q", rec.Code, rec.Body.String())
+	}
+	if !bytes.Equal(gotBody, body) {
+		t.Fatalf("upstream body = %q, want %q", gotBody, body)
+	}
+	if gotContentEncoding != "" {
+		t.Fatalf("upstream Content-Encoding = %q, want empty", gotContentEncoding)
+	}
+	if gotDecodedContentLength != "" {
+		t.Fatalf("upstream X-Amz-Decoded-Content-Length = %q, want empty", gotDecodedContentLength)
+	}
+	if gotContentSHA256 != unsignedPayload {
+		t.Fatalf("upstream X-Amz-Content-Sha256 = %q, want %q", gotContentSHA256, unsignedPayload)
+	}
+}
+
 func TestProxyCachesHeadMetadata(t *testing.T) {
 	var upstreamRequests int
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1269,4 +1360,35 @@ func writeObjectResponse(t *testing.T, w http.ResponseWriter, r *http.Request, b
 	default:
 		t.Fatalf("unexpected upstream range %q", r.Header.Get("Range"))
 	}
+}
+
+type chunkedTestReader struct {
+	chunks [][]byte
+}
+
+func newChunkedTestReader(chunks ...[]byte) *chunkedTestReader {
+	return &chunkedTestReader{chunks: chunks}
+}
+
+func (r *chunkedTestReader) Read(p []byte) (int, error) {
+	if len(r.chunks) == 0 {
+		return 0, io.EOF
+	}
+	n := copy(p, r.chunks[0])
+	r.chunks[0] = r.chunks[0][n:]
+	if len(r.chunks[0]) == 0 {
+		r.chunks = r.chunks[1:]
+	}
+	return n, nil
+}
+
+func awsChunkedBody(chunks ...[]byte) []byte {
+	var body bytes.Buffer
+	for _, chunk := range chunks {
+		_, _ = fmt.Fprintf(&body, "%x;chunk-signature=%064x\r\n", len(chunk), 0)
+		_, _ = body.Write(chunk)
+		_, _ = body.WriteString("\r\n")
+	}
+	_, _ = body.WriteString("0;chunk-signature=0000000000000000000000000000000000000000000000000000000000000000\r\n\r\n")
+	return body.Bytes()
 }

@@ -967,13 +967,13 @@ Cover:
   - [x] add health endpoint
   - [x] add basic request logging
 
-- [ ] **Milestone 2: Pass-Through Proxy**
+- [x] **Milestone 2: Pass-Through Proxy**
   - [x] parse path-style S3 requests
   - [x] classify requests; pass through GET subresources and `?versionId`
   - [x] sign upstream requests
-  - [ ] forward all methods to upstream, including streaming/chunked PUT bodies
+  - [x] forward all methods to upstream, including streaming/chunked PUT bodies
   - [x] preserve response status, headers, and bodies
-  - [ ] add integration test with local S3-compatible backend
+  - [x] add integration test with local S3-compatible backend
 
 - [x] **Milestone 3: Page Cache Core**
   - [x] add SQLite cache index

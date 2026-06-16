@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -8,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -224,18 +226,49 @@ func (p *Proxy) handle(w http.ResponseWriter, r *http.Request, target s3request.
 
 func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, stats *requestStats) (int, int64, error) {
 	upstreamURL := p.upstreamURL(r)
-	req, err := http.NewRequestWithContext(r.Context(), r.Method, upstreamURL.String(), r.Body)
+	body, contentLength, getBody, cleanup, decodedAWSChunked, err := forwardBody(r)
+	if cleanup != nil {
+		defer cleanup()
+	}
+	if err != nil {
+		http.Error(w, "prepare upstream request body", http.StatusBadGateway)
+		return 0, 0, err
+	}
+
+	req, err := http.NewRequestWithContext(r.Context(), r.Method, upstreamURL.String(), body)
 	if err != nil {
 		http.Error(w, "build upstream request", http.StatusInternalServerError)
 		return 0, 0, err
 	}
-	req.ContentLength = r.ContentLength
+	req.ContentLength = contentLength
+	req.GetBody = getBody
 	copyRequestHeaders(req.Header, r.Header)
+	if decodedAWSChunked {
+		removeAWSChunkedHeaders(req.Header)
+	}
 	req.Header.Set("X-Amz-Content-Sha256", unsignedPayload)
 
 	if err := p.sign(req); err != nil {
 		http.Error(w, "sign upstream request", http.StatusBadGateway)
 		return 0, 0, err
+	}
+	if getBody != nil {
+		if req.Body != nil {
+			_ = req.Body.Close()
+		}
+		req.Body, err = getBody()
+		if err != nil {
+			http.Error(w, "prepare upstream request body", http.StatusBadGateway)
+			return 0, 0, err
+		}
+		if seeker, ok := req.Body.(io.Seeker); ok {
+			if _, err := seeker.Seek(0, io.SeekStart); err != nil {
+				http.Error(w, "prepare upstream request body", http.StatusBadGateway)
+				return 0, 0, err
+			}
+		}
+		req.ContentLength = contentLength
+		req.GetBody = getBody
 	}
 
 	start := time.Now()
@@ -264,6 +297,131 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, stats *requestSt
 	}
 
 	return resp.StatusCode, bytesWritten, nil
+}
+
+func forwardBody(r *http.Request) (io.Reader, int64, func() (io.ReadCloser, error), func(), bool, error) {
+	if r.Body == nil || r.Body == http.NoBody {
+		return nil, 0, nil, nil, false, nil
+	}
+	if isAWSChunked(r.Header) {
+		return spoolForwardBody(r.Body, decodeAWSChunkedBody, true)
+	}
+	if r.ContentLength >= 0 {
+		return r.Body, r.ContentLength, nil, nil, false, nil
+	}
+
+	return spoolForwardBody(r.Body, io.Copy, false)
+}
+
+func spoolForwardBody(src io.Reader, copyBody func(io.Writer, io.Reader) (int64, error), decodedAWSChunked bool) (io.Reader, int64, func() (io.ReadCloser, error), func(), bool, error) {
+	tmp, err := os.CreateTemp("", "simple-s3-cache-upload-*")
+	if err != nil {
+		return nil, 0, nil, nil, false, err
+	}
+	cleanup := func() {
+		name := tmp.Name()
+		_ = tmp.Close()
+		_ = os.Remove(name)
+	}
+
+	size, err := copyBody(tmp, src)
+	if err != nil {
+		cleanup()
+		return nil, 0, nil, nil, false, err
+	}
+	if _, err := tmp.Seek(0, io.SeekStart); err != nil {
+		cleanup()
+		return nil, 0, nil, nil, false, err
+	}
+	getBody := func() (io.ReadCloser, error) {
+		return io.NopCloser(io.NewSectionReader(tmp, 0, size)), nil
+	}
+
+	body := io.NopCloser(io.NewSectionReader(tmp, 0, size))
+	return body, size, getBody, cleanup, decodedAWSChunked, nil
+}
+
+func decodeAWSChunkedBody(dst io.Writer, src io.Reader) (int64, error) {
+	reader := bufio.NewReader(src)
+	var written int64
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			return written, err
+		}
+		line = strings.TrimSuffix(strings.TrimSuffix(line, "\n"), "\r")
+		sizeText, _, _ := strings.Cut(line, ";")
+		size, err := strconv.ParseInt(sizeText, 16, 64)
+		if err != nil {
+			return written, fmt.Errorf("parse aws-chunked size %q: %w", sizeText, err)
+		}
+		if size == 0 {
+			if err := discardAWSChunkedTrailers(reader); err != nil {
+				return written, err
+			}
+			return written, nil
+		}
+		n, err := io.CopyN(dst, reader, size)
+		written += n
+		if err != nil {
+			return written, err
+		}
+		if err := readCRLF(reader); err != nil {
+			return written, err
+		}
+	}
+}
+
+func discardAWSChunkedTrailers(reader *bufio.Reader) error {
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			return err
+		}
+		if line == "\r\n" || line == "\n" {
+			return nil
+		}
+	}
+}
+
+func readCRLF(reader *bufio.Reader) error {
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		return err
+	}
+	if line != "\r\n" {
+		return fmt.Errorf("invalid aws-chunked chunk terminator %q", line)
+	}
+	return nil
+}
+
+func isAWSChunked(header http.Header) bool {
+	for _, value := range header.Values("Content-Encoding") {
+		for _, part := range strings.Split(value, ",") {
+			if strings.EqualFold(strings.TrimSpace(part), "aws-chunked") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func removeAWSChunkedHeaders(header http.Header) {
+	var encodings []string
+	for _, value := range header.Values("Content-Encoding") {
+		for _, part := range strings.Split(value, ",") {
+			part = strings.TrimSpace(part)
+			if part != "" && !strings.EqualFold(part, "aws-chunked") {
+				encodings = append(encodings, part)
+			}
+		}
+	}
+	header.Del("Content-Encoding")
+	if len(encodings) > 0 {
+		header.Set("Content-Encoding", strings.Join(encodings, ", "))
+	}
+	header.Del("X-Amz-Decoded-Content-Length")
+	header.Del("X-Amz-Trailer")
 }
 
 func shouldInvalidateAfterWrite(r *http.Request, target s3request.Target) bool {

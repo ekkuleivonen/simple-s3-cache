@@ -6,6 +6,7 @@ import base64
 import concurrent.futures
 import datetime as dt
 import hashlib
+import http.client
 import os
 import sqlite3
 import urllib.error
@@ -57,6 +58,65 @@ def test_proxy_put_head_get_range_delete(cache_s3_client, s3_client, e2e_config,
     with pytest.raises(ClientError) as deleted:
         s3_client.head_object(Bucket=e2e_config.bucket, Key=object_key)
     assert _status(deleted.value) == 404
+
+
+def test_proxy_chunked_put_body_passes_through(cache_endpoint: str, s3_client, e2e_config) -> None:
+    key = f"{e2e_config.prefix}/objects/chunked-put.bin"
+    body = b"chunked put through simple-s3-cache\n" + bytes(range(64))
+    url = urllib.parse.urlsplit(_object_url(cache_endpoint, e2e_config.bucket, key))
+    assert url.scheme == "http"
+    assert url.hostname is not None
+
+    connection = http.client.HTTPConnection(url.hostname, url.port, timeout=10)
+    try:
+        connection.request(
+            "PUT",
+            url.path,
+            body=iter([body[:13], body[13:37], body[37:]]),
+            headers={"Content-Type": "application/octet-stream"},
+            encode_chunked=True,
+        )
+        response = connection.getresponse()
+        response_body = response.read()
+    finally:
+        connection.close()
+
+    assert 200 <= response.status < 300, response_body
+    stored = s3_client.get_object(Bucket=e2e_config.bucket, Key=key)
+    assert stored["Body"].read() == body
+    assert stored["ContentType"] == "application/octet-stream"
+
+
+def test_proxy_aws_chunked_put_body_is_decoded_before_upstream(cache_endpoint: str, s3_client, e2e_config) -> None:
+    key = f"{e2e_config.prefix}/objects/aws-chunked-put.bin"
+    body = b"aws chunked put through simple-s3-cache\n" + bytes(range(64))
+    encoded = _aws_chunked_body(body[:17], body[17:43], body[43:])
+    url = urllib.parse.urlsplit(_object_url(cache_endpoint, e2e_config.bucket, key))
+    assert url.scheme == "http"
+    assert url.hostname is not None
+
+    connection = http.client.HTTPConnection(url.hostname, url.port, timeout=10)
+    try:
+        connection.request(
+            "PUT",
+            url.path,
+            body=encoded,
+            headers={
+                "Content-Encoding": "aws-chunked",
+                "Content-Type": "application/octet-stream",
+                "X-Amz-Content-Sha256": "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+                "X-Amz-Decoded-Content-Length": str(len(body)),
+            },
+        )
+        response = connection.getresponse()
+        response_body = response.read()
+    finally:
+        connection.close()
+
+    assert 200 <= response.status < 300, response_body
+    stored = s3_client.get_object(Bucket=e2e_config.bucket, Key=key)
+    assert stored["Body"].read() == body
+    assert stored["ContentType"] == "application/octet-stream"
 
 
 def test_proxy_full_get_round_trips_large_object(cache_s3_client, s3_client, e2e_config, object_key: str) -> None:
@@ -336,7 +396,12 @@ def test_proxy_sse_c_requests_pass_through(cache_s3_client, s3_client, e2e_confi
     assert response["Body"].read() == body
 
 
-def test_proxy_conditional_get_if_none_match_passes_through(cache_s3_client, s3_client, e2e_config, object_key: str) -> None:
+def test_proxy_conditional_get_if_none_match_uses_cached_metadata(
+    cache_s3_client,
+    s3_client,
+    e2e_config,
+    object_key: str,
+) -> None:
     old_body = b"old conditional"
     new_body = b"new conditional"
     s3_client.put_object(Bucket=e2e_config.bucket, Key=object_key, Body=old_body)
@@ -344,9 +409,9 @@ def test_proxy_conditional_get_if_none_match_passes_through(cache_s3_client, s3_
     assert cache_s3_client.get_object(Bucket=e2e_config.bucket, Key=object_key)["Body"].read() == old_body
     s3_client.put_object(Bucket=e2e_config.bucket, Key=object_key, Body=new_body)
 
-    response = cache_s3_client.get_object(Bucket=e2e_config.bucket, Key=object_key, IfNoneMatch=old_etag)
-
-    assert response["Body"].read() == new_body
+    with pytest.raises(ClientError) as not_modified:
+        cache_s3_client.get_object(Bucket=e2e_config.bucket, Key=object_key, IfNoneMatch=old_etag)
+    assert _status(not_modified.value) == 304
 
 
 def test_proxy_conditional_get_if_modified_since_matches_backend(
@@ -502,6 +567,16 @@ def _object_url(endpoint: str, bucket: str, key: str) -> str:
         + "/"
         + urllib.parse.quote(key, safe="/")
     )
+
+
+def _aws_chunked_body(*chunks: bytes) -> bytes:
+    body = bytearray()
+    for chunk in chunks:
+        body.extend(f"{len(chunk):x};chunk-signature={'0' * 64}\r\n".encode("ascii"))
+        body.extend(chunk)
+        body.extend(b"\r\n")
+    body.extend(b"0;chunk-signature=0000000000000000000000000000000000000000000000000000000000000000\r\n\r\n")
+    return bytes(body)
 
 
 def _first_cached_page_path(db_path: Path, cache_path: Path) -> Path:
