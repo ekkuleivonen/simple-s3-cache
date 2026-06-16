@@ -567,7 +567,7 @@ func (c *Cache) OpenPage(ctx context.Context, objectID string, index int64, expe
 	}
 	if page.ETag != expectedETag || page.Epoch != expectedEpoch {
 		bucket, _ := c.pageBucket(ctx, objectID)
-		deleted, deleteErr := c.deletePage(ctx, objectID, index)
+		deleted, deleteErr := c.deletePageIfCurrent(ctx, page)
 		if deleteErr != nil {
 			return nil, false, deleteErr
 		}
@@ -1197,6 +1197,26 @@ WHERE object_id = ? AND page_index = ?
 
 func (c *Cache) deletePage(ctx context.Context, objectID string, index int64) (bool, error) {
 	result, err := c.execWrite(ctx, `DELETE FROM pages WHERE object_id = ? AND page_index = ?`, objectID, index)
+	if err != nil {
+		return false, fmt.Errorf("delete stale page row: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("read deleted page count: %w", err)
+	}
+	return rows > 0, nil
+}
+
+func (c *Cache) deletePageIfCurrent(ctx context.Context, page Page) (bool, error) {
+	result, err := c.execWrite(ctx, `
+DELETE FROM pages
+WHERE object_id = ?
+	AND page_index = ?
+	AND etag = ?
+	AND epoch = ?
+	AND size = ?
+	AND path = ?
+`, page.ObjectID, page.Index, page.ETag, page.Epoch, page.Size, page.Path)
 	if err != nil {
 		return false, fmt.Errorf("delete stale page row: %w", err)
 	}

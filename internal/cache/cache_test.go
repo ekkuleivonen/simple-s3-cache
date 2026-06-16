@@ -352,6 +352,59 @@ func TestStaleStorePageCannotOverwriteNewerPageAfterInvalidationRace(t *testing.
 	}
 }
 
+func TestConditionalStalePageDeletePreservesNewerPageRow(t *testing.T) {
+	ctx := context.Background()
+	c := openTestCache(t)
+	obj := putTestObject(t, c, "bucket", "stale-delete-race.bin")
+
+	if _, err := c.StorePage(ctx, PageWrite{
+		ObjectID: obj.ID,
+		Index:    0,
+		ETag:     obj.ETag,
+		Size:     int64(len("old page")),
+		Source:   bytes.NewReader([]byte("old page")),
+	}); err != nil {
+		t.Fatalf("StorePage(old) error = %v", err)
+	}
+	stalePage, ok, err := c.getPage(ctx, obj.ID, 0)
+	if err != nil {
+		t.Fatalf("getPage(old) error = %v", err)
+	}
+	if !ok {
+		t.Fatal("getPage(old) ok = false, want true")
+	}
+
+	if err := c.PutPage(ctx, Page{
+		ObjectID: obj.ID,
+		Index:    0,
+		ETag:     `"etag-2"`,
+		Epoch:    obj.Epoch,
+		Size:     int64(len("new page")),
+		Path:     c.pagePathForVersion(obj.ID, 0, `"etag-2"`, obj.Epoch),
+	}); err != nil {
+		t.Fatalf("PutPage(new) error = %v", err)
+	}
+
+	deleted, err := c.deletePageIfCurrent(ctx, stalePage)
+	if err != nil {
+		t.Fatalf("deletePageIfCurrent(stale) error = %v", err)
+	}
+	if deleted {
+		t.Fatal("deletePageIfCurrent(stale) deleted newer row")
+	}
+
+	current, ok, err := c.getPage(ctx, obj.ID, 0)
+	if err != nil {
+		t.Fatalf("getPage(current) error = %v", err)
+	}
+	if !ok {
+		t.Fatal("getPage(current) ok = false, want newer page row preserved")
+	}
+	if current.ETag != `"etag-2"` {
+		t.Fatalf("current ETag = %q, want newer ETag", current.ETag)
+	}
+}
+
 func TestOpenUsesSeparateCacheAndMetaPaths(t *testing.T) {
 	ctx := context.Background()
 	cachePath := filepath.Join(t.TempDir(), "cache-bytes")
