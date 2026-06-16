@@ -94,6 +94,7 @@ type Page struct {
 	ObjectID string
 	Index    int64
 	ETag     string
+	Epoch    int64
 	Size     int64
 	Path     string
 }
@@ -414,14 +415,15 @@ func (c *Cache) PutPage(ctx context.Context, page Page) error {
 		return err
 	}
 	_, err = c.execWrite(ctx, `
-INSERT INTO pages (object_id, page_index, etag, size, path, created_at, last_accessed_at)
-VALUES (?, ?, ?, ?, ?, ?, ?)
+INSERT INTO pages (object_id, page_index, etag, epoch, size, path, created_at, last_accessed_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(object_id, page_index) DO UPDATE SET
 	etag = excluded.etag,
+	epoch = excluded.epoch,
 	size = excluded.size,
 	path = excluded.path,
 	last_accessed_at = excluded.last_accessed_at
-`, page.ObjectID, page.Index, page.ETag, page.Size, page.Path, time.Now().UnixNano(), time.Now().UnixNano())
+`, page.ObjectID, page.Index, page.ETag, page.Epoch, page.Size, page.Path, time.Now().UnixNano(), time.Now().UnixNano())
 	if err != nil {
 		return fmt.Errorf("put page: %w", err)
 	}
@@ -437,7 +439,7 @@ ON CONFLICT(object_id, page_index) DO UPDATE SET
 
 func (c *Cache) ListPages(ctx context.Context, objectID string) ([]Page, error) {
 	rows, err := c.db.QueryContext(ctx, `
-SELECT object_id, page_index, etag, size, path
+SELECT object_id, page_index, etag, epoch, size, path
 FROM pages
 WHERE object_id = ?
 ORDER BY page_index
@@ -450,7 +452,7 @@ ORDER BY page_index
 	var pages []Page
 	for rows.Next() {
 		var page Page
-		if err := rows.Scan(&page.ObjectID, &page.Index, &page.ETag, &page.Size, &page.Path); err != nil {
+		if err := rows.Scan(&page.ObjectID, &page.Index, &page.ETag, &page.Epoch, &page.Size, &page.Path); err != nil {
 			return nil, fmt.Errorf("scan page: %w", err)
 		}
 		pages = append(pages, page)
@@ -539,6 +541,7 @@ func (c *Cache) StorePage(ctx context.Context, write PageWrite) (Page, error) {
 		ObjectID: write.ObjectID,
 		Index:    write.Index,
 		ETag:     write.ETag,
+		Epoch:    write.ExpectedEpoch,
 		Size:     write.Size,
 		Path:     relPath,
 	}
@@ -554,12 +557,27 @@ func (c *Cache) StorePage(ctx context.Context, write PageWrite) (Page, error) {
 	return page, nil
 }
 
-func (c *Cache) OpenPage(ctx context.Context, objectID string, index int64) (io.ReadCloser, bool, error) {
+func (c *Cache) OpenPage(ctx context.Context, objectID string, index int64, expectedETag string, expectedEpoch int64) (io.ReadCloser, bool, error) {
 	page, ok, err := c.getPage(ctx, objectID, index)
 	if err != nil {
 		return nil, false, err
 	}
 	if !ok {
+		return nil, false, nil
+	}
+	if page.ETag != expectedETag || page.Epoch != expectedEpoch {
+		bucket, _ := c.pageBucket(ctx, objectID)
+		deleted, deleteErr := c.deletePage(ctx, objectID, index)
+		if deleteErr != nil {
+			return nil, false, deleteErr
+		}
+		if err := os.Remove(filepath.Join(c.cacheRoot, page.Path)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return nil, false, fmt.Errorf("delete stale page file: %w", err)
+		}
+		if deleted {
+			c.adjustCacheSize(bucket, -page.Size)
+			c.requestMetricsRefresh()
+		}
 		return nil, false, nil
 	}
 
@@ -686,6 +704,13 @@ func (c *Cache) currentSizeByBucket() map[string]int64 {
 	return byBucket
 }
 
+func (c *Cache) currentSizeForBucket(bucket string) int64 {
+	c.sizeMu.RLock()
+	defer c.sizeMu.RUnlock()
+
+	return c.cachedByBucket[bucket]
+}
+
 func (c *Cache) maxSizeForBucket(bucket string) int64 {
 	if c.maxSizeByBucket == nil {
 		return 0
@@ -773,7 +798,7 @@ func (c *Cache) Evict(ctx context.Context) error {
 func (c *Cache) evictBuckets(ctx context.Context) error {
 	for bucket, maxSize := range c.maxSizeByBucket {
 		for {
-			size := c.currentSizeByBucket()[bucket]
+			size := c.currentSizeForBucket(bucket)
 			if size <= maxSize {
 				break
 			}
@@ -942,6 +967,7 @@ func (c *Cache) init(ctx context.Context) error {
 			object_id TEXT NOT NULL,
 			page_index INTEGER NOT NULL,
 			etag TEXT NOT NULL,
+			epoch INTEGER NOT NULL DEFAULT 0,
 			size INTEGER NOT NULL,
 			path TEXT NOT NULL,
 			created_at INTEGER NOT NULL,
@@ -950,7 +976,9 @@ func (c *Cache) init(ctx context.Context) error {
 			FOREIGN KEY (object_id) REFERENCES objects(id) ON DELETE CASCADE
 		)`,
 		`CREATE INDEX IF NOT EXISTS pages_object_idx ON pages(object_id)`,
+		`CREATE INDEX IF NOT EXISTS objects_bucket_idx ON objects(bucket)`,
 		`CREATE INDEX IF NOT EXISTS pages_lru_idx ON pages(last_accessed_at, created_at)`,
+		`CREATE INDEX IF NOT EXISTS pages_object_lru_idx ON pages(object_id, last_accessed_at, created_at)`,
 	}
 
 	for _, statement := range statements {
@@ -961,11 +989,48 @@ func (c *Cache) init(ctx context.Context) error {
 	if err := c.ensureObjectGenerationUpdatedAtColumn(ctx); err != nil {
 		return err
 	}
+	if err := c.ensurePageEpochColumn(ctx); err != nil {
+		return err
+	}
 	if _, err := c.db.ExecContext(ctx, `
 INSERT OR IGNORE INTO object_generations (id, epoch, updated_at)
 SELECT id, epoch, updated_at FROM objects
 `); err != nil {
 		return fmt.Errorf("init object generations: %w", err)
+	}
+	return nil
+}
+
+func (c *Cache) ensurePageEpochColumn(ctx context.Context) error {
+	rows, err := c.db.QueryContext(ctx, `PRAGMA table_info(pages)`)
+	if err != nil {
+		return fmt.Errorf("inspect pages schema: %w", err)
+	}
+	defer rows.Close()
+
+	hasEpoch := false
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notNull int
+		var defaultValue sql.NullString
+		var pk int
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
+			return fmt.Errorf("scan pages schema: %w", err)
+		}
+		if name == "epoch" {
+			hasEpoch = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("inspect pages schema: %w", err)
+	}
+	if hasEpoch {
+		return nil
+	}
+
+	if _, err := c.execWrite(ctx, `ALTER TABLE pages ADD COLUMN epoch INTEGER NOT NULL DEFAULT 0`); err != nil {
+		return fmt.Errorf("migrate pages schema: %w", err)
 	}
 	return nil
 }
@@ -1094,14 +1159,15 @@ WHERE object_id = ? AND page_index = ?
 		return "", 0, fmt.Errorf("read previous page size: %w", err)
 	}
 	_, err = tx.ExecContext(ctx, `
-INSERT INTO pages (object_id, page_index, etag, size, path, created_at, last_accessed_at)
-VALUES (?, ?, ?, ?, ?, ?, ?)
+INSERT INTO pages (object_id, page_index, etag, epoch, size, path, created_at, last_accessed_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(object_id, page_index) DO UPDATE SET
 	etag = excluded.etag,
+	epoch = excluded.epoch,
 	size = excluded.size,
 	path = excluded.path,
 	last_accessed_at = excluded.last_accessed_at
-`, page.ObjectID, page.Index, page.ETag, page.Size, page.Path, time.Now().UnixNano(), time.Now().UnixNano())
+`, page.ObjectID, page.Index, page.ETag, page.Epoch, page.Size, page.Path, time.Now().UnixNano(), time.Now().UnixNano())
 	if err != nil {
 		_ = tx.Rollback()
 		return "", 0, fmt.Errorf("put page: %w", err)
@@ -1114,13 +1180,13 @@ ON CONFLICT(object_id, page_index) DO UPDATE SET
 
 func (c *Cache) getPage(ctx context.Context, objectID string, index int64) (Page, bool, error) {
 	row := c.db.QueryRowContext(ctx, `
-SELECT object_id, page_index, etag, size, path
+SELECT object_id, page_index, etag, epoch, size, path
 FROM pages
 WHERE object_id = ? AND page_index = ?
 `, objectID, index)
 
 	var page Page
-	if err := row.Scan(&page.ObjectID, &page.Index, &page.ETag, &page.Size, &page.Path); err != nil {
+	if err := row.Scan(&page.ObjectID, &page.Index, &page.ETag, &page.Epoch, &page.Size, &page.Path); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return Page{}, false, nil
 		}
@@ -1151,7 +1217,7 @@ func (c *Cache) touchPage(ctx context.Context, objectID string, index int64, at 
 
 func (c *Cache) oldestPages(ctx context.Context, limit int) ([]Page, error) {
 	rows, err := c.db.QueryContext(ctx, `
-SELECT object_id, page_index, etag, size, path
+SELECT object_id, page_index, etag, epoch, size, path
 FROM pages
 ORDER BY last_accessed_at ASC, created_at ASC
 LIMIT ?
@@ -1164,7 +1230,7 @@ LIMIT ?
 	var pages []Page
 	for rows.Next() {
 		var page Page
-		if err := rows.Scan(&page.ObjectID, &page.Index, &page.ETag, &page.Size, &page.Path); err != nil {
+		if err := rows.Scan(&page.ObjectID, &page.Index, &page.ETag, &page.Epoch, &page.Size, &page.Path); err != nil {
 			return nil, fmt.Errorf("scan eviction candidate: %w", err)
 		}
 		pages = append(pages, page)
@@ -1177,9 +1243,9 @@ LIMIT ?
 
 func (c *Cache) oldestPagesForBucket(ctx context.Context, bucket string, limit int) ([]Page, error) {
 	rows, err := c.db.QueryContext(ctx, `
-SELECT p.object_id, p.page_index, p.etag, p.size, p.path
-FROM pages p
-JOIN objects o ON o.id = p.object_id
+SELECT p.object_id, p.page_index, p.etag, p.epoch, p.size, p.path
+FROM objects o
+JOIN pages p ON p.object_id = o.id
 WHERE o.bucket = ?
 ORDER BY p.last_accessed_at ASC, p.created_at ASC
 LIMIT ?
@@ -1192,7 +1258,7 @@ LIMIT ?
 	var pages []Page
 	for rows.Next() {
 		var page Page
-		if err := rows.Scan(&page.ObjectID, &page.Index, &page.ETag, &page.Size, &page.Path); err != nil {
+		if err := rows.Scan(&page.ObjectID, &page.Index, &page.ETag, &page.Epoch, &page.Size, &page.Path); err != nil {
 			return nil, fmt.Errorf("scan bucket eviction candidate: %w", err)
 		}
 		pages = append(pages, page)
@@ -1316,6 +1382,9 @@ func validatePage(page Page) error {
 	}
 	if page.ETag == "" {
 		return errors.New("etag is required")
+	}
+	if page.Epoch < 0 {
+		return errors.New("page epoch must not be negative")
 	}
 	if page.Size < 0 {
 		return errors.New("page size must not be negative")

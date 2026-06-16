@@ -830,6 +830,10 @@ Global totals, plus the same counters **labeled by `bucket`** wherever cheap:
 - bytes served from upstream
 - **bytes fetched upstream to fill cache** (on misses; may exceed client
   requested bytes because whole pages are pulled)
+- peer owner decisions by `bucket`, `decision`, and `owner_id`
+- peer forwarded requests by `bucket`, `peer_id`, `method`, and `status_class`
+- peer forwarding failures by `bucket`, `peer_id`, and bounded `reason`
+- peer response bytes and peer forwarding duration by bounded peer labels
 
 Derived ratios worth exposing or computing in dashboards:
 

@@ -18,9 +18,10 @@ func TestRecorderRendersGlobalAndBucketMetrics(t *testing.T) {
 	recorder.RecordCacheWriteFailure("photos")
 	recorder.RecordEviction("photos")
 	recorder.RecordUpstreamFailure("photos", "fill")
-	recorder.RecordPeerDecision("photos", "remote")
-	recorder.RecordPeerForward("photos", "cache-1")
-	recorder.RecordPeerForwardFailure("photos", "cache-1")
+	recorder.RecordPeerDecision("photos", "remote", "cache-1")
+	recorder.RecordPeerForward("photos", "cache-1", http.MethodGet, "2xx")
+	recorder.RecordPeerForwardFailure("photos", "cache-1", "request_failed")
+	recorder.RecordPeerForwardResponseBytes("photos", "cache-1", 13)
 	recorder.RecordBytesServedFromCache("photos", 3)
 	recorder.RecordBytesServedFromUpstream("photos", 5)
 	recorder.RecordUpstreamFillBytes("photos", 8)
@@ -29,7 +30,7 @@ func TestRecorderRendersGlobalAndBucketMetrics(t *testing.T) {
 	recorder.ObserveReadAmplification("photos", float64(8)/3)
 	recorder.ObserveUpstreamDuration("photos", "fill", 25*time.Millisecond)
 	recorder.ObserveCacheServeDuration("photos", 2*time.Millisecond)
-	recorder.ObservePeerForwardDuration("photos", "cache-1", time.Millisecond)
+	recorder.ObservePeerForwardDuration("photos", "cache-1", "2xx", time.Millisecond)
 	recorder.SetCachedBytes(64, map[string]int64{"photos": 64})
 
 	body := renderMetrics(t, recorder)
@@ -42,9 +43,10 @@ func TestRecorderRendersGlobalAndBucketMetrics(t *testing.T) {
 		`simple_s3_cache_cache_write_failures_total{bucket="photos"} 1`,
 		`simple_s3_cache_evictions_total{bucket="photos"} 1`,
 		`simple_s3_cache_upstream_request_failures_total{bucket="photos",operation="fill"} 1`,
-		`simple_s3_cache_peer_owner_decisions_total{bucket="photos",decision="remote"} 1`,
-		`simple_s3_cache_peer_forwarded_requests_total{bucket="photos",peer_id="cache-1"} 1`,
-		`simple_s3_cache_peer_forward_failures_total{bucket="photos",peer_id="cache-1"} 1`,
+		`simple_s3_cache_peer_owner_decisions_total{bucket="photos",decision="remote",owner_id="cache-1"} 1`,
+		`simple_s3_cache_peer_forwarded_requests_total{bucket="photos",peer_id="cache-1",method="GET",status_class="2xx"} 1`,
+		`simple_s3_cache_peer_forward_failures_total{bucket="photos",peer_id="cache-1",reason="request_failed"} 1`,
+		`simple_s3_cache_peer_forward_response_bytes_total{bucket="photos",peer_id="cache-1"} 13`,
 		`simple_s3_cache_bytes_served_from_cache_total{bucket="photos"} 3`,
 		`simple_s3_cache_bytes_served_from_upstream_total{bucket="photos"} 5`,
 		`simple_s3_cache_upstream_fill_bytes_total{bucket="photos"} 8`,

@@ -1172,6 +1172,161 @@ func TestProxyInvalidatesAndRefetchesMetadataOnPreconditionFailure(t *testing.T)
 	}
 }
 
+func TestProxyFallsBackWhenRefetchedObjectNoLongerSatisfiesRange(t *testing.T) {
+	ctx := context.Background()
+	body := []byte("short")
+	var upstreamRequests []string
+
+	p := testProxyWithPageSize(t, "", 4)
+	_, err := p.cache.PutObject(ctx, cache.ObjectMetadata{
+		Bucket:   "bucket",
+		Key:      "shrunk.bin",
+		ETag:     `"old-etag"`,
+		Size:     12,
+		PageSize: 4,
+		Headers: http.Header{
+			"Content-Length": []string{"12"},
+			"Content-Type":   []string{"application/octet-stream"},
+			"ETag":           []string{`"old-etag"`},
+		},
+	})
+	if err != nil {
+		t.Fatalf("PutObject(stale) error = %v", err)
+	}
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamRequests = append(upstreamRequests, r.Method+" "+r.Header.Get("Range")+" "+r.Header.Get("If-Match"))
+		if r.Method == http.MethodHead {
+			w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+			w.Header().Set("Content-Type", "application/octet-stream")
+			w.Header().Set("ETag", `"new-etag"`)
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if r.Header.Get("If-Match") == `"old-etag"` {
+			w.WriteHeader(http.StatusPreconditionFailed)
+			return
+		}
+		if r.Header.Get("Range") == "bytes=8-10" {
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", len(body)))
+			w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+			return
+		}
+		t.Fatalf("unexpected upstream GET range=%q if-match=%q", r.Header.Get("Range"), r.Header.Get("If-Match"))
+	}))
+	defer upstream.Close()
+
+	parsed, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream URL: %v", err)
+	}
+	p.upstreamEndpoint = parsed
+
+	req := httptest.NewRequest(http.MethodGet, "/bucket/shrunk.bin", nil)
+	req.Header.Set("Range", "bytes=8-10")
+	rec := httptest.NewRecorder()
+
+	p.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusRequestedRangeNotSatisfiable {
+		t.Fatalf("status = %d, want 416; body=%q", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("Content-Range"); got != "bytes */5" {
+		t.Fatalf("Content-Range = %q, want bytes */5", got)
+	}
+	wantRequests := []string{
+		"GET bytes=8-11 \"old-etag\"",
+		"HEAD  ",
+		"GET bytes=8-10 ",
+	}
+	if !equalStringSlices(upstreamRequests, wantRequests) {
+		t.Fatalf("upstream requests = %q, want %q", upstreamRequests, wantRequests)
+	}
+}
+
+func TestProxyDoesNotServeStalePageAfterMetadataRefresh(t *testing.T) {
+	ctx := context.Background()
+	oldBody := []byte("old-data")
+	newBody := []byte("new-data")
+	var upstreamRequests []string
+
+	p := testProxyWithPageSize(t, "", 4)
+	oldObj, err := p.cache.PutObject(ctx, cache.ObjectMetadata{
+		Bucket:   "bucket",
+		Key:      "refreshed.bin",
+		ETag:     `"old-etag"`,
+		Size:     int64(len(oldBody)),
+		PageSize: 4,
+		Headers: http.Header{
+			"Content-Length": []string{strconv.Itoa(len(oldBody))},
+			"Content-Type":   []string{"application/octet-stream"},
+			"ETag":           []string{`"old-etag"`},
+		},
+	})
+	if err != nil {
+		t.Fatalf("PutObject(old) error = %v", err)
+	}
+	if _, err := p.cache.StorePage(ctx, cache.PageWrite{
+		ObjectID:      oldObj.ID,
+		Index:         0,
+		ETag:          oldObj.ETag,
+		ExpectedEpoch: oldObj.Epoch,
+		Size:          4,
+		Source:        bytes.NewReader(oldBody[:4]),
+	}); err != nil {
+		t.Fatalf("StorePage(old) error = %v", err)
+	}
+	if _, err := p.cache.PutObject(ctx, cache.ObjectMetadata{
+		Bucket:   "bucket",
+		Key:      "refreshed.bin",
+		ETag:     `"new-etag"`,
+		Size:     int64(len(newBody)),
+		PageSize: 4,
+		Headers: http.Header{
+			"Content-Length": []string{strconv.Itoa(len(newBody))},
+			"Content-Type":   []string{"application/octet-stream"},
+			"ETag":           []string{`"new-etag"`},
+		},
+	}); err != nil {
+		t.Fatalf("PutObject(new) error = %v", err)
+	}
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamRequests = append(upstreamRequests, r.Method+" "+r.Header.Get("Range")+" "+r.Header.Get("If-Match"))
+		if r.Header.Get("If-Match") != `"new-etag"` {
+			t.Fatalf("If-Match = %q, want new etag", r.Header.Get("If-Match"))
+		}
+		w.Header().Set("Content-Length", "4")
+		w.Header().Set("Content-Range", "bytes 0-3/8")
+		w.Header().Set("ETag", `"new-etag"`)
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(newBody[:4])
+	}))
+	defer upstream.Close()
+	parsed, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream URL: %v", err)
+	}
+	p.upstreamEndpoint = parsed
+
+	req := httptest.NewRequest(http.MethodGet, "/bucket/refreshed.bin", nil)
+	req.Header.Set("Range", "bytes=0-3")
+	rec := httptest.NewRecorder()
+
+	p.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusPartialContent {
+		t.Fatalf("status = %d, want 206; body=%q", rec.Code, rec.Body.String())
+	}
+	if got := rec.Body.Bytes(); !bytes.Equal(got, newBody[:4]) {
+		t.Fatalf("body = %q, want %q", got, newBody[:4])
+	}
+	wantRequests := []string{`GET bytes=0-3 "new-etag"`}
+	if !equalStringSlices(upstreamRequests, wantRequests) {
+		t.Fatalf("upstream requests = %q, want %q", upstreamRequests, wantRequests)
+	}
+}
+
 func TestProxyInvalidatesCachedObjectAfterSuccessfulWrites(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -1529,8 +1684,15 @@ func TestProxyPeerModeForwardsRemoteOwnerRequest(t *testing.T) {
 		t.Fatalf("peer requests = %d, want 1", peerRequests)
 	}
 	metricsBody := renderProxyMetrics(t, p.metrics)
-	if !strings.Contains(metricsBody, `simple_s3_cache_peer_forwarded_requests_total{bucket="bucket",peer_id="cache-1"} 1`) {
-		t.Fatalf("metrics missing peer forward:\n%s", metricsBody)
+	for _, want := range []string{
+		`simple_s3_cache_peer_owner_decisions_total{bucket="bucket",decision="remote",owner_id="cache-1"} 1`,
+		`simple_s3_cache_peer_forwarded_requests_total{bucket="bucket",peer_id="cache-1",method="GET",status_class="2xx"} 1`,
+		`simple_s3_cache_peer_forward_response_bytes_total{bucket="bucket",peer_id="cache-1"} 9`,
+		`simple_s3_cache_peer_forward_duration_seconds_count{bucket="bucket",peer_id="cache-1",status_class="2xx"} 1`,
+	} {
+		if !strings.Contains(metricsBody, want) {
+			t.Fatalf("metrics missing %q:\n%s", want, metricsBody)
+		}
 	}
 }
 
@@ -1566,6 +1728,10 @@ func TestProxyPeerModeHandlesLocalOwnerRequestLocally(t *testing.T) {
 	}
 	if upstreamRequests != 1 {
 		t.Fatalf("upstream requests = %d, want 1", upstreamRequests)
+	}
+	metricsBody := renderProxyMetrics(t, p.metrics)
+	if !strings.Contains(metricsBody, `simple_s3_cache_peer_owner_decisions_total{bucket="bucket",decision="local",owner_id="cache-0"} 1`) {
+		t.Fatalf("metrics missing local owner decision:\n%s", metricsBody)
 	}
 }
 
@@ -1657,6 +1823,10 @@ func TestProxyPeerModeRejectsForwardingLoop(t *testing.T) {
 
 	if rec.Code != http.StatusBadGateway {
 		t.Fatalf("status = %d, want 502; body=%q", rec.Code, rec.Body.String())
+	}
+	metricsBody := renderProxyMetrics(t, p.metrics)
+	if !strings.Contains(metricsBody, `simple_s3_cache_peer_forward_failures_total{bucket="bucket",peer_id="cache-1",reason="routing_mismatch"} 1`) {
+		t.Fatalf("metrics missing routing mismatch failure:\n%s", metricsBody)
 	}
 }
 
@@ -1799,8 +1969,8 @@ type missingPageSignalCache struct {
 	secondSignaled atomic.Bool
 }
 
-func (c *missingPageSignalCache) OpenPage(ctx context.Context, objectID string, index int64) (io.ReadCloser, bool, error) {
-	body, ok, err := c.cacheStore.OpenPage(ctx, objectID, index)
+func (c *missingPageSignalCache) OpenPage(ctx context.Context, objectID string, index int64, expectedETag string, expectedEpoch int64) (io.ReadCloser, bool, error) {
+	body, ok, err := c.cacheStore.OpenPage(ctx, objectID, index, expectedETag, expectedEpoch)
 	if err == nil && !ok && c.misses.Add(1) == 2 && c.secondSignaled.CompareAndSwap(false, true) {
 		close(c.secondMissSeen)
 	}

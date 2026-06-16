@@ -47,9 +47,10 @@ const (
 )
 
 var (
-	errObjectChanged = errors.New("cached object changed upstream")
-	errMetadataStore = errors.New("cache metadata store failed")
-	errSpoolLimit    = errors.New("upload body exceeds max spool size")
+	errObjectChanged             = errors.New("cached object changed upstream")
+	errMetadataStore             = errors.New("cache metadata store failed")
+	errSpoolLimit                = errors.New("upload body exceeds max spool size")
+	errRefetchedRangeUnsatisfied = errors.New("refetched object does not satisfy requested range")
 )
 
 type uploadOptions struct {
@@ -63,7 +64,7 @@ type cacheStore interface {
 	DeleteObject(context.Context, string, string) error
 	StorePage(context.Context, cache.PageWrite) (cache.Page, error)
 	ListPages(context.Context, string) ([]cache.Page, error)
-	OpenPage(context.Context, string, int64) (io.ReadCloser, bool, error)
+	OpenPage(context.Context, string, int64, string, int64) (io.ReadCloser, bool, error)
 	Close() error
 }
 
@@ -116,7 +117,9 @@ type requestStats struct {
 	peerMode             string
 	peerLocalID          string
 	peerOwnerID          string
+	peerDecision         string
 	peerForwarded        bool
+	peerForwardFailure   string
 	peerForwardDuration  time.Duration
 }
 
@@ -335,36 +338,31 @@ func (p *Proxy) shouldForwardToPeer(w http.ResponseWriter, r *http.Request, targ
 	stats.peerLocalID = p.peerRouter.LocalID()
 	stats.peerOwnerID = owner.ID
 	if owner.ID == p.peerRouter.LocalID() {
-		if p.metrics != nil {
-			p.metrics.RecordPeerDecision(target.Bucket, "local")
-		}
+		stats.peerDecision = "local"
+		p.recordPeerMetrics(stats)
 		return false
 	}
 
 	if r.Header.Get(peerForwardedHeader) != "" {
 		stats.peerForwarded = true
 		stats.cacheResult = "peer_routing_mismatch"
-		if p.metrics != nil {
-			p.metrics.RecordPeerForwardFailure(target.Bucket, owner.ID)
-		}
+		stats.peerForwardFailure = "routing_mismatch"
+		p.recordPeerMetrics(stats)
 		http.Error(w, "peer routing mismatch", http.StatusBadGateway)
 		return true
 	}
 
 	stats.peerForwarded = true
 	stats.cacheResult = "peer_forward"
-	if p.metrics != nil {
-		p.metrics.RecordPeerDecision(target.Bucket, "remote")
-	}
+	stats.peerDecision = "remote"
 	start := time.Now()
 	status, bytesWritten, err := p.forwardToPeer(w, r, owner)
 	stats.peerForwardDuration = time.Since(start)
 	stats.status = status
 	stats.bytesSent = bytesWritten
 	if err != nil {
-		if p.metrics != nil {
-			p.metrics.RecordPeerForwardFailure(target.Bucket, owner.ID)
-		}
+		stats.peerForwardFailure = "request_failed"
+		p.recordPeerMetrics(stats)
 		p.logger.ErrorContext(r.Context(), "peer forward failed",
 			slog.String("bucket", target.Bucket),
 			slog.String("key", target.Key),
@@ -373,10 +371,7 @@ func (p *Proxy) shouldForwardToPeer(w http.ResponseWriter, r *http.Request, targ
 		)
 		return true
 	}
-	if p.metrics != nil {
-		p.metrics.RecordPeerForward(target.Bucket, owner.ID)
-		p.metrics.ObservePeerForwardDuration(target.Bucket, owner.ID, stats.peerForwardDuration)
-	}
+	p.recordPeerMetrics(stats)
 	p.logger.InfoContext(r.Context(), "peer request forwarded",
 		slog.String("method", r.Method),
 		slog.String("bucket", target.Bucket),
@@ -876,6 +871,38 @@ func (p *Proxy) recordMetrics(stats *requestStats) {
 	}
 }
 
+func (p *Proxy) recordPeerMetrics(stats *requestStats) {
+	if p.metrics == nil {
+		return
+	}
+	if stats.peerDecision != "" {
+		p.metrics.RecordPeerDecision(stats.bucket, stats.peerDecision, stats.peerOwnerID)
+	}
+	if !stats.peerForwarded {
+		return
+	}
+	if stats.peerForwardFailure != "" {
+		p.metrics.RecordPeerForwardFailure(stats.bucket, stats.peerOwnerID, stats.peerForwardFailure)
+	}
+	statusClass := peerStatusClass(stats.status)
+	if stats.peerForwardDuration > 0 {
+		p.metrics.ObservePeerForwardDuration(stats.bucket, stats.peerOwnerID, statusClass, stats.peerForwardDuration)
+	}
+	if stats.peerForwardFailure == "" {
+		p.metrics.RecordPeerForward(stats.bucket, stats.peerOwnerID, stats.method, statusClass)
+		if stats.bytesSent > 0 {
+			p.metrics.RecordPeerForwardResponseBytes(stats.bucket, stats.peerOwnerID, stats.bytesSent)
+		}
+	}
+}
+
+func peerStatusClass(status int) string {
+	if status < 100 {
+		return "error"
+	}
+	return strconv.Itoa(status/100) + "xx"
+}
+
 func (p *Proxy) recordUpstreamFailure(bucket, operation string) {
 	if p.metrics != nil {
 		p.metrics.RecordUpstreamFailure(bucket, operation)
@@ -961,6 +988,10 @@ func (p *Proxy) serveCachedRange(w http.ResponseWriter, r *http.Request, target 
 	if errors.Is(err, errObjectChanged) {
 		obj, byteRange, pages, firstPage, err = p.refetchAfterObjectChanged(r, target, byteRange, stats)
 		stats.bytesRequested = byteRange.End - byteRange.Start + 1
+	}
+	if errors.Is(err, errRefetchedRangeUnsatisfied) {
+		stats.cacheResult = "fallback"
+		return p.forward(w, r, stats)
 	}
 	if err != nil {
 		stats.cacheResult = "error"
@@ -1061,6 +1092,10 @@ func (p *Proxy) serveCachedFullObject(w http.ResponseWriter, r *http.Request, ta
 	if errors.Is(err, errObjectChanged) {
 		obj, byteRange, pages, firstPage, err = p.refetchAfterObjectChanged(r, target, byteRange, stats)
 		stats.bytesRequested = obj.Size
+	}
+	if errors.Is(err, errRefetchedRangeUnsatisfied) {
+		stats.cacheResult = "fallback"
+		return p.forward(w, r, stats)
 	}
 	if err != nil {
 		stats.cacheResult = "error"
@@ -1338,7 +1373,7 @@ func (p *Proxy) refetchAfterObjectChanged(r *http.Request, target s3request.Targ
 		requestedRange.End = obj.Size - 1
 	}
 	if requestedRange.Start > requestedRange.End {
-		return cache.Object{}, cacheplan.ByteRange{}, nil, nil, errors.New("requested range is invalid after refetch")
+		return cache.Object{}, cacheplan.ByteRange{}, nil, nil, errRefetchedRangeUnsatisfied
 	}
 
 	pages, firstPage, err := p.prepareFirstPage(r, target, obj, requestedRange, stats)
@@ -1384,7 +1419,7 @@ func abortCommittedResponse(w http.ResponseWriter, bytesWritten int64) {
 }
 
 func (p *Proxy) pageReader(ctx context.Context, r *http.Request, target s3request.Target, obj cache.Object, index int64, stats *requestStats) (io.ReadCloser, error) {
-	body, ok, err := p.cache.OpenPage(ctx, obj.ID, index)
+	body, ok, err := p.cache.OpenPage(ctx, obj.ID, index, obj.ETag, obj.Epoch)
 	if err != nil {
 		return nil, err
 	}
@@ -1422,7 +1457,7 @@ func (p *Proxy) fillMissingPage(ctx context.Context, r *http.Request, target s3r
 			if call.err != nil {
 				return nil, call.err
 			}
-			body, ok, err := p.cache.OpenPage(ctx, obj.ID, index)
+			body, ok, err := p.cache.OpenPage(ctx, obj.ID, index, obj.ETag, obj.Epoch)
 			if err != nil {
 				return nil, err
 			}
@@ -1450,7 +1485,7 @@ func (p *Proxy) fillMissingPage(ctx context.Context, r *http.Request, target s3r
 }
 
 func (p *Proxy) streamPageSpan(w http.ResponseWriter, r *http.Request, target s3request.Target, obj cache.Object, page cacheplan.PageSpan, stats *requestStats) (int64, error) {
-	body, ok, err := p.cache.OpenPage(r.Context(), obj.ID, page.Index)
+	body, ok, err := p.cache.OpenPage(r.Context(), obj.ID, page.Index, obj.ETag, obj.Epoch)
 	if err != nil {
 		return 0, err
 	}
@@ -1489,7 +1524,7 @@ func (p *Proxy) fillAndStreamMissingPage(w http.ResponseWriter, r *http.Request,
 			if call.err != nil {
 				return 0, call.err
 			}
-			body, ok, err := p.cache.OpenPage(r.Context(), obj.ID, page.Index)
+			body, ok, err := p.cache.OpenPage(r.Context(), obj.ID, page.Index, obj.ETag, obj.Epoch)
 			if err != nil {
 				return 0, err
 			}

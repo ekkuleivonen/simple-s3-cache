@@ -119,7 +119,7 @@ func TestStorePageWritesFileAtomicallyThenCommitsRow(t *testing.T) {
 		t.Fatal("page path is empty")
 	}
 
-	body, ok, err := c.OpenPage(ctx, obj.ID, 0)
+	body, ok, err := c.OpenPage(ctx, obj.ID, 0, obj.ETag, obj.Epoch)
 	if err != nil {
 		t.Fatalf("OpenPage() error = %v", err)
 	}
@@ -164,7 +164,7 @@ func TestOpenPageTreatsMissingFileAsMissAndRemovesStaleRow(t *testing.T) {
 		t.Fatalf("remove page file: %v", err)
 	}
 
-	body, ok, err := c.OpenPage(ctx, obj.ID, 5)
+	body, ok, err := c.OpenPage(ctx, obj.ID, 5, obj.ETag, obj.Epoch)
 	if err != nil {
 		t.Fatalf("OpenPage() error = %v", err)
 	}
@@ -256,7 +256,7 @@ func TestStorePageRejectsStaleObjectEpochAfterInvalidation(t *testing.T) {
 		t.Fatal("StorePage(stale) error = nil, want stale epoch error")
 	}
 
-	body, ok, err := c.OpenPage(ctx, newObj.ID, 0)
+	body, ok, err := c.OpenPage(ctx, newObj.ID, 0, newObj.ETag, newObj.Epoch)
 	if err != nil {
 		t.Fatalf("OpenPage() error = %v", err)
 	}
@@ -335,7 +335,7 @@ func TestStaleStorePageCannotOverwriteNewerPageAfterInvalidationRace(t *testing.
 		t.Fatal("StorePage(stale) error = nil, want stale epoch error")
 	}
 
-	body, ok, err := c.OpenPage(ctx, newObj.ID, 0)
+	body, ok, err := c.OpenPage(ctx, newObj.ID, 0, newObj.ETag, newObj.Epoch)
 	if err != nil {
 		t.Fatalf("OpenPage(new) error = %v", err)
 	}
@@ -426,6 +426,23 @@ func TestOpenConfiguresSQLiteForConcurrentReadsAndLRUEviction(t *testing.T) {
 	}
 }
 
+func TestOpenConfiguresSQLiteForBucketLRUEviction(t *testing.T) {
+	ctx := context.Background()
+	c := openTestCache(t)
+
+	pageIndexes := sqliteIndexNames(t, ctx, c, "pages")
+	for _, name := range []string{"pages_lru_idx", "pages_object_lru_idx"} {
+		if !pageIndexes[name] {
+			t.Fatalf("%s not found in pages indexes: %#v", name, pageIndexes)
+		}
+	}
+
+	objectIndexes := sqliteIndexNames(t, ctx, c, "objects")
+	if !objectIndexes["objects_bucket_idx"] {
+		t.Fatalf("objects_bucket_idx not found in objects indexes: %#v", objectIndexes)
+	}
+}
+
 func TestCacheTracksStoredPageSize(t *testing.T) {
 	ctx := context.Background()
 	c := openTestCache(t)
@@ -511,13 +528,13 @@ func TestEvictLRURemovesOldestPagesUntilUnderMaxSize(t *testing.T) {
 	} else if got > 7 {
 		t.Fatalf("CurrentSize() = %d, want <= 7", got)
 	}
-	if body, ok, err := c.OpenPage(ctx, obj.ID, 0); err != nil {
+	if body, ok, err := c.OpenPage(ctx, obj.ID, 0, obj.ETag, obj.Epoch); err != nil {
 		t.Fatalf("OpenPage(oldest) error = %v", err)
 	} else if ok {
 		body.Close()
 		t.Fatal("oldest page still present after eviction")
 	}
-	if body, ok, err := c.OpenPage(ctx, obj.ID, 2); err != nil {
+	if body, ok, err := c.OpenPage(ctx, obj.ID, 2, obj.ETag, obj.Epoch); err != nil {
 		t.Fatalf("OpenPage(newest) error = %v", err)
 	} else if !ok {
 		t.Fatal("newest page was evicted, want it retained")
@@ -578,10 +595,10 @@ func TestEvictRemovesOldestPagesFromBucketsOverTheirOwnMaxSize(t *testing.T) {
 		t.Fatalf("Evict() error = %v", err)
 	}
 
-	assertPagePresent(t, c, mediaObj.ID, 0, true)
-	assertPagePresent(t, c, analyticsObj.ID, 0, false)
-	assertPagePresent(t, c, analyticsObj.ID, 1, false)
-	assertPagePresent(t, c, analyticsObj.ID, 2, true)
+	assertPagePresent(t, c, mediaObj, 0, true)
+	assertPagePresent(t, c, analyticsObj, 0, false)
+	assertPagePresent(t, c, analyticsObj, 1, false)
+	assertPagePresent(t, c, analyticsObj, 2, true)
 	if got, err := c.CurrentSize(ctx); err != nil {
 		t.Fatalf("CurrentSize() error = %v", err)
 	} else if got != 14 {
@@ -611,8 +628,8 @@ func TestEvictStillEnforcesGlobalMaxSizeWithBucketMaxSizes(t *testing.T) {
 	} else if got > 10 {
 		t.Fatalf("CurrentSize() = %d, want <= 10", got)
 	}
-	assertPagePresent(t, c, analyticsObj.ID, 0, false)
-	assertPagePresent(t, c, mediaObj.ID, 1, true)
+	assertPagePresent(t, c, analyticsObj, 0, false)
+	assertPagePresent(t, c, mediaObj, 1, true)
 }
 
 func TestOpenPageTreatsSizeMismatchAsMissAndRemovesCorruptFile(t *testing.T) {
@@ -635,7 +652,7 @@ func TestOpenPageTreatsSizeMismatchAsMissAndRemovesCorruptFile(t *testing.T) {
 		t.Fatalf("corrupt page file: %v", err)
 	}
 
-	body, ok, err := c.OpenPage(ctx, obj.ID, 0)
+	body, ok, err := c.OpenPage(ctx, obj.ID, 0, obj.ETag, obj.Epoch)
 	if err != nil {
 		t.Fatalf("OpenPage() error = %v", err)
 	}
@@ -767,7 +784,7 @@ func TestMetadataGCPreservesObjectsWithPages(t *testing.T) {
 	} else if !ok {
 		t.Fatal("GetObject() ok = false, want metadata with pages preserved")
 	}
-	if body, ok, err := c.OpenPage(ctx, obj.ID, 0); err != nil {
+	if body, ok, err := c.OpenPage(ctx, obj.ID, 0, obj.ETag, obj.Epoch); err != nil {
 		t.Fatalf("OpenPage() error = %v", err)
 	} else if !ok {
 		t.Fatal("OpenPage() ok = false, want page preserved")
@@ -905,18 +922,18 @@ func storeTestPage(t *testing.T, c *Cache, obj Object, index int64, data []byte)
 	return page
 }
 
-func assertPagePresent(t *testing.T, c *Cache, objectID string, index int64, wantPresent bool) {
+func assertPagePresent(t *testing.T, c *Cache, obj Object, index int64, wantPresent bool) {
 	t.Helper()
 
-	body, ok, err := c.OpenPage(context.Background(), objectID, index)
+	body, ok, err := c.OpenPage(context.Background(), obj.ID, index, obj.ETag, obj.Epoch)
 	if err != nil {
-		t.Fatalf("OpenPage(%s, %d) error = %v", objectID, index, err)
+		t.Fatalf("OpenPage(%s, %d) error = %v", obj.ID, index, err)
 	}
 	if ok {
 		_ = body.Close()
 	}
 	if ok != wantPresent {
-		t.Fatalf("OpenPage(%s, %d) present = %v, want %v", objectID, index, ok, wantPresent)
+		t.Fatalf("OpenPage(%s, %d) present = %v, want %v", obj.ID, index, ok, wantPresent)
 	}
 }
 
@@ -928,4 +945,31 @@ func generationExists(t *testing.T, c *Cache, objectID string) bool {
 		t.Fatalf("query generation count: %v", err)
 	}
 	return count > 0
+}
+
+func sqliteIndexNames(t *testing.T, ctx context.Context, c *Cache, table string) map[string]bool {
+	t.Helper()
+
+	rows, err := c.db.QueryContext(ctx, `PRAGMA index_list(`+table+`)`)
+	if err != nil {
+		t.Fatalf("list %s indexes: %v", table, err)
+	}
+	defer rows.Close()
+
+	indexes := map[string]bool{}
+	for rows.Next() {
+		var seq int
+		var name string
+		var unique int
+		var origin string
+		var partial int
+		if err := rows.Scan(&seq, &name, &unique, &origin, &partial); err != nil {
+			t.Fatalf("scan %s index: %v", table, err)
+		}
+		indexes[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("list %s indexes: %v", table, err)
+	}
+	return indexes
 }

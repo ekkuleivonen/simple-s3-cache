@@ -464,9 +464,11 @@ Full counter, gauge, histogram, and log-field requirements are in
 [PLAN.md](PLAN.md#observability).
 
 Peer mode also emits structured log fields for `peer_mode`, `peer_local_id`,
-`peer_owner_id`, `peer_forwarded`, and `peer_forward_duration_ms`, plus metrics
-for owner decisions, forwarded requests, forwarding failures, and peer forwarding
-duration.
+`peer_owner_id`, `peer_forwarded`, and `peer_forward_duration_ms`. Metrics expose
+owner decisions by `bucket`, `decision`, and `owner_id`; forwarded requests by
+`bucket`, `peer_id`, `method`, and `status_class`; forwarding failures by
+`bucket`, `peer_id`, and bounded `reason`; peer response bytes; and peer
+forwarding duration.
 
 ## Why?
 
