@@ -23,6 +23,9 @@ upstream:
 	if cfg.Cache.Path != "/cache" {
 		t.Fatalf("Cache.Path = %q, want /cache", cfg.Cache.Path)
 	}
+	if cfg.Upstream.Region != "us-east-1" {
+		t.Fatalf("Upstream.Region = %q, want us-east-1", cfg.Upstream.Region)
+	}
 	if cfg.Cache.PageSize != 4<<20 {
 		t.Fatalf("Cache.PageSize = %d, want %d", cfg.Cache.PageSize, 4<<20)
 	}
@@ -36,6 +39,7 @@ func TestLoadParsesConfiguredValues(t *testing.T) {
 listen: "127.0.0.1:8081"
 upstream:
   endpoint: https://s3.example.test
+  region: eu-north-1
 cache:
   path: /tmp/cache
   max_size: 2GB
@@ -52,6 +56,9 @@ cache:
 	}
 	if cfg.Upstream.Endpoint != "https://s3.example.test" {
 		t.Fatalf("Upstream.Endpoint = %q", cfg.Upstream.Endpoint)
+	}
+	if cfg.Upstream.Region != "eu-north-1" {
+		t.Fatalf("Upstream.Region = %q", cfg.Upstream.Region)
 	}
 	if cfg.Cache.Path != "/tmp/cache" {
 		t.Fatalf("Cache.Path = %q", cfg.Cache.Path)

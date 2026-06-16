@@ -17,6 +17,7 @@ const (
 	defaultCacheDir = "/cache"
 	defaultMaxSize  = int64(1 << 40) // 1 TiB
 	defaultPageSize = int64(4 << 20) // 4 MiB
+	defaultRegion   = "us-east-1"
 )
 
 // Config is the process configuration loaded from YAML.
@@ -28,6 +29,7 @@ type Config struct {
 
 type UpstreamConfig struct {
 	Endpoint string `yaml:"endpoint"`
+	Region   string `yaml:"region"`
 }
 
 type CacheConfig struct {
@@ -65,6 +67,9 @@ func Load(path string) (Config, error) {
 func Default() Config {
 	return Config{
 		Listen: defaultListen,
+		Upstream: UpstreamConfig{
+			Region: defaultRegion,
+		},
 		Cache: CacheConfig{
 			Path:     defaultCacheDir,
 			MaxSize:  defaultMaxSize,
@@ -111,6 +116,9 @@ func (cfg Config) Validate() error {
 		errs = append(errs, errors.New("upstream.endpoint must use http or https"))
 	} else if parsed.Host == "" {
 		errs = append(errs, errors.New("upstream.endpoint must include a host"))
+	}
+	if strings.TrimSpace(cfg.Upstream.Region) == "" {
+		errs = append(errs, errors.New("upstream.region is required"))
 	}
 
 	if strings.TrimSpace(cfg.Cache.Path) == "" {

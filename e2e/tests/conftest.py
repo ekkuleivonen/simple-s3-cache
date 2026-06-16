@@ -3,9 +3,14 @@ from __future__ import annotations
 # pyright: reportMissingImports=false
 
 import os
+import socket
+import subprocess
+import time
+import urllib.error
+import urllib.request
 import uuid
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import boto3
@@ -27,9 +32,9 @@ class E2EConfig:
     endpoint_url: str | None
     region: str
     prefix: str
-    access_key_id: str | None
-    secret_access_key: str | None
-    session_token: str | None
+    access_key_id: str | None = field(repr=False)
+    secret_access_key: str | None = field(repr=False)
+    session_token: str | None = field(repr=False)
 
 
 @pytest.fixture(scope="session")
@@ -76,6 +81,69 @@ def e2e_config() -> E2EConfig:
 
 @pytest.fixture(scope="session")
 def s3_client(e2e_config: E2EConfig):
+    return _s3_client(e2e_config, e2e_config.endpoint_url)
+
+
+@pytest.fixture(scope="session")
+def cache_endpoint(e2e_config: E2EConfig, tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
+    port = _free_port()
+    endpoint = f"http://127.0.0.1:{port}"
+    work_dir = tmp_path_factory.mktemp("simple-s3-cache")
+    config_path = work_dir / "simple-s3-cache.yaml"
+    cache_path = work_dir / "cache"
+    upstream_endpoint = e2e_config.endpoint_url or _aws_s3_endpoint(e2e_config.region)
+
+    config_path.write_text(
+        "\n".join(
+            [
+                f'listen: "127.0.0.1:{port}"',
+                "upstream:",
+                f"  endpoint: {upstream_endpoint}",
+                f"  region: {e2e_config.region}",
+                "cache:",
+                f"  path: {cache_path}",
+                "  max_size: 1GB",
+                "  page_size: 4MB",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    process = subprocess.Popen(
+        [
+            "go",
+            "run",
+            "-ldflags=-linkmode=external",
+            "./cmd/simple-s3-cache",
+            "-config",
+            str(config_path),
+        ],
+        cwd=REPO_ROOT,
+        env=_proxy_env(e2e_config),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+
+    try:
+        _wait_for_healthz(endpoint, process)
+        yield endpoint
+    finally:
+        process.terminate()
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=10)
+
+
+@pytest.fixture
+def cache_s3_client(e2e_config: E2EConfig, cache_endpoint: str):
+    return _s3_client(e2e_config, cache_endpoint)
+
+
+def _s3_client(e2e_config: E2EConfig, endpoint_url: str | None):
     session = boto3.session.Session(
         aws_access_key_id=e2e_config.access_key_id,
         aws_secret_access_key=e2e_config.secret_access_key,
@@ -90,7 +158,7 @@ def s3_client(e2e_config: E2EConfig):
 
     return session.client(
         "s3",
-        endpoint_url=e2e_config.endpoint_url,
+        endpoint_url=endpoint_url,
         config=BotoConfig(
             retries={"max_attempts": 3, "mode": "standard"},
             s3={"addressing_style": "path"},
@@ -122,6 +190,53 @@ def _first_env(*names: str) -> str | None:
         if value:
             return value
     return None
+
+
+def _free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def _wait_for_healthz(endpoint: str, process: subprocess.Popen[str]) -> None:
+    deadline = time.monotonic() + 20
+    last_error: Exception | None = None
+
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            output = process.stdout.read() if process.stdout else ""
+            pytest.fail(f"simple-s3-cache exited before becoming ready:\n{output}")
+
+        try:
+            with urllib.request.urlopen(f"{endpoint}/healthz", timeout=1) as response:
+                if response.status == 200:
+                    return
+        except (urllib.error.URLError, TimeoutError) as exc:
+            last_error = exc
+
+        time.sleep(0.1)
+
+    output = process.stdout.read() if process.stdout else ""
+    pytest.fail(f"simple-s3-cache did not become ready: {last_error}\n{output}")
+
+
+def _proxy_env(e2e_config: E2EConfig) -> dict[str, str]:
+    env = os.environ.copy()
+    env["AWS_REGION"] = e2e_config.region
+    env["AWS_DEFAULT_REGION"] = e2e_config.region
+    if e2e_config.access_key_id:
+        env["AWS_ACCESS_KEY_ID"] = e2e_config.access_key_id
+    if e2e_config.secret_access_key:
+        env["AWS_SECRET_ACCESS_KEY"] = e2e_config.secret_access_key
+    if e2e_config.session_token:
+        env["AWS_SESSION_TOKEN"] = e2e_config.session_token
+    return env
+
+
+def _aws_s3_endpoint(region: str) -> str:
+    if region == "us-east-1":
+        return "https://s3.amazonaws.com"
+    return f"https://s3.{region}.amazonaws.com"
 
 
 def _chunks[T](items: list[T], size: int) -> Iterator[list[T]]:

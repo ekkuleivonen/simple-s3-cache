@@ -14,9 +14,12 @@ type Server struct {
 	httpServer *http.Server
 }
 
-func New(cfg config.Config, logger *slog.Logger) *Server {
+func New(cfg config.Config, logger *slog.Logger, proxyHandler ...http.Handler) *Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", healthz)
+	if len(proxyHandler) > 0 && proxyHandler[0] != nil {
+		mux.Handle("/", proxyHandler[0])
+	}
 
 	handler := requestLogger(logger, mux)
 

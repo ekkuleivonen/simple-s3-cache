@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/ekkuleivonen/simple-s3-cache/internal/config"
+	"github.com/ekkuleivonen/simple-s3-cache/internal/proxy"
 	"github.com/ekkuleivonen/simple-s3-cache/internal/server"
 )
 
@@ -31,7 +32,13 @@ func run() int {
 		return 1
 	}
 
-	srv := server.New(cfg, logger)
+	proxyHandler, err := proxy.New(context.Background(), cfg, logger)
+	if err != nil {
+		logger.Error("create proxy", slog.String("error", err.Error()))
+		return 1
+	}
+
+	srv := server.New(cfg, logger, proxyHandler)
 	errCh := make(chan error, 1)
 
 	go func() {

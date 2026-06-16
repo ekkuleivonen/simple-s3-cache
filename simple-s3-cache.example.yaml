@@ -2,6 +2,7 @@ listen: ":8080"
 
 upstream:
   endpoint: http://rustfs:9000
+  region: us-east-1
 
 cache:
   path: /cache
