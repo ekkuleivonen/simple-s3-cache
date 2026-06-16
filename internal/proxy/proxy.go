@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -49,6 +50,21 @@ type Proxy struct {
 	cache            cacheStore
 	pageSize         int64
 	metrics          *metrics.Recorder
+	pageFillMu       sync.Mutex
+	pageFills        map[pageFillKey]*pageFillCall
+}
+
+type pageFillKey struct {
+	objectID string
+	index    int64
+	etag     string
+	epoch    int64
+}
+
+type pageFillCall struct {
+	done chan struct{}
+	data []byte
+	err  error
 }
 
 type requestStats struct {
@@ -634,6 +650,45 @@ func (p *Proxy) pageData(ctx context.Context, r *http.Request, target s3request.
 		p.metrics.RecordPageMiss(target.Bucket)
 	}
 
+	return p.fillMissingPage(ctx, r, target, obj, index, stats)
+}
+
+func (p *Proxy) fillMissingPage(ctx context.Context, r *http.Request, target s3request.Target, obj cache.Object, index int64, stats *requestStats) ([]byte, error) {
+	key := pageFillKey{
+		objectID: obj.ID,
+		index:    index,
+		etag:     obj.ETag,
+		epoch:    obj.Epoch,
+	}
+
+	p.pageFillMu.Lock()
+	if p.pageFills == nil {
+		p.pageFills = make(map[pageFillKey]*pageFillCall)
+	}
+	if call, ok := p.pageFills[key]; ok {
+		p.pageFillMu.Unlock()
+		select {
+		case <-call.done:
+			return call.data, call.err
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	call := &pageFillCall{done: make(chan struct{})}
+	p.pageFills[key] = call
+	p.pageFillMu.Unlock()
+
+	call.data, call.err = p.fetchAndStorePage(ctx, r, target, obj, index, stats)
+
+	p.pageFillMu.Lock()
+	delete(p.pageFills, key)
+	p.pageFillMu.Unlock()
+	close(call.done)
+
+	return call.data, call.err
+}
+
+func (p *Proxy) fetchAndStorePage(ctx context.Context, r *http.Request, target s3request.Target, obj cache.Object, index int64, stats *requestStats) ([]byte, error) {
 	bounds, err := cacheplan.PageBounds(index, obj.PageSize, obj.Size)
 	if err != nil {
 		return nil, err

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -12,7 +13,10 @@ import (
 	"net/url"
 	"path/filepath"
 	"strconv"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
@@ -442,6 +446,83 @@ func TestProxyCachesSinglePageRangeRead(t *testing.T) {
 	wantRequests := []string{"HEAD ", "GET bytes=0-3"}
 	if !equalStringSlices(upstreamRequests, wantRequests) {
 		t.Fatalf("upstream requests = %q, want %q", upstreamRequests, wantRequests)
+	}
+}
+
+func TestProxyCoalescesConcurrentFetchesForSameMissingPage(t *testing.T) {
+	body := []byte("abcdefghijkl")
+	firstFillStarted := make(chan struct{})
+	releaseFill := make(chan struct{})
+	secondMissSeen := make(chan struct{})
+	var fillRequests atomic.Int32
+	var firstFill atomic.Bool
+	var misses atomic.Int32
+	var releaseOnce sync.Once
+	release := func() {
+		releaseOnce.Do(func() {
+			close(releaseFill)
+		})
+	}
+	defer release()
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			fillRequests.Add(1)
+			if firstFill.CompareAndSwap(false, true) {
+				close(firstFillStarted)
+			}
+			<-releaseFill
+		}
+		writeObjectResponse(t, w, r, body, `"etag-coalesce"`)
+	}))
+	defer upstream.Close()
+
+	p := testProxyWithPageSize(t, upstream.URL, 4)
+	p.cache = &missingPageSignalCache{
+		cacheStore:     p.cache,
+		misses:         &misses,
+		secondMissSeen: secondMissSeen,
+	}
+	warmReq := httptest.NewRequest(http.MethodHead, "/bucket/coalesce.bin", nil)
+	warmRec := httptest.NewRecorder()
+	p.ServeHTTP(warmRec, warmReq)
+	if warmRec.Code != http.StatusOK {
+		t.Fatalf("warm HEAD status = %d, want 200; body=%q", warmRec.Code, warmRec.Body.String())
+	}
+
+	firstDone := make(chan error, 1)
+	go func() {
+		firstDone <- serveRangeRequest(p, "/bucket/coalesce.bin", "bytes=1-3", body[1:4])
+	}()
+
+	select {
+	case <-firstFillStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for first upstream fill")
+	}
+
+	secondDone := make(chan error, 1)
+	go func() {
+		secondDone <- serveRangeRequest(p, "/bucket/coalesce.bin", "bytes=1-3", body[1:4])
+	}()
+
+	select {
+	case <-secondMissSeen:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for second request to observe the missing page")
+	}
+	if got := fillRequests.Load(); got != 1 {
+		t.Fatalf("upstream fill requests while first fill is blocked = %d, want 1", got)
+	}
+	release()
+
+	for i, done := range []chan error{firstDone, secondDone} {
+		if err := <-done; err != nil {
+			t.Fatalf("range request %d failed: %v", i+1, err)
+		}
+	}
+	if got := fillRequests.Load(); got != 1 {
+		t.Fatalf("upstream fill requests = %d, want 1", got)
 	}
 }
 
@@ -1076,6 +1157,22 @@ func renderProxyMetrics(t *testing.T, recorder *metrics.Recorder) string {
 	return rec.Body.String()
 }
 
+func serveRangeRequest(p *Proxy, path, rangeHeader string, wantBody []byte) error {
+	req := httptest.NewRequest(http.MethodGet, path, nil)
+	req.Header.Set("Range", rangeHeader)
+	rec := httptest.NewRecorder()
+
+	p.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusPartialContent {
+		return fmt.Errorf("status = %d, want 206; body=%q", rec.Code, rec.Body.String())
+	}
+	if got := rec.Body.Bytes(); !bytes.Equal(got, wantBody) {
+		return fmt.Errorf("body = %q, want %q", got, wantBody)
+	}
+	return nil
+}
+
 type metadataStoreFailingCache struct {
 	cacheStore
 }
@@ -1090,6 +1187,21 @@ type invalidationFailingCache struct {
 
 func (c invalidationFailingCache) DeleteObject(context.Context, string, string) error {
 	return errors.New("invalidation failed")
+}
+
+type missingPageSignalCache struct {
+	cacheStore
+	misses         *atomic.Int32
+	secondMissSeen chan struct{}
+	secondSignaled atomic.Bool
+}
+
+func (c *missingPageSignalCache) OpenPage(ctx context.Context, objectID string, index int64) (io.ReadCloser, bool, error) {
+	body, ok, err := c.cacheStore.OpenPage(ctx, objectID, index)
+	if err == nil && !ok && c.misses.Add(1) == 2 && c.secondSignaled.CompareAndSwap(false, true) {
+		close(c.secondMissSeen)
+	}
+	return body, ok, err
 }
 
 func equalStringSlices(a, b []string) bool {

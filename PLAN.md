@@ -975,13 +975,13 @@ Cover:
   - [x] preserve response status, headers, and bodies
   - [ ] add integration test with local S3-compatible backend
 
-- [ ] **Milestone 3: Page Cache Core**
+- [x] **Milestone 3: Page Cache Core**
   - [x] add SQLite cache index
   - [x] add object rows and page files
   - [x] add page inventory tracking through SQLite
   - [x] atomically store fetched pages
   - [x] ignore incomplete or corrupt pages
-  - [ ] coalesce concurrent fetches for the same missing page
+  - [x] coalesce concurrent fetches for the same missing page
   - [x] fetch pages with `If-Match` and fence stores with a per-object epoch
 
 - [x] **Milestone 4: GET, HEAD, and Single Range Cache**
