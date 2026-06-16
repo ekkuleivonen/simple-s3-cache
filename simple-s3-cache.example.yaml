@@ -1,0 +1,9 @@
+listen: ":8080"
+
+upstream:
+  endpoint: http://rustfs:9000
+
+cache:
+  path: /cache
+  max_size: 1TB
+  page_size: 4MB
