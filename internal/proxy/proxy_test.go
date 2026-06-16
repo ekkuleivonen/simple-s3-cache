@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -17,6 +18,7 @@ import (
 	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 
 	"github.com/ekkuleivonen/simple-s3-cache/internal/cache"
+	"github.com/ekkuleivonen/simple-s3-cache/internal/metrics"
 	"github.com/ekkuleivonen/simple-s3-cache/internal/s3request"
 )
 
@@ -290,6 +292,98 @@ func TestProxyCachesMultiPageRangeRead(t *testing.T) {
 	wantRequests := []string{"HEAD ", "GET bytes=0-3", "GET bytes=4-7"}
 	if !equalStringSlices(upstreamRequests, wantRequests) {
 		t.Fatalf("upstream requests = %q, want %q", upstreamRequests, wantRequests)
+	}
+}
+
+func TestProxyRecordsRangeMetricsAndStructuredLogFields(t *testing.T) {
+	body := []byte("abcdefghijkl")
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeObjectResponse(t, w, r, body, `"etag-observe"`)
+	}))
+	defer upstream.Close()
+
+	var logs bytes.Buffer
+	p := testProxyWithPageSize(t, upstream.URL, 4)
+	p.logger = slog.New(slog.NewJSONHandler(&logs, nil))
+	p.metrics = metrics.NewRecorder(1 << 20)
+
+	req := httptest.NewRequest(http.MethodGet, "/photos/object.bin", nil)
+	req.Header.Set("Range", "bytes=2-7")
+	rec := httptest.NewRecorder()
+
+	p.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusPartialContent {
+		t.Fatalf("status = %d, want 206; body=%q", rec.Code, rec.Body.String())
+	}
+
+	var entry map[string]any
+	if err := json.Unmarshal(logs.Bytes(), &entry); err != nil {
+		t.Fatalf("decode log entry: %v\nlog: %s", err, logs.String())
+	}
+	for key, want := range map[string]any{
+		"method":                 http.MethodGet,
+		"bucket":                 "photos",
+		"key":                    "object.bin",
+		"cache_result":           "miss",
+		"requested_range":        "bytes=2-7",
+		"bytes_requested":        float64(6),
+		"pages_requested":        float64(2),
+		"pages_hit":              float64(0),
+		"pages_missed":           float64(2),
+		"status":                 float64(http.StatusPartialContent),
+		"bytes_sent":             float64(6),
+		"bytes_fetched_upstream": float64(8),
+	} {
+		if entry[key] != want {
+			t.Fatalf("log field %s = %#v, want %#v\nentry=%#v", key, entry[key], want, entry)
+		}
+	}
+	if got, ok := entry["read_amplification"].(float64); !ok || got < 1.33 || got > 1.34 {
+		t.Fatalf("read_amplification = %#v, want about 1.333", entry["read_amplification"])
+	}
+
+	metricsBody := renderProxyMetrics(t, p.metrics)
+	for _, want := range []string{
+		`simple_s3_cache_page_misses_total{bucket="photos"} 2`,
+		`simple_s3_cache_upstream_fill_bytes_total{bucket="photos"} 8`,
+		`simple_s3_cache_requested_bytes_sum{bucket="photos"} 6`,
+		`simple_s3_cache_pages_touched_sum{bucket="photos"} 2`,
+		`simple_s3_cache_read_amplification_sum{bucket="photos"} 1.333`,
+	} {
+		if !bytes.Contains([]byte(metricsBody), []byte(want)) {
+			t.Fatalf("metrics body missing %q:\n%s", want, metricsBody)
+		}
+	}
+}
+
+func TestProxyRecordsUpstreamFailureWhenPageFillReturnsUnexpectedStatus(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "12")
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("ETag", `"etag-fail-fill"`)
+		if r.Method == http.MethodHead {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer upstream.Close()
+
+	p := testProxyWithPageSize(t, upstream.URL, 4)
+	p.metrics = metrics.NewRecorder(1 << 20)
+	req := httptest.NewRequest(http.MethodGet, "/photos/object.bin", nil)
+	req.Header.Set("Range", "bytes=0-3")
+	rec := httptest.NewRecorder()
+
+	p.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", rec.Code)
+	}
+	metricsBody := renderProxyMetrics(t, p.metrics)
+	if !bytes.Contains([]byte(metricsBody), []byte(`simple_s3_cache_upstream_request_failures_total{bucket="photos",operation="fill"} 1`)) {
+		t.Fatalf("metrics body missing upstream fill failure:\n%s", metricsBody)
 	}
 }
 
@@ -643,9 +737,10 @@ func TestProxyDoesNotFailSuccessfulWriteWhenInvalidationFails(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPut, "/bucket/object.bin", bytes.NewReader([]byte("new body")))
 	rec := httptest.NewRecorder()
 
-	status, bytesWritten, err := p.handle(rec, req, s3request.Target{Bucket: "bucket", Key: "object.bin"}, s3request.Classification{
+	target := s3request.Target{Bucket: "bucket", Key: "object.bin"}
+	status, bytesWritten, err := p.handle(rec, req, target, s3request.Classification{
 		Disposition: s3request.PassThrough,
-	})
+	}, newRequestStats(req, target))
 	if err != nil {
 		t.Fatalf("handle() error = %v, want nil because upstream write already succeeded", err)
 	}
@@ -747,9 +842,11 @@ func testProxyWithPageSize(t *testing.T, endpoint string, pageSize int64) *Proxy
 		t.Fatalf("parse endpoint: %v", err)
 	}
 	root := t.TempDir()
+	recorder := metrics.NewRecorder(1 << 30)
 	cacheStore, err := cache.Open(context.Background(), cache.Options{
 		CachePath: filepath.Join(root, "cache-bytes"),
 		MetaPath:  filepath.Join(root, "cache-meta"),
+		Metrics:   recorder,
 	})
 	if err != nil {
 		t.Fatalf("open cache: %v", err)
@@ -775,11 +872,24 @@ func testProxyWithPageSize(t *testing.T, endpoint string, pageSize int64) *Proxy
 		logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
 		cache:    cacheStore,
 		pageSize: pageSize,
+		metrics:  recorder,
 	}
 }
 
 func upstreamClient(_ string) *http.Client {
 	return http.DefaultClient
+}
+
+func renderProxyMetrics(t *testing.T, recorder *metrics.Recorder) string {
+	t.Helper()
+
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	rec := httptest.NewRecorder()
+	recorder.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("metrics status = %d, want 200", rec.Code)
+	}
+	return rec.Body.String()
 }
 
 type metadataStoreFailingCache struct {

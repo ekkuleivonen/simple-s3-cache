@@ -1005,9 +1005,9 @@ Cover:
   - [x] implement background LRU eviction, out of the request hot path
   - [x] tolerate missing or corrupt cache files
 
-- [ ] **Milestone 7: Operations Polish**
-  - [ ] add metrics endpoint with bucket-labeled counters and read-amplification data
-  - [ ] add structured logs with bytes requested and bytes fetched upstream
+- [x] **Milestone 7: Operations Polish**
+  - [x] add metrics endpoint with bucket-labeled counters and read-amplification data
+  - [x] add structured logs with bytes requested and bytes fetched upstream
   - [x] add graceful shutdown
   - [x] document deployment assumptions
   - [x] document known limitations and production tuning strategy

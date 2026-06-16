@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/ekkuleivonen/simple-s3-cache/internal/config"
+	"github.com/ekkuleivonen/simple-s3-cache/internal/metrics"
 )
 
 func TestHealthz(t *testing.T) {
@@ -29,6 +30,26 @@ func TestHealthz(t *testing.T) {
 	}
 	if got := rec.Body.String(); got != "{\"status\":\"ok\"}\n" {
 		t.Fatalf("body = %q", got)
+	}
+}
+
+func TestMetricsEndpoint(t *testing.T) {
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logs, nil))
+	recorder := metrics.NewRecorder(4096)
+	recorder.RecordPageHit("bucket")
+	srv := New(config.Config{Listen: ":0"}, logger, nil, recorder.Handler())
+
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	rec := httptest.NewRecorder()
+
+	srv.httpServer.Handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	if got := rec.Body.String(); !bytes.Contains([]byte(got), []byte(`simple_s3_cache_page_hits_total{bucket="bucket"} 1`)) {
+		t.Fatalf("metrics body missing page hit:\n%s", got)
 	}
 }
 

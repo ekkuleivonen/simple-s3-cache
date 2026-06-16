@@ -15,6 +15,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ekkuleivonen/simple-s3-cache/internal/metrics"
+
 	_ "modernc.org/sqlite"
 )
 
@@ -22,6 +24,7 @@ type Options struct {
 	CachePath string
 	MetaPath  string
 	MaxSize   int64
+	Metrics   *metrics.Recorder
 }
 
 type Cache struct {
@@ -33,6 +36,7 @@ type Cache struct {
 	touchCh      chan pageRef
 	cancelWorker context.CancelFunc
 	workerWG     sync.WaitGroup
+	metrics      *metrics.Recorder
 }
 
 type ObjectMetadata struct {
@@ -108,12 +112,14 @@ func Open(ctx context.Context, opts Options) (*Cache, error) {
 		evictionCh:   make(chan struct{}, 1),
 		touchCh:      make(chan pageRef, 1024),
 		cancelWorker: cancelWorker,
+		metrics:      opts.Metrics,
 	}
 	if err := c.init(ctx); err != nil {
 		cancelWorker()
 		_ = db.Close()
 		return nil, err
 	}
+	c.updateCacheSizeMetrics(ctx)
 
 	c.workerWG.Add(1)
 	go c.maintenanceLoop(workerCtx)
@@ -257,6 +263,7 @@ ON CONFLICT(id) DO NOTHING
 			return fmt.Errorf("delete page file: %w", err)
 		}
 	}
+	c.updateCacheSizeMetrics(ctx)
 
 	return nil
 }
@@ -371,6 +378,7 @@ func (c *Cache) StorePage(ctx context.Context, write PageWrite) (Page, error) {
 		_ = os.Remove(absPath)
 		return Page{}, err
 	}
+	c.updateCacheSizeMetrics(ctx)
 	c.requestEviction()
 
 	return page, nil
@@ -428,6 +436,33 @@ func (c *Cache) CurrentSize(ctx context.Context) (int64, error) {
 		return 0, fmt.Errorf("read cache size: %w", err)
 	}
 	return size, nil
+}
+
+func (c *Cache) CurrentSizeByBucket(ctx context.Context) (map[string]int64, error) {
+	rows, err := c.db.QueryContext(ctx, `
+SELECT o.bucket, COALESCE(SUM(p.size), 0)
+FROM pages p
+JOIN objects o ON o.id = p.object_id
+GROUP BY o.bucket
+`)
+	if err != nil {
+		return nil, fmt.Errorf("read cache size by bucket: %w", err)
+	}
+	defer rows.Close()
+
+	sizes := map[string]int64{}
+	for rows.Next() {
+		var bucket string
+		var size int64
+		if err := rows.Scan(&bucket, &size); err != nil {
+			return nil, fmt.Errorf("scan cache size by bucket: %w", err)
+		}
+		sizes[bucket] = size
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read cache size by bucket: %w", err)
+	}
+	return sizes, nil
 }
 
 func (c *Cache) Evict(ctx context.Context) error {
@@ -500,6 +535,21 @@ func (c *Cache) init(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+func (c *Cache) updateCacheSizeMetrics(ctx context.Context) {
+	if c.metrics == nil {
+		return
+	}
+	total, err := c.CurrentSize(ctx)
+	if err != nil {
+		return
+	}
+	byBucket, err := c.CurrentSizeByBucket(ctx)
+	if err != nil {
+		return
+	}
+	c.metrics.SetCachedBytes(total, byBucket)
 }
 
 func (c *Cache) ensureGeneration(ctx context.Context, objectID string) error {
@@ -650,13 +700,30 @@ LIMIT 1
 }
 
 func (c *Cache) removePage(ctx context.Context, page Page) error {
+	bucket, _ := c.pageBucket(ctx, page.ObjectID)
 	if err := c.deletePage(ctx, page.ObjectID, page.Index); err != nil {
 		return err
 	}
 	if err := os.Remove(filepath.Join(c.cacheRoot, page.Path)); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("delete evicted page file: %w", err)
 	}
+	if c.metrics != nil {
+		c.metrics.RecordEviction(bucket)
+	}
+	c.updateCacheSizeMetrics(ctx)
 	return nil
+}
+
+func (c *Cache) pageBucket(ctx context.Context, objectID string) (string, error) {
+	row := c.db.QueryRowContext(ctx, `SELECT bucket FROM objects WHERE id = ?`, objectID)
+	var bucket string
+	if err := row.Scan(&bucket); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", nil
+		}
+		return "", fmt.Errorf("read page bucket: %w", err)
+	}
+	return bucket, nil
 }
 
 func (c *Cache) requestEviction() {

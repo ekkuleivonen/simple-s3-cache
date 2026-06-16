@@ -43,7 +43,7 @@ func run() int {
 		}
 	}()
 
-	srv := server.New(cfg, logger, proxyHandler)
+	srv := server.New(cfg, logger, proxyHandler, proxyHandler.MetricsHandler())
 	errCh := make(chan error, 1)
 
 	go func() {
