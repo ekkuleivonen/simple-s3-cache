@@ -36,6 +36,8 @@ func TestRecorderRendersGlobalAndBucketMetrics(t *testing.T) {
 	recorder.ObservePeerForwardDuration("photos", "cache-1", "2xx", time.Millisecond)
 	recorder.ObservePeerResponseHeaderDuration("photos", "cache-1", "2xx", 2*time.Millisecond)
 	recorder.ObservePeerResponseCopyDuration("photos", "cache-1", "2xx", 3*time.Millisecond)
+	recorder.ObservePeerResponseBodyReadDuration("photos", "cache-1", "2xx", time.Millisecond)
+	recorder.ObservePeerDownstreamWriteDuration("photos", "cache-1", "2xx", 2*time.Millisecond)
 	recorder.SetCachedBytes(64, map[string]int64{"photos": 64})
 
 	body := renderMetrics(t, recorder)
@@ -67,6 +69,8 @@ func TestRecorderRendersGlobalAndBucketMetrics(t *testing.T) {
 		`simple_s3_cache_peer_forward_duration_seconds_count{bucket="photos",peer_id="cache-1",status_class="2xx"} 1`,
 		`simple_s3_cache_peer_response_header_duration_seconds_count{bucket="photos",peer_id="cache-1",status_class="2xx"} 1`,
 		`simple_s3_cache_peer_response_copy_duration_seconds_count{bucket="photos",peer_id="cache-1",status_class="2xx"} 1`,
+		`simple_s3_cache_peer_response_body_read_duration_seconds_count{bucket="photos",peer_id="cache-1",status_class="2xx"} 1`,
+		`simple_s3_cache_peer_downstream_write_duration_seconds_count{bucket="photos",peer_id="cache-1",status_class="2xx"} 1`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("metrics body missing %q:\n%s", want, body)

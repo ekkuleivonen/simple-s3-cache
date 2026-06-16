@@ -1760,6 +1760,8 @@ func TestProxyPeerModeForwardsRemoteOwnerRequest(t *testing.T) {
 		`simple_s3_cache_peer_forward_duration_seconds_count{bucket="bucket",peer_id="cache-1",status_class="2xx"} 1`,
 		`simple_s3_cache_peer_response_header_duration_seconds_count{bucket="bucket",peer_id="cache-1",status_class="2xx"} 1`,
 		`simple_s3_cache_peer_response_copy_duration_seconds_count{bucket="bucket",peer_id="cache-1",status_class="2xx"} 1`,
+		`simple_s3_cache_peer_response_body_read_duration_seconds_count{bucket="bucket",peer_id="cache-1",status_class="2xx"} 1`,
+		`simple_s3_cache_peer_downstream_write_duration_seconds_count{bucket="bucket",peer_id="cache-1",status_class="2xx"} 1`,
 	} {
 		if !strings.Contains(metricsBody, want) {
 			t.Fatalf("metrics missing %q:\n%s", want, metricsBody)

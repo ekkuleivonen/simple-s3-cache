@@ -101,34 +101,37 @@ type pageFillCall struct {
 }
 
 type requestStats struct {
-	method                     string
-	bucket                     string
-	key                        string
-	cacheResult                string
-	requestedRange             string
-	bytesRequested             int64
-	pagesRequested             int64
-	pagesHit                   int64
-	pagesMissed                int64
-	bytesSent                  int64
-	bytesFetchedUpstream       int64
-	upstreamDuration           time.Duration
-	cacheServeDuration         time.Duration
-	cacheMetadataDuration      time.Duration
-	cachePageOpenDuration      time.Duration
-	cacheResponseCopyDuration  time.Duration
-	cacheResponseBytes         int64
-	status                     int
-	peerMode                   string
-	peerLocalID                string
-	peerOwnerID                string
-	peerDecision               string
-	peerForwarded              bool
-	peerForwardFailure         string
-	peerForwardDuration        time.Duration
-	peerResponseHeaderDuration time.Duration
-	peerResponseCopyDuration   time.Duration
-	peerResponseBytes          int64
+	method                       string
+	bucket                       string
+	key                          string
+	cacheResult                  string
+	requestedRange               string
+	bytesRequested               int64
+	pagesRequested               int64
+	pagesHit                     int64
+	pagesMissed                  int64
+	bytesSent                    int64
+	bytesFetchedUpstream         int64
+	upstreamDuration             time.Duration
+	cacheServeDuration           time.Duration
+	cacheMetadataDuration        time.Duration
+	cachePageOpenDuration        time.Duration
+	cacheResponseCopyDuration    time.Duration
+	cacheResponseBytes           int64
+	status                       int
+	peerMode                     string
+	peerLocalID                  string
+	peerOwnerID                  string
+	peerDecision                 string
+	peerForwarded                bool
+	peerForwardFailure           string
+	peerForwardDuration          time.Duration
+	peerResponseHeaderDuration   time.Duration
+	peerResponseCopyDuration     time.Duration
+	peerResponseBodyReadDuration time.Duration
+	peerDownstreamWriteDuration  time.Duration
+	peerResponseBodyReadChunks   int64
+	peerResponseBytes            int64
 }
 
 func New(ctx context.Context, cfg appconfig.Config, logger *slog.Logger) (*Proxy, error) {
@@ -398,6 +401,9 @@ func (p *Proxy) shouldForwardToPeer(w http.ResponseWriter, r *http.Request, targ
 		slog.Int64("peer_forward_duration_ms", stats.peerForwardDuration.Milliseconds()),
 		slog.Int64("peer_response_header_duration_ms", stats.peerResponseHeaderDuration.Milliseconds()),
 		slog.Int64("peer_response_copy_duration_ms", stats.peerResponseCopyDuration.Milliseconds()),
+		slog.Int64("peer_response_body_read_duration_ms", stats.peerResponseBodyReadDuration.Milliseconds()),
+		slog.Int64("peer_downstream_write_duration_ms", stats.peerDownstreamWriteDuration.Milliseconds()),
+		slog.Int64("peer_response_body_read_chunks", stats.peerResponseBodyReadChunks),
 	)
 	return true
 }
@@ -550,10 +556,33 @@ func (p *Proxy) forwardToPeer(w http.ResponseWriter, r *http.Request, owner peer
 		return resp.StatusCode, 0, nil
 	}
 	copyStart := time.Now()
-	bytesWritten, copyErr := io.Copy(w, resp.Body)
+	reader := &timedPeerBodyReader{src: resp.Body}
+	bytesWritten, copyErr := io.Copy(w, reader)
 	stats.peerResponseCopyDuration = time.Since(copyStart)
+	stats.peerResponseBodyReadDuration = reader.duration
+	stats.peerResponseBodyReadChunks = reader.chunks
+	stats.peerDownstreamWriteDuration = stats.peerResponseCopyDuration - stats.peerResponseBodyReadDuration
+	if stats.peerDownstreamWriteDuration < 0 {
+		stats.peerDownstreamWriteDuration = 0
+	}
 	stats.peerResponseBytes = bytesWritten
 	return resp.StatusCode, bytesWritten, copyErr
+}
+
+type timedPeerBodyReader struct {
+	src      io.Reader
+	duration time.Duration
+	chunks   int64
+}
+
+func (r *timedPeerBodyReader) Read(data []byte) (int, error) {
+	start := time.Now()
+	n, err := r.src.Read(data)
+	r.duration += time.Since(start)
+	if n > 0 {
+		r.chunks++
+	}
+	return n, err
 }
 
 func forwardBody(r *http.Request, opts uploadOptions) (io.Reader, int64, func() (io.ReadCloser, error), func(), bool, error) {
@@ -925,6 +954,8 @@ func (p *Proxy) recordPeerMetrics(stats *requestStats) {
 	}
 	if stats.peerResponseCopyDuration > 0 {
 		p.metrics.ObservePeerResponseCopyDuration(stats.bucket, stats.peerOwnerID, statusClass, stats.peerResponseCopyDuration)
+		p.metrics.ObservePeerResponseBodyReadDuration(stats.bucket, stats.peerOwnerID, statusClass, stats.peerResponseBodyReadDuration)
+		p.metrics.ObservePeerDownstreamWriteDuration(stats.bucket, stats.peerOwnerID, statusClass, stats.peerDownstreamWriteDuration)
 	}
 	if stats.peerForwardFailure == "" {
 		p.metrics.RecordPeerForward(stats.bucket, stats.peerOwnerID, stats.method, statusClass)

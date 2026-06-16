@@ -51,6 +51,8 @@ func NewRecorder(cacheMaxBytes int64) *Recorder {
 	r.registerHistogram("simple_s3_cache_peer_forward_duration_seconds", []float64{0.0001, 0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5})
 	r.registerHistogram("simple_s3_cache_peer_response_header_duration_seconds", []float64{0.0001, 0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5})
 	r.registerHistogram("simple_s3_cache_peer_response_copy_duration_seconds", []float64{0.0001, 0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5})
+	r.registerHistogram("simple_s3_cache_peer_response_body_read_duration_seconds", []float64{0.0001, 0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5})
+	r.registerHistogram("simple_s3_cache_peer_downstream_write_duration_seconds", []float64{0.0001, 0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5})
 	return r
 }
 
@@ -159,6 +161,14 @@ func (r *Recorder) ObservePeerResponseHeaderDuration(bucket, peerID, statusClass
 
 func (r *Recorder) ObservePeerResponseCopyDuration(bucket, peerID, statusClass string, d time.Duration) {
 	r.observe("simple_s3_cache_peer_response_copy_duration_seconds", labels(label{"bucket", bucket}, label{"peer_id", peerID}, label{"status_class", statusClass}), d.Seconds())
+}
+
+func (r *Recorder) ObservePeerResponseBodyReadDuration(bucket, peerID, statusClass string, d time.Duration) {
+	r.observe("simple_s3_cache_peer_response_body_read_duration_seconds", labels(label{"bucket", bucket}, label{"peer_id", peerID}, label{"status_class", statusClass}), d.Seconds())
+}
+
+func (r *Recorder) ObservePeerDownstreamWriteDuration(bucket, peerID, statusClass string, d time.Duration) {
+	r.observe("simple_s3_cache_peer_downstream_write_duration_seconds", labels(label{"bucket", bucket}, label{"peer_id", peerID}, label{"status_class", statusClass}), d.Seconds())
 }
 
 func (r *Recorder) SetCachedBytes(total int64, byBucket map[string]int64) {
