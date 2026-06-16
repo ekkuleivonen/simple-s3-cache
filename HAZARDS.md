@@ -191,9 +191,9 @@ test. Until then, treat it as load-bearing.
 
 ### H13. Disk-full or cache write failure breaks reads
 
-* **Risk:** Cache page storage fails because the cache directory is full, SQLite
-  is locked, permissions changed, or disk writes fail, and the client request is
-  failed even though upstream object bytes were readable.
+* **Risk:** Cache page storage fails because the cache data path is full,
+  SQLite is locked, permissions changed, or disk writes fail, and the client
+  request is failed even though upstream object bytes were readable.
 * **Why it matters:** The disposable cache becomes a source of user-visible
   read failures.
 * **Mitigation:** Continue serving the upstream response when possible, skip

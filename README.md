@@ -237,7 +237,7 @@ disposable cache, not a source of truth.
 
 The cache is disposable.
 
-Deleting the cache directory should never result in data loss.
+Deleting the cache data or metadata paths should never result in data loss.
 
 ## Consistency
 
@@ -309,10 +309,15 @@ upstream:
   endpoint: http://rustfs:9000
 
 cache:
-  path: /cache
+  cache_path: /cache/objects
+  meta_path: /cache/meta
   max_size: 1TB
   page_size: 4MB
 ```
+
+`cache_path` stores cached page files. `meta_path` stores the SQLite cache
+index. Both are disposable cache state, but they may be placed on separate
+volumes when that is operationally useful.
 
 Page size is the primary tuning knob. Larger pages reduce metadata overhead but
 amplify over-fetch on small scattered reads (a tiny Parquet footer still pulls a

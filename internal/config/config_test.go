@@ -20,8 +20,11 @@ upstream:
 	if cfg.Listen != ":8080" {
 		t.Fatalf("Listen = %q, want :8080", cfg.Listen)
 	}
-	if cfg.Cache.Path != "/cache" {
-		t.Fatalf("Cache.Path = %q, want /cache", cfg.Cache.Path)
+	if cfg.Cache.CachePath != "/cache/objects" {
+		t.Fatalf("Cache.CachePath = %q, want /cache/objects", cfg.Cache.CachePath)
+	}
+	if cfg.Cache.MetaPath != "/cache/meta" {
+		t.Fatalf("Cache.MetaPath = %q, want /cache/meta", cfg.Cache.MetaPath)
 	}
 	if cfg.Upstream.Region != "us-east-1" {
 		t.Fatalf("Upstream.Region = %q, want us-east-1", cfg.Upstream.Region)
@@ -41,7 +44,8 @@ upstream:
   endpoint: https://s3.example.test
   region: eu-north-1
 cache:
-  path: /tmp/cache
+  cache_path: /mnt/cache-bytes
+  meta_path: /mnt/cache-meta
   max_size: 2GB
   page_size: 512KB
 `)
@@ -60,8 +64,11 @@ cache:
 	if cfg.Upstream.Region != "eu-north-1" {
 		t.Fatalf("Upstream.Region = %q", cfg.Upstream.Region)
 	}
-	if cfg.Cache.Path != "/tmp/cache" {
-		t.Fatalf("Cache.Path = %q", cfg.Cache.Path)
+	if cfg.Cache.CachePath != "/mnt/cache-bytes" {
+		t.Fatalf("Cache.CachePath = %q", cfg.Cache.CachePath)
+	}
+	if cfg.Cache.MetaPath != "/mnt/cache-meta" {
+		t.Fatalf("Cache.MetaPath = %q", cfg.Cache.MetaPath)
 	}
 	if cfg.Cache.MaxSize != 2<<30 {
 		t.Fatalf("Cache.MaxSize = %d, want %d", cfg.Cache.MaxSize, int64(2<<30))
@@ -74,6 +81,20 @@ cache:
 func TestLoadRequiresUpstreamEndpoint(t *testing.T) {
 	path := writeConfig(t, `
 listen: ":8080"
+`)
+
+	if _, err := Load(path); err == nil {
+		t.Fatal("Load() error = nil, want validation error")
+	}
+}
+
+func TestLoadRequiresCacheAndMetaPaths(t *testing.T) {
+	path := writeConfig(t, `
+upstream:
+  endpoint: http://rustfs:9000
+cache:
+  cache_path: ""
+  meta_path: ""
 `)
 
 	if _, err := Load(path); err == nil {

@@ -90,7 +90,8 @@ def cache_endpoint(e2e_config: E2EConfig, tmp_path_factory: pytest.TempPathFacto
     endpoint = f"http://127.0.0.1:{port}"
     work_dir = tmp_path_factory.mktemp("simple-s3-cache")
     config_path = work_dir / "simple-s3-cache.yaml"
-    cache_path = work_dir / "cache"
+    cache_path = work_dir / "cache-bytes"
+    meta_path = work_dir / "cache-meta"
     upstream_endpoint = e2e_config.endpoint_url or _aws_s3_endpoint(e2e_config.region)
 
     config_path.write_text(
@@ -101,7 +102,8 @@ def cache_endpoint(e2e_config: E2EConfig, tmp_path_factory: pytest.TempPathFacto
                 f"  endpoint: {upstream_endpoint}",
                 f"  region: {e2e_config.region}",
                 "cache:",
-                f"  path: {cache_path}",
+                f"  cache_path: {cache_path}",
+                f"  meta_path: {meta_path}",
                 "  max_size: 1GB",
                 "  page_size: 4MB",
                 "",

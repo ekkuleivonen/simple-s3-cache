@@ -126,13 +126,13 @@ the request must be passed through. Serving a `200` where upstream would return
 Objects are cached as fixed-size pages rather than complete files. Only
 requested pages are stored locally.
 
-Cached pages are stored under the configured cache directory. A cached object
+Cached pages are stored under the configured `cache.cache_path`. A cached object
 may be fully cached, partially cached, or not cached.
 
-The cache also keeps a local SQLite index at the root of the cache directory.
-SQLite is part of the disposable cache, not a source of truth.
+The cache also keeps a local SQLite index under the configured
+`cache.meta_path`. SQLite is part of the disposable cache, not a source of truth.
 
-The cache directory contains:
+The cache paths contain:
 
 - zero or more immutable page files
 - `cache.db`, which tracks objects, pages, headers, sizes, and access times
@@ -141,7 +141,8 @@ Example:
 
 ```text
 /cache/
-  cache.db
+  meta/
+    cache.db
   objects/
     ab/cd/object-hash/
       page-000000
@@ -225,7 +226,8 @@ upstream:
   path_style: true
 
 cache:
-  path: /cache
+  cache_path: /cache/objects
+  meta_path: /cache/meta
   max_size: 1TB
   page_size: 4MB
 ```
@@ -663,7 +665,7 @@ in `HAZARDS.md`.
 Cache storage failure must not turn a readable upstream object into a failed
 client read unless the upstream read itself failed.
 
-If a page cannot be stored because the cache directory is full, SQLite is
+If a page cannot be stored because the cache data path is full, SQLite is
 locked, permissions changed, or a disk write fails:
 
 - continue streaming the upstream response to the client when possible
@@ -746,8 +748,8 @@ request contract.
 
 ### Storage And Failure Behavior
 
-- Cache state is disposable: deleting the cache directory never loses upstream
-  data.
+- Cache state is disposable: deleting the cache data or metadata paths never
+  loses upstream data.
 - Missing or corrupt `cache.db` starts cleanly with an empty cache.
 - Missing page files, orphaned page files, interrupted downloads, and failed
   cache writes are tolerated.
@@ -943,7 +945,7 @@ Cover:
 Cover:
 
 - interrupted upstream download does not create visible pages
-- cache directory deletion does not lose upstream data
+- cache data or metadata path deletion does not lose upstream data
 - missing or corrupt `cache.db` starts with an empty cache
 - stale SQLite page rows are ignored and removed
 - orphaned page files are ignored

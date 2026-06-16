@@ -13,11 +13,12 @@ import (
 )
 
 const (
-	defaultListen   = ":8080"
-	defaultCacheDir = "/cache"
-	defaultMaxSize  = int64(1 << 40) // 1 TiB
-	defaultPageSize = int64(4 << 20) // 4 MiB
-	defaultRegion   = "us-east-1"
+	defaultListen    = ":8080"
+	defaultCachePath = "/cache/objects"
+	defaultMetaPath  = "/cache/meta"
+	defaultMaxSize   = int64(1 << 40) // 1 TiB
+	defaultPageSize  = int64(4 << 20) // 4 MiB
+	defaultRegion    = "us-east-1"
 )
 
 // Config is the process configuration loaded from YAML.
@@ -33,9 +34,10 @@ type UpstreamConfig struct {
 }
 
 type CacheConfig struct {
-	Path     string `yaml:"path"`
-	MaxSize  int64  `yaml:"-"`
-	PageSize int64  `yaml:"-"`
+	CachePath string `yaml:"cache_path"`
+	MetaPath  string `yaml:"meta_path"`
+	MaxSize   int64  `yaml:"-"`
+	PageSize  int64  `yaml:"-"`
 
 	MaxSizeText  string `yaml:"max_size"`
 	PageSizeText string `yaml:"page_size"`
@@ -71,9 +73,10 @@ func Default() Config {
 			Region: defaultRegion,
 		},
 		Cache: CacheConfig{
-			Path:     defaultCacheDir,
-			MaxSize:  defaultMaxSize,
-			PageSize: defaultPageSize,
+			CachePath: defaultCachePath,
+			MetaPath:  defaultMetaPath,
+			MaxSize:   defaultMaxSize,
+			PageSize:  defaultPageSize,
 		},
 	}
 }
@@ -121,8 +124,11 @@ func (cfg Config) Validate() error {
 		errs = append(errs, errors.New("upstream.region is required"))
 	}
 
-	if strings.TrimSpace(cfg.Cache.Path) == "" {
-		errs = append(errs, errors.New("cache.path is required"))
+	if strings.TrimSpace(cfg.Cache.CachePath) == "" {
+		errs = append(errs, errors.New("cache.cache_path is required"))
+	}
+	if strings.TrimSpace(cfg.Cache.MetaPath) == "" {
+		errs = append(errs, errors.New("cache.meta_path is required"))
 	}
 	if cfg.Cache.MaxSize <= 0 {
 		errs = append(errs, errors.New("cache.max_size must be greater than zero"))
