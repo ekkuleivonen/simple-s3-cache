@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
 )
 
@@ -106,7 +108,8 @@ func TestStorePageWritesFileAtomicallyThenCommitsRow(t *testing.T) {
 		ObjectID: obj.ID,
 		Index:    0,
 		ETag:     obj.ETag,
-		Data:     []byte("hello cached page"),
+		Size:     int64(len("hello cached page")),
+		Source:   bytes.NewReader([]byte("hello cached page")),
 	})
 	if err != nil {
 		t.Fatalf("StorePage() error = %v", err)
@@ -150,7 +153,8 @@ func TestOpenPageTreatsMissingFileAsMissAndRemovesStaleRow(t *testing.T) {
 		ObjectID: obj.ID,
 		Index:    5,
 		ETag:     obj.ETag,
-		Data:     []byte("page that disappears"),
+		Size:     int64(len("page that disappears")),
+		Source:   bytes.NewReader([]byte("page that disappears")),
 	})
 	if err != nil {
 		t.Fatalf("StorePage() error = %v", err)
@@ -185,7 +189,8 @@ func TestDeleteObjectRemovesMetadataRowsAndPageFiles(t *testing.T) {
 		ObjectID: obj.ID,
 		Index:    0,
 		ETag:     obj.ETag,
-		Data:     []byte("cached page"),
+		Size:     int64(len("cached page")),
+		Source:   bytes.NewReader([]byte("cached page")),
 	})
 	if err != nil {
 		t.Fatalf("StorePage() error = %v", err)
@@ -244,7 +249,8 @@ func TestStorePageRejectsStaleObjectEpochAfterInvalidation(t *testing.T) {
 		Index:         0,
 		ETag:          oldObj.ETag,
 		ExpectedEpoch: oldObj.Epoch,
-		Data:          []byte("stale page"),
+		Size:          int64(len("stale page")),
+		Source:        bytes.NewReader([]byte("stale page")),
 	}); err == nil {
 		t.Fatal("StorePage(stale) error = nil, want stale epoch error")
 	}
@@ -256,6 +262,92 @@ func TestStorePageRejectsStaleObjectEpochAfterInvalidation(t *testing.T) {
 	if ok {
 		body.Close()
 		t.Fatal("OpenPage() ok = true, want false")
+	}
+}
+
+func TestStaleStorePageCannotOverwriteNewerPageAfterInvalidationRace(t *testing.T) {
+	ctx := context.Background()
+	c := openTestCache(t)
+	oldObj := putTestObject(t, c, "bucket", "race-overwrite.bin")
+
+	validated := make(chan struct{})
+	releaseStaleStore := make(chan struct{})
+	var hookUsed atomic.Bool
+	var releaseOnce sync.Once
+	release := func() {
+		releaseOnce.Do(func() {
+			close(releaseStaleStore)
+		})
+	}
+	t.Cleanup(func() {
+		storePageAfterValidationHook = nil
+		release()
+	})
+	storePageAfterValidationHook = func() {
+		if hookUsed.CompareAndSwap(false, true) {
+			close(validated)
+			<-releaseStaleStore
+		}
+	}
+
+	staleDone := make(chan error, 1)
+	go func() {
+		_, err := c.StorePage(ctx, PageWrite{
+			ObjectID:      oldObj.ID,
+			Index:         0,
+			ETag:          oldObj.ETag,
+			ExpectedEpoch: oldObj.Epoch,
+			Size:          int64(len("stale page")),
+			Source:        bytes.NewReader([]byte("stale page")),
+		})
+		staleDone <- err
+	}()
+
+	<-validated
+	if err := c.DeleteObject(ctx, "bucket", "race-overwrite.bin"); err != nil {
+		t.Fatalf("DeleteObject() error = %v", err)
+	}
+	newObj, err := c.PutObject(ctx, ObjectMetadata{
+		Bucket:   "bucket",
+		Key:      "race-overwrite.bin",
+		ETag:     `"etag-2"`,
+		Size:     1024,
+		PageSize: 128,
+		Headers:  http.Header{"Content-Type": []string{"application/octet-stream"}},
+	})
+	if err != nil {
+		t.Fatalf("PutObject(new) error = %v", err)
+	}
+	if _, err := c.StorePage(ctx, PageWrite{
+		ObjectID:      newObj.ID,
+		Index:         0,
+		ETag:          newObj.ETag,
+		ExpectedEpoch: newObj.Epoch,
+		Size:          int64(len("new page")),
+		Source:        bytes.NewReader([]byte("new page")),
+	}); err != nil {
+		t.Fatalf("StorePage(new) error = %v", err)
+	}
+
+	release()
+	if err := <-staleDone; err == nil {
+		t.Fatal("StorePage(stale) error = nil, want stale epoch error")
+	}
+
+	body, ok, err := c.OpenPage(ctx, newObj.ID, 0)
+	if err != nil {
+		t.Fatalf("OpenPage(new) error = %v", err)
+	}
+	if !ok {
+		t.Fatal("OpenPage(new) ok = false, want newer page preserved")
+	}
+	defer body.Close()
+	got, err := io.ReadAll(body)
+	if err != nil {
+		t.Fatalf("ReadAll(new page) error = %v", err)
+	}
+	if !bytes.Equal(got, []byte("new page")) {
+		t.Fatalf("new page body = %q, want %q", got, "new page")
 	}
 }
 
@@ -279,7 +371,8 @@ func TestOpenUsesSeparateCacheAndMetaPaths(t *testing.T) {
 		ObjectID: obj.ID,
 		Index:    1,
 		ETag:     obj.ETag,
-		Data:     []byte("split paths"),
+		Size:     int64(len("split paths")),
+		Source:   bytes.NewReader([]byte("split paths")),
 	})
 	if err != nil {
 		t.Fatalf("StorePage() error = %v", err)
@@ -293,6 +386,42 @@ func TestOpenUsesSeparateCacheAndMetaPaths(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(metaPath, page.Path)); !os.IsNotExist(err) {
 		t.Fatalf("page file under meta path error = %v, want not exist", err)
+	}
+}
+
+func TestOpenConfiguresSQLiteForConcurrentReadsAndLRUEviction(t *testing.T) {
+	ctx := context.Background()
+	c := openTestCache(t)
+
+	if got := c.db.Stats().MaxOpenConnections; got != cacheDBMaxOpenConns {
+		t.Fatalf("MaxOpenConnections = %d, want %d", got, cacheDBMaxOpenConns)
+	}
+
+	rows, err := c.db.QueryContext(ctx, `PRAGMA index_list(pages)`)
+	if err != nil {
+		t.Fatalf("list page indexes: %v", err)
+	}
+	defer rows.Close()
+
+	found := false
+	for rows.Next() {
+		var seq int
+		var name string
+		var unique int
+		var origin string
+		var partial int
+		if err := rows.Scan(&seq, &name, &unique, &origin, &partial); err != nil {
+			t.Fatalf("scan page index: %v", err)
+		}
+		if name == "pages_lru_idx" {
+			found = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("list page indexes: %v", err)
+	}
+	if !found {
+		t.Fatal("pages_lru_idx not found")
 	}
 }
 
@@ -311,7 +440,8 @@ func TestCacheTracksStoredPageSize(t *testing.T) {
 		ObjectID: obj.ID,
 		Index:    0,
 		ETag:     obj.ETag,
-		Data:     []byte("12345"),
+		Size:     int64(len("12345")),
+		Source:   bytes.NewReader([]byte("12345")),
 	}); err != nil {
 		t.Fatalf("StorePage(first) error = %v", err)
 	}
@@ -319,7 +449,8 @@ func TestCacheTracksStoredPageSize(t *testing.T) {
 		ObjectID: obj.ID,
 		Index:    1,
 		ETag:     obj.ETag,
-		Data:     []byte("abc"),
+		Size:     int64(len("abc")),
+		Source:   bytes.NewReader([]byte("abc")),
 	}); err != nil {
 		t.Fatalf("StorePage(second) error = %v", err)
 	}
@@ -340,7 +471,8 @@ func TestStorePageRejectsPageLargerThanMaxSize(t *testing.T) {
 		ObjectID: obj.ID,
 		Index:    0,
 		ETag:     obj.ETag,
-		Data:     []byte("12345"),
+		Size:     int64(len("12345")),
+		Source:   bytes.NewReader([]byte("12345")),
 	}); err == nil {
 		t.Fatal("StorePage() error = nil, want max-size rejection")
 	}
@@ -362,7 +494,8 @@ func TestEvictLRURemovesOldestPagesUntilUnderMaxSize(t *testing.T) {
 			ObjectID: obj.ID,
 			Index:    int64(i),
 			ETag:     obj.ETag,
-			Data:     data,
+			Size:     int64(len(data)),
+			Source:   bytes.NewReader(data),
 		}); err != nil {
 			t.Fatalf("StorePage(%d) error = %v", i, err)
 		}
@@ -401,7 +534,8 @@ func TestOpenPageTreatsSizeMismatchAsMissAndRemovesCorruptFile(t *testing.T) {
 		ObjectID: obj.ID,
 		Index:    0,
 		ETag:     obj.ETag,
-		Data:     []byte("valid page"),
+		Size:     int64(len("valid page")),
+		Source:   bytes.NewReader([]byte("valid page")),
 	})
 	if err != nil {
 		t.Fatalf("StorePage() error = %v", err)
@@ -421,6 +555,44 @@ func TestOpenPageTreatsSizeMismatchAsMissAndRemovesCorruptFile(t *testing.T) {
 	}
 	if _, err := os.Stat(pagePath); !os.IsNotExist(err) {
 		t.Fatalf("corrupt page file stat error = %v, want removed", err)
+	}
+}
+
+func TestOpenTreatsCorruptDatabaseAsEmptyCache(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	cachePath := filepath.Join(root, "cache-bytes")
+	metaPath := filepath.Join(root, "cache-meta")
+	if err := os.MkdirAll(metaPath, 0o755); err != nil {
+		t.Fatalf("create metadata path: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(cachePath, "objects", "orphan"), 0o755); err != nil {
+		t.Fatalf("create orphan cache path: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(cachePath, "objects", "orphan", "page"), []byte("orphan"), 0o644); err != nil {
+		t.Fatalf("write orphan page: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(metaPath, "cache.db"), []byte("not sqlite"), 0o600); err != nil {
+		t.Fatalf("write corrupt cache db: %v", err)
+	}
+
+	c, err := Open(ctx, Options{CachePath: cachePath, MetaPath: metaPath, MaxSize: 1 << 20})
+	if err != nil {
+		t.Fatalf("Open() error = %v, want clean empty cache after corrupt db", err)
+	}
+	t.Cleanup(func() {
+		if err := c.Close(); err != nil {
+			t.Fatalf("Close() error = %v", err)
+		}
+	})
+
+	if got, err := c.CurrentSize(ctx); err != nil {
+		t.Fatalf("CurrentSize() error = %v", err)
+	} else if got != 0 {
+		t.Fatalf("CurrentSize() = %d, want empty cache", got)
+	}
+	if _, err := os.Stat(filepath.Join(cachePath, "objects", "orphan", "page")); !os.IsNotExist(err) {
+		t.Fatalf("orphan page stat error = %v, want removed with corrupt db reset", err)
 	}
 }
 

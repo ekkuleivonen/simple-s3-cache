@@ -3,9 +3,22 @@ listen: ":8080"
 upstream:
   endpoint: http://rustfs:9000
   region: us-east-1
+  access_key: simple-s3-cache
+  secret_key: change-me
+  response_header_timeout: 30s
 
 cache:
   cache_path: /cache/objects
   meta_path: /cache/meta
   max_size: 1TB
   page_size: 4MB
+
+http:
+  read_header_timeout: 5s
+  read_timeout: 10m
+  write_timeout: 10m
+  idle_timeout: 2m
+
+upload:
+  spool_path: /cache/spool
+  max_spool_size: 10GB

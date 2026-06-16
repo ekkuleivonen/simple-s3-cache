@@ -10,14 +10,26 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/ekkuleivonen/simple-s3-cache/internal/metrics"
 
 	_ "modernc.org/sqlite"
+)
+
+const (
+	cacheDBMaxOpenConns    = 8
+	cacheDBMaxIdleConns    = 8
+	evictionBatchSize      = 128
+	metricsRefreshInterval = 5 * time.Second
+	touchFlushInterval     = time.Second
+	touchFlushBatchSize    = 256
+	touchQueueSize         = 1024
 )
 
 type Options struct {
@@ -28,15 +40,20 @@ type Options struct {
 }
 
 type Cache struct {
-	cacheRoot    string
-	metaRoot     string
-	maxSize      int64
-	db           *sql.DB
-	evictionCh   chan struct{}
-	touchCh      chan pageRef
-	cancelWorker context.CancelFunc
-	workerWG     sync.WaitGroup
-	metrics      *metrics.Recorder
+	cacheRoot      string
+	metaRoot       string
+	maxSize        int64
+	db             *sql.DB
+	evictionCh     chan struct{}
+	touchCh        chan pageRef
+	metricsCh      chan struct{}
+	writeMu        sync.Mutex
+	cancelWorker   context.CancelFunc
+	workerWG       sync.WaitGroup
+	metrics        *metrics.Recorder
+	sizeMu         sync.RWMutex
+	cachedSize     int64
+	cachedByBucket map[string]int64
 }
 
 type ObjectMetadata struct {
@@ -72,12 +89,36 @@ type PageWrite struct {
 	Index         int64
 	ETag          string
 	ExpectedEpoch int64
-	Data          []byte
+	Size          int64
+	Source        io.Reader
 }
 
 type pageRef struct {
 	objectID string
 	index    int64
+}
+
+var storePageAfterValidationHook func()
+
+func openCacheDB(dbPath string) (*sql.DB, error) {
+	values := url.Values{}
+	values.Add("_pragma", "journal_mode(WAL)")
+	values.Add("_pragma", "busy_timeout(5000)")
+	values.Add("_pragma", "foreign_keys(1)")
+
+	dsn := (&url.URL{
+		Scheme:   "file",
+		Path:     dbPath,
+		RawQuery: values.Encode(),
+	}).String()
+
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(cacheDBMaxOpenConns)
+	db.SetMaxIdleConns(cacheDBMaxIdleConns)
+	return db, nil
 }
 
 func Open(ctx context.Context, opts Options) (*Cache, error) {
@@ -97,29 +138,56 @@ func Open(ctx context.Context, opts Options) (*Cache, error) {
 		return nil, fmt.Errorf("create metadata directory: %w", err)
 	}
 
-	db, err := sql.Open("sqlite", filepath.Join(opts.MetaPath, "cache.db"))
+	dbPath := filepath.Join(opts.MetaPath, "cache.db")
+	db, err := openCacheDB(dbPath)
 	if err != nil {
 		return nil, fmt.Errorf("open cache db: %w", err)
 	}
-	db.SetMaxOpenConns(1)
 
 	workerCtx, cancelWorker := context.WithCancel(context.Background())
 	c := &Cache{
-		cacheRoot:    opts.CachePath,
-		metaRoot:     opts.MetaPath,
-		maxSize:      opts.MaxSize,
-		db:           db,
-		evictionCh:   make(chan struct{}, 1),
-		touchCh:      make(chan pageRef, 1024),
-		cancelWorker: cancelWorker,
-		metrics:      opts.Metrics,
+		cacheRoot:      opts.CachePath,
+		metaRoot:       opts.MetaPath,
+		maxSize:        opts.MaxSize,
+		db:             db,
+		evictionCh:     make(chan struct{}, 1),
+		touchCh:        make(chan pageRef, touchQueueSize),
+		metricsCh:      make(chan struct{}, 1),
+		cancelWorker:   cancelWorker,
+		metrics:        opts.Metrics,
+		cachedByBucket: map[string]int64{},
 	}
-	if err := c.init(ctx); err != nil {
-		cancelWorker()
+	initErr := c.init(ctx)
+	if initErr != nil && isCorruptDatabaseError(initErr) {
 		_ = db.Close()
+		if resetErr := resetLocalCacheState(opts.CachePath, dbPath); resetErr != nil {
+			cancelWorker()
+			return nil, resetErr
+		}
+		db, err = openCacheDB(dbPath)
+		if err != nil {
+			cancelWorker()
+			return nil, fmt.Errorf("open cache db after reset: %w", err)
+		}
+		c.db = db
+		initErr = c.init(ctx)
+	}
+	if initErr != nil {
+		cancelWorker()
+		if c.db != nil {
+			_ = db.Close()
+		}
+		return nil, initErr
+	}
+
+	total, byBucket, err := c.readCacheSize(ctx)
+	if err != nil {
+		cancelWorker()
+		_ = c.db.Close()
 		return nil, err
 	}
-	c.updateCacheSizeMetrics(ctx)
+	c.setCacheSize(total, byBucket)
+	c.publishCacheSizeMetrics()
 
 	c.workerWG.Add(1)
 	go c.maintenanceLoop(workerCtx)
@@ -131,6 +199,22 @@ func (c *Cache) Close() error {
 	c.cancelWorker()
 	c.workerWG.Wait()
 	return c.db.Close()
+}
+
+func (c *Cache) execWrite(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	return c.db.ExecContext(ctx, query, args...)
+}
+
+func (c *Cache) beginWriteTx(ctx context.Context) (*sql.Tx, func(), error) {
+	c.writeMu.Lock()
+	tx, err := c.db.BeginTx(ctx, nil)
+	if err != nil {
+		c.writeMu.Unlock()
+		return nil, nil, err
+	}
+	return tx, c.writeMu.Unlock, nil
 }
 
 func ObjectKey(bucket, key string) string {
@@ -169,7 +253,7 @@ func (c *Cache) PutObject(ctx context.Context, meta ObjectMetadata) (Object, err
 		return Object{}, err
 	}
 
-	_, err = c.db.ExecContext(ctx, `
+	_, err = c.execWrite(ctx, `
 INSERT INTO objects (id, bucket, key, etag, size, page_size, headers_json, epoch, updated_at)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET
@@ -234,10 +318,11 @@ func (c *Cache) DeleteObject(ctx context.Context, bucket, key string) error {
 		return err
 	}
 
-	tx, err := c.db.BeginTx(ctx, nil)
+	tx, unlock, err := c.beginWriteTx(ctx)
 	if err != nil {
 		return fmt.Errorf("begin delete object: %w", err)
 	}
+	defer unlock()
 	if _, err := tx.ExecContext(ctx, `
 INSERT INTO object_generations (id, epoch)
 VALUES (?, 0)
@@ -263,7 +348,8 @@ ON CONFLICT(id) DO NOTHING
 			return fmt.Errorf("delete page file: %w", err)
 		}
 	}
-	c.updateCacheSizeMetrics(ctx)
+	c.adjustCacheSize(obj.Bucket, -pagesSize(pages))
+	c.requestMetricsRefresh()
 
 	return nil
 }
@@ -273,7 +359,11 @@ func (c *Cache) PutPage(ctx context.Context, page Page) error {
 		return err
 	}
 
-	_, err := c.db.ExecContext(ctx, `
+	previous, hadPrevious, err := c.getPage(ctx, page.ObjectID, page.Index)
+	if err != nil {
+		return err
+	}
+	_, err = c.execWrite(ctx, `
 INSERT INTO pages (object_id, page_index, etag, size, path, created_at, last_accessed_at)
 VALUES (?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(object_id, page_index) DO UPDATE SET
@@ -285,6 +375,13 @@ ON CONFLICT(object_id, page_index) DO UPDATE SET
 	if err != nil {
 		return fmt.Errorf("put page: %w", err)
 	}
+	bucket, _ := c.pageBucket(ctx, page.ObjectID)
+	delta := page.Size
+	if hadPrevious {
+		delta -= previous.Size
+	}
+	c.adjustCacheSize(bucket, delta)
+	c.requestMetricsRefresh()
 	return nil
 }
 
@@ -325,14 +422,23 @@ func (c *Cache) StorePage(ctx context.Context, write PageWrite) (Page, error) {
 	if write.ETag == "" {
 		return Page{}, errors.New("etag is required")
 	}
-	if int64(len(write.Data)) > c.maxSize {
-		return Page{}, fmt.Errorf("page size %d exceeds cache max size %d", len(write.Data), c.maxSize)
+	if write.Size < 0 {
+		return Page{}, errors.New("page size must not be negative")
+	}
+	if write.Source == nil {
+		return Page{}, errors.New("page source is required")
+	}
+	if write.Size > c.maxSize {
+		return Page{}, fmt.Errorf("page size %d exceeds cache max size %d", write.Size, c.maxSize)
 	}
 	if err := c.validatePageCommit(ctx, write.ObjectID, write.ETag, write.ExpectedEpoch); err != nil {
 		return Page{}, err
 	}
+	if storePageAfterValidationHook != nil {
+		storePageAfterValidationHook()
+	}
 
-	relPath := c.pagePath(write.ObjectID, write.Index)
+	relPath := c.pagePathForVersion(write.ObjectID, write.Index, write.ETag, write.ExpectedEpoch)
 	absPath := filepath.Join(c.cacheRoot, relPath)
 	dir := filepath.Dir(absPath)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -351,9 +457,14 @@ func (c *Cache) StorePage(ctx context.Context, write PageWrite) (Page, error) {
 		}
 	}()
 
-	if _, err := tmp.Write(write.Data); err != nil {
+	written, err := io.Copy(tmp, write.Source)
+	if err != nil {
 		_ = tmp.Close()
 		return Page{}, fmt.Errorf("write temp page: %w", err)
+	}
+	if written != write.Size {
+		_ = tmp.Close()
+		return Page{}, fmt.Errorf("write temp page: got %d bytes, want %d", written, write.Size)
 	}
 	if err := tmp.Sync(); err != nil {
 		_ = tmp.Close()
@@ -371,14 +482,16 @@ func (c *Cache) StorePage(ctx context.Context, write PageWrite) (Page, error) {
 		ObjectID: write.ObjectID,
 		Index:    write.Index,
 		ETag:     write.ETag,
-		Size:     int64(len(write.Data)),
+		Size:     write.Size,
 		Path:     relPath,
 	}
-	if err := c.putPageIfCurrent(ctx, page, write.ExpectedEpoch); err != nil {
+	bucket, previousSize, err := c.putPageIfCurrent(ctx, page, write.ExpectedEpoch)
+	if err != nil {
 		_ = os.Remove(absPath)
 		return Page{}, err
 	}
-	c.updateCacheSizeMetrics(ctx)
+	c.adjustCacheSize(bucket, page.Size-previousSize)
+	c.requestMetricsRefresh()
 	c.requestEviction()
 
 	return page, nil
@@ -397,19 +510,31 @@ func (c *Cache) OpenPage(ctx context.Context, objectID string, index int64) (io.
 	info, err := os.Stat(absPath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			if deleteErr := c.deletePage(ctx, objectID, index); deleteErr != nil {
+			bucket, _ := c.pageBucket(ctx, objectID)
+			deleted, deleteErr := c.deletePage(ctx, objectID, index)
+			if deleteErr != nil {
 				return nil, false, deleteErr
+			}
+			if deleted {
+				c.adjustCacheSize(bucket, -page.Size)
+				c.requestMetricsRefresh()
 			}
 			return nil, false, nil
 		}
 		return nil, false, fmt.Errorf("stat page file: %w", err)
 	}
 	if info.Size() != page.Size {
-		if err := c.deletePage(ctx, objectID, index); err != nil {
+		bucket, _ := c.pageBucket(ctx, objectID)
+		deleted, err := c.deletePage(ctx, objectID, index)
+		if err != nil {
 			return nil, false, err
 		}
 		if err := os.Remove(absPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return nil, false, fmt.Errorf("delete corrupt page file: %w", err)
+		}
+		if deleted {
+			c.adjustCacheSize(bucket, -page.Size)
+			c.requestMetricsRefresh()
 		}
 		return nil, false, nil
 	}
@@ -417,8 +542,14 @@ func (c *Cache) OpenPage(ctx context.Context, objectID string, index int64) (io.
 	file, err := os.Open(absPath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			if deleteErr := c.deletePage(ctx, objectID, index); deleteErr != nil {
+			bucket, _ := c.pageBucket(ctx, objectID)
+			deleted, deleteErr := c.deletePage(ctx, objectID, index)
+			if deleteErr != nil {
 				return nil, false, deleteErr
+			}
+			if deleted {
+				c.adjustCacheSize(bucket, -page.Size)
+				c.requestMetricsRefresh()
 			}
 			return nil, false, nil
 		}
@@ -430,15 +561,20 @@ func (c *Cache) OpenPage(ctx context.Context, objectID string, index int64) (io.
 }
 
 func (c *Cache) CurrentSize(ctx context.Context) (int64, error) {
-	row := c.db.QueryRowContext(ctx, `SELECT COALESCE(SUM(size), 0) FROM pages`)
-	var size int64
-	if err := row.Scan(&size); err != nil {
-		return 0, fmt.Errorf("read cache size: %w", err)
-	}
-	return size, nil
+	return c.currentSize(), nil
 }
 
 func (c *Cache) CurrentSizeByBucket(ctx context.Context) (map[string]int64, error) {
+	return c.currentSizeByBucket(), nil
+}
+
+func (c *Cache) readCacheSize(ctx context.Context) (int64, map[string]int64, error) {
+	row := c.db.QueryRowContext(ctx, `SELECT COALESCE(SUM(size), 0) FROM pages`)
+	var total int64
+	if err := row.Scan(&total); err != nil {
+		return 0, nil, fmt.Errorf("read cache size: %w", err)
+	}
+
 	rows, err := c.db.QueryContext(ctx, `
 SELECT o.bucket, COALESCE(SUM(p.size), 0)
 FROM pages p
@@ -446,50 +582,156 @@ JOIN objects o ON o.id = p.object_id
 GROUP BY o.bucket
 `)
 	if err != nil {
-		return nil, fmt.Errorf("read cache size by bucket: %w", err)
+		return 0, nil, fmt.Errorf("read cache size by bucket: %w", err)
 	}
 	defer rows.Close()
 
-	sizes := map[string]int64{}
+	byBucket := map[string]int64{}
 	for rows.Next() {
 		var bucket string
 		var size int64
 		if err := rows.Scan(&bucket, &size); err != nil {
-			return nil, fmt.Errorf("scan cache size by bucket: %w", err)
+			return 0, nil, fmt.Errorf("scan cache size by bucket: %w", err)
 		}
-		sizes[bucket] = size
+		byBucket[bucket] = size
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("read cache size by bucket: %w", err)
+		return 0, nil, fmt.Errorf("read cache size by bucket: %w", err)
 	}
-	return sizes, nil
+	return total, byBucket, nil
+}
+
+func (c *Cache) setCacheSize(total int64, byBucket map[string]int64) {
+	c.sizeMu.Lock()
+	defer c.sizeMu.Unlock()
+
+	c.cachedSize = total
+	c.cachedByBucket = make(map[string]int64, len(byBucket))
+	for bucket, size := range byBucket {
+		c.cachedByBucket[bucket] = size
+	}
+}
+
+func (c *Cache) currentSize() int64 {
+	c.sizeMu.RLock()
+	defer c.sizeMu.RUnlock()
+	return c.cachedSize
+}
+
+func (c *Cache) currentSizeByBucket() map[string]int64 {
+	c.sizeMu.RLock()
+	defer c.sizeMu.RUnlock()
+
+	byBucket := make(map[string]int64, len(c.cachedByBucket))
+	for bucket, size := range c.cachedByBucket {
+		byBucket[bucket] = size
+	}
+	return byBucket
+}
+
+func (c *Cache) adjustCacheSize(bucket string, delta int64) {
+	if delta == 0 {
+		return
+	}
+
+	c.sizeMu.Lock()
+	defer c.sizeMu.Unlock()
+
+	c.cachedSize += delta
+	if c.cachedSize < 0 {
+		c.cachedSize = 0
+	}
+	if bucket != "" {
+		c.cachedByBucket[bucket] += delta
+		if c.cachedByBucket[bucket] <= 0 {
+			delete(c.cachedByBucket, bucket)
+		}
+	}
+}
+
+func (c *Cache) publishCacheSizeMetrics() {
+	if c.metrics == nil {
+		return
+	}
+	c.metrics.SetCachedBytes(c.currentSize(), c.currentSizeByBucket())
+}
+
+func (c *Cache) requestMetricsRefresh() {
+	if c.metrics == nil {
+		return
+	}
+	select {
+	case c.metricsCh <- struct{}{}:
+	default:
+	}
+}
+
+func pagesSize(pages []Page) int64 {
+	var size int64
+	for _, page := range pages {
+		size += page.Size
+	}
+	return size
 }
 
 func (c *Cache) Evict(ctx context.Context) error {
 	for {
-		size, err := c.CurrentSize(ctx)
-		if err != nil {
-			return err
-		}
+		size := c.currentSize()
 		if size <= c.maxSize {
+			c.requestMetricsRefresh()
 			return nil
 		}
 
-		page, ok, err := c.oldestPage(ctx)
+		pages, err := c.oldestPages(ctx, evictionBatchSize)
 		if err != nil {
 			return err
 		}
-		if !ok {
+		if len(pages) == 0 {
 			return nil
 		}
-		if err := c.removePage(ctx, page); err != nil {
-			return err
+		targetBytes := size - c.maxSize
+		var removedBytes int64
+		for _, page := range pages {
+			if err := c.removePage(ctx, page); err != nil {
+				return err
+			}
+			removedBytes += page.Size
+			if removedBytes >= targetBytes {
+				break
+			}
 		}
 	}
 }
 
 func (c *Cache) pagePath(objectID string, index int64) string {
 	return filepath.Join("objects", objectID[:2], objectID[2:4], objectID, fmt.Sprintf("page-%012d", index))
+}
+
+func (c *Cache) pagePathForVersion(objectID string, index int64, etag string, epoch int64) string {
+	sum := sha256.Sum256([]byte(etag))
+	version := fmt.Sprintf("epoch-%020d-etag-%s", epoch, hex.EncodeToString(sum[:]))
+	return filepath.Join("objects", objectID[:2], objectID[2:4], objectID, version, fmt.Sprintf("page-%012d", index))
+}
+
+func isCorruptDatabaseError(err error) bool {
+	text := strings.ToLower(err.Error())
+	return strings.Contains(text, "file is not a database") ||
+		strings.Contains(text, "database disk image is malformed")
+}
+
+func resetLocalCacheState(cachePath, dbPath string) error {
+	if err := os.RemoveAll(filepath.Join(cachePath, "objects")); err != nil {
+		return fmt.Errorf("reset cache objects after corrupt db: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Join(cachePath, "objects"), 0o755); err != nil {
+		return fmt.Errorf("recreate cache objects after corrupt db: %w", err)
+	}
+	for _, path := range []string{dbPath, dbPath + "-wal", dbPath + "-shm"} {
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove corrupt cache db file: %w", err)
+		}
+	}
+	return nil
 }
 
 func (c *Cache) init(ctx context.Context) error {
@@ -527,6 +769,7 @@ func (c *Cache) init(ctx context.Context) error {
 		`INSERT OR IGNORE INTO object_generations (id, epoch)
 			SELECT id, epoch FROM objects`,
 		`CREATE INDEX IF NOT EXISTS pages_object_idx ON pages(object_id)`,
+		`CREATE INDEX IF NOT EXISTS pages_lru_idx ON pages(last_accessed_at, created_at)`,
 	}
 
 	for _, statement := range statements {
@@ -537,23 +780,8 @@ func (c *Cache) init(ctx context.Context) error {
 	return nil
 }
 
-func (c *Cache) updateCacheSizeMetrics(ctx context.Context) {
-	if c.metrics == nil {
-		return
-	}
-	total, err := c.CurrentSize(ctx)
-	if err != nil {
-		return
-	}
-	byBucket, err := c.CurrentSizeByBucket(ctx)
-	if err != nil {
-		return
-	}
-	c.metrics.SetCachedBytes(total, byBucket)
-}
-
 func (c *Cache) ensureGeneration(ctx context.Context, objectID string) error {
-	_, err := c.db.ExecContext(ctx, `
+	_, err := c.execWrite(ctx, `
 INSERT INTO object_generations (id, epoch)
 VALUES (?, 0)
 ON CONFLICT(id) DO NOTHING
@@ -597,37 +825,49 @@ WHERE o.id = ?
 	return nil
 }
 
-func (c *Cache) putPageIfCurrent(ctx context.Context, page Page, expectedEpoch int64) error {
+func (c *Cache) putPageIfCurrent(ctx context.Context, page Page, expectedEpoch int64) (string, int64, error) {
 	if err := validatePage(page); err != nil {
-		return err
+		return "", 0, err
 	}
 
-	tx, err := c.db.BeginTx(ctx, nil)
+	tx, unlock, err := c.beginWriteTx(ctx)
 	if err != nil {
-		return fmt.Errorf("begin put page: %w", err)
+		return "", 0, fmt.Errorf("begin put page: %w", err)
 	}
+	defer unlock()
 	var currentETag string
 	var currentEpoch int64
+	var bucket string
 	err = tx.QueryRowContext(ctx, `
-SELECT o.etag, g.epoch
+SELECT o.etag, g.epoch, o.bucket
 FROM objects o
 JOIN object_generations g ON g.id = o.id
 WHERE o.id = ?
-`, page.ObjectID).Scan(&currentETag, &currentEpoch)
+`, page.ObjectID).Scan(&currentETag, &currentEpoch, &bucket)
 	if err != nil {
 		_ = tx.Rollback()
 		if errors.Is(err, sql.ErrNoRows) {
-			return errors.New("object metadata is not current")
+			return "", 0, errors.New("object metadata is not current")
 		}
-		return fmt.Errorf("validate page commit: %w", err)
+		return "", 0, fmt.Errorf("validate page commit: %w", err)
 	}
 	if currentEpoch != expectedEpoch {
 		_ = tx.Rollback()
-		return fmt.Errorf("object epoch changed from %d to %d", expectedEpoch, currentEpoch)
+		return "", 0, fmt.Errorf("object epoch changed from %d to %d", expectedEpoch, currentEpoch)
 	}
 	if currentETag != page.ETag {
 		_ = tx.Rollback()
-		return fmt.Errorf("object etag changed from %s to %s", page.ETag, currentETag)
+		return "", 0, fmt.Errorf("object etag changed from %s to %s", page.ETag, currentETag)
+	}
+	var previousSize int64
+	err = tx.QueryRowContext(ctx, `
+SELECT size
+FROM pages
+WHERE object_id = ? AND page_index = ?
+`, page.ObjectID, page.Index).Scan(&previousSize)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		_ = tx.Rollback()
+		return "", 0, fmt.Errorf("read previous page size: %w", err)
 	}
 	_, err = tx.ExecContext(ctx, `
 INSERT INTO pages (object_id, page_index, etag, size, path, created_at, last_accessed_at)
@@ -640,12 +880,12 @@ ON CONFLICT(object_id, page_index) DO UPDATE SET
 `, page.ObjectID, page.Index, page.ETag, page.Size, page.Path, time.Now().UnixNano(), time.Now().UnixNano())
 	if err != nil {
 		_ = tx.Rollback()
-		return fmt.Errorf("put page: %w", err)
+		return "", 0, fmt.Errorf("put page: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit put page: %w", err)
+		return "", 0, fmt.Errorf("commit put page: %w", err)
 	}
-	return nil
+	return bucket, previousSize, nil
 }
 
 func (c *Cache) getPage(ctx context.Context, objectID string, index int64) (Page, bool, error) {
@@ -665,52 +905,68 @@ WHERE object_id = ? AND page_index = ?
 	return page, true, nil
 }
 
-func (c *Cache) deletePage(ctx context.Context, objectID string, index int64) error {
-	_, err := c.db.ExecContext(ctx, `DELETE FROM pages WHERE object_id = ? AND page_index = ?`, objectID, index)
+func (c *Cache) deletePage(ctx context.Context, objectID string, index int64) (bool, error) {
+	result, err := c.execWrite(ctx, `DELETE FROM pages WHERE object_id = ? AND page_index = ?`, objectID, index)
 	if err != nil {
-		return fmt.Errorf("delete stale page row: %w", err)
+		return false, fmt.Errorf("delete stale page row: %w", err)
 	}
-	return nil
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("read deleted page count: %w", err)
+	}
+	return rows > 0, nil
 }
 
 func (c *Cache) touchPage(ctx context.Context, objectID string, index int64, at int64) error {
-	_, err := c.db.ExecContext(ctx, `UPDATE pages SET last_accessed_at = ? WHERE object_id = ? AND page_index = ?`, at, objectID, index)
+	_, err := c.execWrite(ctx, `UPDATE pages SET last_accessed_at = ? WHERE object_id = ? AND page_index = ?`, at, objectID, index)
 	if err != nil {
 		return fmt.Errorf("touch page: %w", err)
 	}
 	return nil
 }
 
-func (c *Cache) oldestPage(ctx context.Context) (Page, bool, error) {
-	row := c.db.QueryRowContext(ctx, `
+func (c *Cache) oldestPages(ctx context.Context, limit int) ([]Page, error) {
+	rows, err := c.db.QueryContext(ctx, `
 SELECT object_id, page_index, etag, size, path
 FROM pages
 ORDER BY last_accessed_at ASC, created_at ASC
-LIMIT 1
-`)
-
-	var page Page
-	if err := row.Scan(&page.ObjectID, &page.Index, &page.ETag, &page.Size, &page.Path); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return Page{}, false, nil
-		}
-		return Page{}, false, fmt.Errorf("select eviction candidate: %w", err)
+LIMIT ?
+`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("select eviction candidates: %w", err)
 	}
-	return page, true, nil
+	defer rows.Close()
+
+	var pages []Page
+	for rows.Next() {
+		var page Page
+		if err := rows.Scan(&page.ObjectID, &page.Index, &page.ETag, &page.Size, &page.Path); err != nil {
+			return nil, fmt.Errorf("scan eviction candidate: %w", err)
+		}
+		pages = append(pages, page)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("select eviction candidates: %w", err)
+	}
+	return pages, nil
 }
 
 func (c *Cache) removePage(ctx context.Context, page Page) error {
 	bucket, _ := c.pageBucket(ctx, page.ObjectID)
-	if err := c.deletePage(ctx, page.ObjectID, page.Index); err != nil {
+	deleted, err := c.deletePage(ctx, page.ObjectID, page.Index)
+	if err != nil {
 		return err
 	}
 	if err := os.Remove(filepath.Join(c.cacheRoot, page.Path)); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("delete evicted page file: %w", err)
 	}
+	if deleted {
+		c.adjustCacheSize(bucket, -page.Size)
+		c.requestMetricsRefresh()
+	}
 	if c.metrics != nil {
 		c.metrics.RecordEviction(bucket)
 	}
-	c.updateCacheSizeMetrics(ctx)
 	return nil
 }
 
@@ -743,24 +999,35 @@ func (c *Cache) requestTouch(objectID string, index int64) {
 func (c *Cache) maintenanceLoop(ctx context.Context) {
 	defer c.workerWG.Done()
 
-	ticker := time.NewTicker(time.Second)
-	defer ticker.Stop()
+	touchTicker := time.NewTicker(touchFlushInterval)
+	defer touchTicker.Stop()
+	metricsTicker := time.NewTicker(metricsRefreshInterval)
+	defer metricsTicker.Stop()
 	pendingTouches := map[pageRef]struct{}{}
+	metricsDirty := false
 
 	for {
 		select {
 		case <-ctx.Done():
 			_ = c.flushTouches(context.Background(), pendingTouches)
+			c.publishCacheSizeMetrics()
 			return
 		case <-c.evictionCh:
 			_ = c.Evict(ctx)
+		case <-c.metricsCh:
+			metricsDirty = true
 		case ref := <-c.touchCh:
 			pendingTouches[ref] = struct{}{}
-			if len(pendingTouches) >= 256 {
+			if len(pendingTouches) >= touchFlushBatchSize {
 				_ = c.flushTouches(ctx, pendingTouches)
 			}
-		case <-ticker.C:
+		case <-touchTicker.C:
 			_ = c.flushTouches(ctx, pendingTouches)
+		case <-metricsTicker.C:
+			if metricsDirty {
+				c.publishCacheSizeMetrics()
+				metricsDirty = false
+			}
 		}
 	}
 }

@@ -461,6 +461,12 @@ def test_proxy_healthz(cache_endpoint: str) -> None:
         assert response.read() == b'{"status":"ok"}\n'
 
 
+def test_proxy_readyz(cache_endpoint: str) -> None:
+    with urllib.request.urlopen(f"{cache_endpoint}/readyz", timeout=5) as response:
+        assert response.status == 200
+        assert response.read() == b'{"status":"ready"}\n'
+
+
 def test_proxy_restart_with_existing_cache(cache_proxy: CacheProxy, cache_s3_client, s3_client, e2e_config, object_key: str) -> None:
     body = b"survives restart"
     s3_client.put_object(Bucket=e2e_config.bucket, Key=object_key, Body=body)

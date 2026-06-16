@@ -17,6 +17,7 @@ type Server struct {
 func New(cfg config.Config, logger *slog.Logger, handlers ...http.Handler) *Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", healthz)
+	mux.HandleFunc("GET /readyz", readyz)
 	if len(handlers) > 1 && handlers[1] != nil {
 		mux.Handle("GET /metrics", handlers[1])
 	}
@@ -30,7 +31,10 @@ func New(cfg config.Config, logger *slog.Logger, handlers ...http.Handler) *Serv
 		httpServer: &http.Server{
 			Addr:              cfg.Listen,
 			Handler:           handler,
-			ReadHeaderTimeout: 5 * time.Second,
+			ReadHeaderTimeout: cfg.HTTP.ReadHeaderTimeout,
+			ReadTimeout:       cfg.HTTP.ReadTimeout,
+			WriteTimeout:      cfg.HTTP.WriteTimeout,
+			IdleTimeout:       cfg.HTTP.IdleTimeout,
 		},
 	}
 }
@@ -47,6 +51,12 @@ func healthz(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte(`{"status":"ok"}` + "\n"))
+}
+
+func readyz(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(`{"status":"ready"}` + "\n"))
 }
 
 type loggingResponseWriter struct {

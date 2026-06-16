@@ -307,12 +307,26 @@ listen: ":8080"
 
 upstream:
   endpoint: http://rustfs:9000
+  region: us-east-1
+  access_key: simple-s3-cache
+  secret_key: change-me
+  response_header_timeout: 30s
 
 cache:
   cache_path: /cache/objects
   meta_path: /cache/meta
   max_size: 1TB
   page_size: 4MB
+
+http:
+  read_header_timeout: 5s
+  read_timeout: 10m
+  write_timeout: 10m
+  idle_timeout: 2m
+
+upload:
+  spool_path: /cache/spool
+  max_spool_size: 10GB
 ```
 
 `cache_path` stores cached page files. `meta_path` stores the SQLite cache
@@ -329,6 +343,19 @@ all buckets. Metrics and structured logs must expose enough data — read
 amplification, hit rate, evictions, and cached bytes, broken down by bucket — to
 guide steady-state tuning from evidence rather than guesses. See the Tuning
 strategy and Observability sections in [PLAN.md](PLAN.md).
+
+`upstream.response_header_timeout` bounds how long the proxy waits for upstream
+S3-compatible storage to begin responding after a request is sent. The proxy
+also configures upstream connection, TLS handshake, idle connection, and
+expect-continue timeouts internally. `http.*_timeout` values bound client-facing
+server connections; tune `read_timeout` and `write_timeout` high enough for the
+largest expected uploads and downloads.
+
+AWS SigV4 streaming uploads (`Content-Encoding: aws-chunked`) are decoded and
+streamed directly upstream when `X-Amz-Decoded-Content-Length` is present. Other
+unknown-length uploads are spooled to `upload.spool_path` before forwarding so
+the proxy can re-sign them with a fixed content length. `upload.max_spool_size`
+bounds that fallback disk usage.
 
 ## Observability
 

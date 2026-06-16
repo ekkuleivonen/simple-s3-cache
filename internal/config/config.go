@@ -8,17 +8,24 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
 
 const (
-	defaultListen    = ":8080"
-	defaultCachePath = "/cache/objects"
-	defaultMetaPath  = "/cache/meta"
-	defaultMaxSize   = int64(1 << 40) // 1 TiB
-	defaultPageSize  = int64(4 << 20) // 4 MiB
-	defaultRegion    = "us-east-1"
+	defaultListen                        = ":8080"
+	defaultCachePath                     = "/cache/objects"
+	defaultMetaPath                      = "/cache/meta"
+	defaultMaxSize                       = int64(1 << 40) // 1 TiB
+	defaultPageSize                      = int64(4 << 20) // 4 MiB
+	defaultRegion                        = "us-east-1"
+	defaultUpstreamResponseHeaderTimeout = 30 * time.Second
+	defaultReadHeaderTimeout             = 5 * time.Second
+	defaultReadTimeout                   = 10 * time.Minute
+	defaultWriteTimeout                  = 10 * time.Minute
+	defaultIdleTimeout                   = 2 * time.Minute
+	defaultMaxSpoolSize                  = int64(10 << 30) // 10 GiB
 )
 
 // Config is the process configuration loaded from YAML.
@@ -26,11 +33,18 @@ type Config struct {
 	Listen   string         `yaml:"listen"`
 	Upstream UpstreamConfig `yaml:"upstream"`
 	Cache    CacheConfig    `yaml:"cache"`
+	HTTP     HTTPConfig     `yaml:"http"`
+	Upload   UploadConfig   `yaml:"upload"`
 }
 
 type UpstreamConfig struct {
-	Endpoint string `yaml:"endpoint"`
-	Region   string `yaml:"region"`
+	Endpoint                  string        `yaml:"endpoint"`
+	Region                    string        `yaml:"region"`
+	AccessKey                 string        `yaml:"access_key"`
+	SecretKey                 string        `yaml:"secret_key"`
+	SessionToken              string        `yaml:"session_token"`
+	ResponseHeaderTimeout     time.Duration `yaml:"-"`
+	ResponseHeaderTimeoutText string        `yaml:"response_header_timeout"`
 }
 
 type CacheConfig struct {
@@ -41,6 +55,23 @@ type CacheConfig struct {
 
 	MaxSizeText  string `yaml:"max_size"`
 	PageSizeText string `yaml:"page_size"`
+}
+
+type HTTPConfig struct {
+	ReadHeaderTimeout     time.Duration `yaml:"-"`
+	ReadTimeout           time.Duration `yaml:"-"`
+	WriteTimeout          time.Duration `yaml:"-"`
+	IdleTimeout           time.Duration `yaml:"-"`
+	ReadHeaderTimeoutText string        `yaml:"read_header_timeout"`
+	ReadTimeoutText       string        `yaml:"read_timeout"`
+	WriteTimeoutText      string        `yaml:"write_timeout"`
+	IdleTimeoutText       string        `yaml:"idle_timeout"`
+}
+
+type UploadConfig struct {
+	SpoolPath        string `yaml:"spool_path"`
+	MaxSpoolSize     int64  `yaml:"-"`
+	MaxSpoolSizeText string `yaml:"max_spool_size"`
 }
 
 // Load reads a YAML config file, applies defaults, and validates required fields.
@@ -59,6 +90,9 @@ func Load(path string) (Config, error) {
 	if err := cfg.applyParsedSizes(); err != nil {
 		return Config{}, err
 	}
+	if err := cfg.applyParsedDurations(); err != nil {
+		return Config{}, err
+	}
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
 	}
@@ -70,13 +104,23 @@ func Default() Config {
 	return Config{
 		Listen: defaultListen,
 		Upstream: UpstreamConfig{
-			Region: defaultRegion,
+			Region:                defaultRegion,
+			ResponseHeaderTimeout: defaultUpstreamResponseHeaderTimeout,
 		},
 		Cache: CacheConfig{
 			CachePath: defaultCachePath,
 			MetaPath:  defaultMetaPath,
 			MaxSize:   defaultMaxSize,
 			PageSize:  defaultPageSize,
+		},
+		HTTP: HTTPConfig{
+			ReadHeaderTimeout: defaultReadHeaderTimeout,
+			ReadTimeout:       defaultReadTimeout,
+			WriteTimeout:      defaultWriteTimeout,
+			IdleTimeout:       defaultIdleTimeout,
+		},
+		Upload: UploadConfig{
+			MaxSpoolSize: defaultMaxSpoolSize,
 		},
 	}
 }
@@ -97,7 +141,39 @@ func (cfg *Config) applyParsedSizes() error {
 		}
 		cfg.Cache.PageSize = size
 	}
+	if cfg.Upload.MaxSpoolSizeText != "" {
+		size, err := ParseBytes(cfg.Upload.MaxSpoolSizeText)
+		if err != nil {
+			return fmt.Errorf("upload.max_spool_size: %w", err)
+		}
+		cfg.Upload.MaxSpoolSize = size
+	}
 
+	return nil
+}
+
+func (cfg *Config) applyParsedDurations() error {
+	durationFields := []struct {
+		name  string
+		text  string
+		value *time.Duration
+	}{
+		{"upstream.response_header_timeout", cfg.Upstream.ResponseHeaderTimeoutText, &cfg.Upstream.ResponseHeaderTimeout},
+		{"http.read_header_timeout", cfg.HTTP.ReadHeaderTimeoutText, &cfg.HTTP.ReadHeaderTimeout},
+		{"http.read_timeout", cfg.HTTP.ReadTimeoutText, &cfg.HTTP.ReadTimeout},
+		{"http.write_timeout", cfg.HTTP.WriteTimeoutText, &cfg.HTTP.WriteTimeout},
+		{"http.idle_timeout", cfg.HTTP.IdleTimeoutText, &cfg.HTTP.IdleTimeout},
+	}
+	for _, field := range durationFields {
+		if strings.TrimSpace(field.text) == "" {
+			continue
+		}
+		duration, err := ParseDuration(field.text)
+		if err != nil {
+			return fmt.Errorf("%s: %w", field.name, err)
+		}
+		*field.value = duration
+	}
 	return nil
 }
 
@@ -123,6 +199,15 @@ func (cfg Config) Validate() error {
 	if strings.TrimSpace(cfg.Upstream.Region) == "" {
 		errs = append(errs, errors.New("upstream.region is required"))
 	}
+	if strings.TrimSpace(cfg.Upstream.AccessKey) == "" {
+		errs = append(errs, errors.New("upstream.access_key is required"))
+	}
+	if strings.TrimSpace(cfg.Upstream.SecretKey) == "" {
+		errs = append(errs, errors.New("upstream.secret_key is required"))
+	}
+	if cfg.Upstream.ResponseHeaderTimeout <= 0 {
+		errs = append(errs, errors.New("upstream.response_header_timeout must be greater than zero"))
+	}
 
 	if strings.TrimSpace(cfg.Cache.CachePath) == "" {
 		errs = append(errs, errors.New("cache.cache_path is required"))
@@ -138,6 +223,21 @@ func (cfg Config) Validate() error {
 	}
 	if cfg.Cache.MaxSize > 0 && cfg.Cache.PageSize > cfg.Cache.MaxSize {
 		errs = append(errs, errors.New("cache.page_size must not exceed cache.max_size"))
+	}
+	if cfg.HTTP.ReadHeaderTimeout <= 0 {
+		errs = append(errs, errors.New("http.read_header_timeout must be greater than zero"))
+	}
+	if cfg.HTTP.ReadTimeout <= 0 {
+		errs = append(errs, errors.New("http.read_timeout must be greater than zero"))
+	}
+	if cfg.HTTP.WriteTimeout <= 0 {
+		errs = append(errs, errors.New("http.write_timeout must be greater than zero"))
+	}
+	if cfg.HTTP.IdleTimeout <= 0 {
+		errs = append(errs, errors.New("http.idle_timeout must be greater than zero"))
+	}
+	if cfg.Upload.MaxSpoolSize <= 0 {
+		errs = append(errs, errors.New("upload.max_spool_size must be greater than zero"))
 	}
 
 	return errors.Join(errs...)
@@ -192,4 +292,19 @@ func ParseBytes(input string) (int64, error) {
 	}
 
 	return int64(size), nil
+}
+
+func ParseDuration(input string) (time.Duration, error) {
+	value := strings.TrimSpace(input)
+	if value == "" {
+		return 0, errors.New("duration is empty")
+	}
+	duration, err := time.ParseDuration(value)
+	if err != nil {
+		return 0, fmt.Errorf("invalid duration %q: %w", input, err)
+	}
+	if duration <= 0 {
+		return 0, errors.New("duration must be greater than zero")
+	}
+	return duration, nil
 }

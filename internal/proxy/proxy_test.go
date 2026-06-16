@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -8,9 +9,11 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strconv"
 	"sync"
@@ -22,6 +25,7 @@ import (
 	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 
 	"github.com/ekkuleivonen/simple-s3-cache/internal/cache"
+	appconfig "github.com/ekkuleivonen/simple-s3-cache/internal/config"
 	"github.com/ekkuleivonen/simple-s3-cache/internal/metrics"
 	"github.com/ekkuleivonen/simple-s3-cache/internal/s3request"
 )
@@ -162,6 +166,29 @@ func TestProxyForwardsPassThroughRequests(t *testing.T) {
 	}
 }
 
+func TestNewUpstreamHTTPClientUsesProductionTimeouts(t *testing.T) {
+	client := newUpstreamHTTPClient(appconfig.UpstreamConfig{
+		ResponseHeaderTimeout: 7 * time.Second,
+	})
+
+	transport, ok := client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("Transport = %T, want *http.Transport", client.Transport)
+	}
+	if transport.ResponseHeaderTimeout != 7*time.Second {
+		t.Fatalf("ResponseHeaderTimeout = %s, want 7s", transport.ResponseHeaderTimeout)
+	}
+	if transport.TLSHandshakeTimeout == 0 {
+		t.Fatal("TLSHandshakeTimeout = 0, want non-zero")
+	}
+	if transport.IdleConnTimeout == 0 {
+		t.Fatal("IdleConnTimeout = 0, want non-zero")
+	}
+	if transport.MaxIdleConnsPerHost == 0 {
+		t.Fatal("MaxIdleConnsPerHost = 0, want non-zero")
+	}
+}
+
 func TestProxyReSignsInsteadOfForwardingClientSigV4Headers(t *testing.T) {
 	var gotHeader http.Header
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -285,6 +312,59 @@ func TestProxyDecodesAWSChunkedPutBodyBeforeResigning(t *testing.T) {
 	}
 	if gotContentSHA256 != unsignedPayload {
 		t.Fatalf("upstream X-Amz-Content-Sha256 = %q, want %q", gotContentSHA256, unsignedPayload)
+	}
+}
+
+func TestForwardBodyStreamsAWSChunkedWithDecodedLengthWithoutSpooling(t *testing.T) {
+	body := []byte("decoded streaming body")
+	req := httptest.NewRequest(http.MethodPut, "/bucket/streamed.bin", bytes.NewReader(awsChunkedBody(body[:8], body[8:])))
+	req.Header.Set("Content-Encoding", "aws-chunked")
+	req.Header.Set("X-Amz-Decoded-Content-Length", strconv.Itoa(len(body)))
+	req.ContentLength = -1
+
+	spoolPath := filepath.Join(t.TempDir(), "spool-parent-does-not-exist", "spool")
+	reader, contentLength, getBody, cleanup, decodedAWSChunked, err := forwardBody(req, uploadOptions{
+		spoolPath:    spoolPath,
+		maxSpoolSize: 1,
+	})
+	if err != nil {
+		t.Fatalf("forwardBody() error = %v", err)
+	}
+	if contentLength != int64(len(body)) {
+		t.Fatalf("contentLength = %d, want %d", contentLength, len(body))
+	}
+	if getBody != nil {
+		t.Fatal("getBody != nil, want streaming body without replay")
+	}
+	if cleanup != nil {
+		t.Fatal("cleanup != nil, want no spool cleanup")
+	}
+	if !decodedAWSChunked {
+		t.Fatal("decodedAWSChunked = false, want true")
+	}
+
+	got, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("read decoded body: %v", err)
+	}
+	if !bytes.Equal(got, body) {
+		t.Fatalf("decoded body = %q, want %q", got, body)
+	}
+	if _, err := os.Stat(spoolPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("spool path stat error = %v, want not exist", err)
+	}
+}
+
+func TestForwardBodyRejectsFallbackSpoolOverLimit(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPut, "/bucket/unknown-length.bin", bytes.NewReader([]byte("too large")))
+	req.ContentLength = -1
+
+	_, _, _, _, _, err := forwardBody(req, uploadOptions{
+		spoolPath:    t.TempDir(),
+		maxSpoolSize: 3,
+	})
+	if !errors.Is(err, errSpoolLimit) {
+		t.Fatalf("forwardBody() error = %v, want %v", err, errSpoolLimit)
 	}
 }
 
@@ -770,7 +850,41 @@ func TestProxyStreamsMultiPageFullGetThroughCache(t *testing.T) {
 		}
 	}
 
-	wantRequests := []string{"HEAD ", "GET bytes=0-4", "GET bytes=5-9", "GET bytes=10-11"}
+	wantRequests := []string{"HEAD ", "GET "}
+	if !equalStringSlices(upstreamRequests, wantRequests) {
+		t.Fatalf("upstream requests = %q, want %q", upstreamRequests, wantRequests)
+	}
+}
+
+func TestProxyKeepsPartialFullGetOnPagedPath(t *testing.T) {
+	body := []byte("abcdefghijkl")
+	var upstreamRequests []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamRequests = append(upstreamRequests, r.Method+" "+r.Header.Get("Range"))
+		writeObjectResponse(t, w, r, body, `"etag-partial-full"`)
+	}))
+	defer upstream.Close()
+
+	p := testProxyWithPageSize(t, upstream.URL, 4)
+	rangeReq := httptest.NewRequest(http.MethodGet, "/bucket/partial-full.bin", nil)
+	rangeReq.Header.Set("Range", "bytes=0-3")
+	rangeRec := httptest.NewRecorder()
+	p.ServeHTTP(rangeRec, rangeReq)
+	if rangeRec.Code != http.StatusPartialContent {
+		t.Fatalf("range status = %d, want 206; body=%q", rangeRec.Code, rangeRec.Body.String())
+	}
+
+	fullReq := httptest.NewRequest(http.MethodGet, "/bucket/partial-full.bin", nil)
+	fullRec := httptest.NewRecorder()
+	p.ServeHTTP(fullRec, fullReq)
+	if fullRec.Code != http.StatusOK {
+		t.Fatalf("full status = %d, want 200; body=%q", fullRec.Code, fullRec.Body.String())
+	}
+	if got := fullRec.Body.Bytes(); !bytes.Equal(got, body) {
+		t.Fatalf("full body = %q, want %q", got, body)
+	}
+
+	wantRequests := []string{"HEAD ", "GET bytes=0-3", "GET bytes=4-7", "GET bytes=8-11"}
 	if !equalStringSlices(upstreamRequests, wantRequests) {
 		t.Fatalf("upstream requests = %q, want %q", upstreamRequests, wantRequests)
 	}
@@ -804,7 +918,67 @@ func TestProxyDoesNotCommitHeadersWhenFirstPageFetchFails(t *testing.T) {
 	if rec.Body.Len() == 12 {
 		t.Fatalf("body length = %d, expected error response rather than promised object body", rec.Body.Len())
 	}
-	wantRequests := []string{"HEAD ", "GET bytes=0-3"}
+	wantRequests := []string{"HEAD ", "GET "}
+	if !equalStringSlices(upstreamRequests, wantRequests) {
+		t.Fatalf("upstream requests = %q, want %q", upstreamRequests, wantRequests)
+	}
+}
+
+func TestProxyAbortsCommittedResponseWhenLaterPageFetchFails(t *testing.T) {
+	body := []byte("abcdefghijkl")
+	var upstreamRequests []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamRequests = append(upstreamRequests, r.Method+" "+r.Header.Get("Range"))
+		w.Header().Set("Content-Length", "12")
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("ETag", `"etag-midstream"`)
+		if r.Method == http.MethodHead {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		switch r.Header.Get("Range") {
+		case "":
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte("upstream unavailable"))
+		case "bytes=0-3":
+			w.Header().Set("Content-Length", "4")
+			w.Header().Set("Content-Range", "bytes 0-3/12")
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(body[:4])
+		case "bytes=4-7":
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte("upstream unavailable"))
+		default:
+			t.Fatalf("unexpected upstream range %q", r.Header.Get("Range"))
+		}
+	}))
+	defer upstream.Close()
+
+	p := testProxyWithPageSize(t, upstream.URL, 4)
+	warmReq := httptest.NewRequest(http.MethodGet, "/bucket/midstream.bin", nil)
+	warmReq.Header.Set("Range", "bytes=0-3")
+	warmRec := httptest.NewRecorder()
+	p.ServeHTTP(warmRec, warmReq)
+	if warmRec.Code != http.StatusPartialContent {
+		t.Fatalf("warm status = %d, want 206; body=%q", warmRec.Code, warmRec.Body.String())
+	}
+	upstreamRequests = nil
+
+	req := httptest.NewRequest(http.MethodGet, "/bucket/midstream.bin", nil)
+	rec := &abortTrackingResponseWriter{ResponseRecorder: httptest.NewRecorder()}
+
+	p.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want committed 200 before mid-stream failure; body=%q", rec.Code, rec.Body.String())
+	}
+	if got := rec.Body.String(); got != "abcd" {
+		t.Fatalf("body = %q, want only first page before abort", got)
+	}
+	if !rec.aborted {
+		t.Fatal("response was not aborted after later page fetch failed")
+	}
+	wantRequests := []string{"GET bytes=4-7"}
 	if !equalStringSlices(upstreamRequests, wantRequests) {
 		t.Fatalf("upstream requests = %q, want %q", upstreamRequests, wantRequests)
 	}
@@ -1228,7 +1402,10 @@ func testProxyWithPageSize(t *testing.T, endpoint string, pageSize int64) *Proxy
 		logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
 		cache:    cacheStore,
 		pageSize: pageSize,
-		metrics:  recorder,
+		upload: uploadOptions{
+			maxSpoolSize: 10 << 30,
+		},
+		metrics: recorder,
 	}
 }
 
@@ -1307,6 +1484,34 @@ func equalStringSlices(a, b []string) bool {
 	return true
 }
 
+type abortTrackingResponseWriter struct {
+	*httptest.ResponseRecorder
+	aborted bool
+}
+
+func (w *abortTrackingResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	w.aborted = true
+	return closeOnlyConn{}, bufio.NewReadWriter(bufio.NewReader(bytes.NewReader(nil)), bufio.NewWriter(io.Discard)), nil
+}
+
+type closeOnlyConn struct{}
+
+func (closeOnlyConn) Read([]byte) (int, error)        { return 0, io.EOF }
+func (closeOnlyConn) Write(p []byte) (int, error)     { return len(p), nil }
+func (closeOnlyConn) Close() error                    { return nil }
+func (closeOnlyConn) LocalAddr() net.Addr             { return dummyAddr("local") }
+func (closeOnlyConn) RemoteAddr() net.Addr            { return dummyAddr("remote") }
+func (closeOnlyConn) SetDeadline(time.Time) error     { return nil }
+func (closeOnlyConn) SetReadDeadline(time.Time) error { return nil }
+func (closeOnlyConn) SetWriteDeadline(time.Time) error {
+	return nil
+}
+
+type dummyAddr string
+
+func (a dummyAddr) Network() string { return string(a) }
+func (a dummyAddr) String() string  { return string(a) }
+
 func writeObjectResponse(t *testing.T, w http.ResponseWriter, r *http.Request, body []byte, etag string) {
 	t.Helper()
 
@@ -1352,6 +1557,11 @@ func writeObjectResponse(t *testing.T, w http.ResponseWriter, r *http.Request, b
 		w.Header().Set("Content-Range", "bytes 5-9/12")
 		w.WriteHeader(http.StatusPartialContent)
 		_, _ = w.Write(body[5:10])
+	case "bytes=8-11":
+		w.Header().Set("Content-Length", "4")
+		w.Header().Set("Content-Range", "bytes 8-11/12")
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(body[8:12])
 	case "bytes=10-11":
 		w.Header().Set("Content-Length", "2")
 		w.Header().Set("Content-Range", "bytes 10-11/12")

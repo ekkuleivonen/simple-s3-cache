@@ -4,12 +4,15 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestLoadAppliesDefaultsAndParsesSizes(t *testing.T) {
 	path := writeConfig(t, `
 upstream:
   endpoint: http://rustfs:9000
+  access_key: test-access
+  secret_key: test-secret
 `)
 
 	cfg, err := Load(path)
@@ -35,6 +38,27 @@ upstream:
 	if cfg.Cache.MaxSize != 1<<40 {
 		t.Fatalf("Cache.MaxSize = %d, want %d", cfg.Cache.MaxSize, int64(1<<40))
 	}
+	if cfg.Upstream.ResponseHeaderTimeout != 30*time.Second {
+		t.Fatalf("Upstream.ResponseHeaderTimeout = %s, want 30s", cfg.Upstream.ResponseHeaderTimeout)
+	}
+	if cfg.HTTP.ReadHeaderTimeout != 5*time.Second {
+		t.Fatalf("HTTP.ReadHeaderTimeout = %s, want 5s", cfg.HTTP.ReadHeaderTimeout)
+	}
+	if cfg.HTTP.ReadTimeout != 10*time.Minute {
+		t.Fatalf("HTTP.ReadTimeout = %s, want 10m", cfg.HTTP.ReadTimeout)
+	}
+	if cfg.HTTP.WriteTimeout != 10*time.Minute {
+		t.Fatalf("HTTP.WriteTimeout = %s, want 10m", cfg.HTTP.WriteTimeout)
+	}
+	if cfg.HTTP.IdleTimeout != 2*time.Minute {
+		t.Fatalf("HTTP.IdleTimeout = %s, want 2m", cfg.HTTP.IdleTimeout)
+	}
+	if cfg.Upload.SpoolPath != "" {
+		t.Fatalf("Upload.SpoolPath = %q, want empty default", cfg.Upload.SpoolPath)
+	}
+	if cfg.Upload.MaxSpoolSize != 10<<30 {
+		t.Fatalf("Upload.MaxSpoolSize = %d, want %d", cfg.Upload.MaxSpoolSize, int64(10<<30))
+	}
 }
 
 func TestLoadParsesConfiguredValues(t *testing.T) {
@@ -43,11 +67,23 @@ listen: "127.0.0.1:8081"
 upstream:
   endpoint: https://s3.example.test
   region: eu-north-1
+  access_key: configured-access
+  secret_key: configured-secret
+  session_token: configured-token
+  response_header_timeout: 45s
 cache:
   cache_path: /mnt/cache-bytes
   meta_path: /mnt/cache-meta
   max_size: 2GB
   page_size: 512KB
+http:
+  read_header_timeout: 3s
+  read_timeout: 2m
+  write_timeout: 4m
+  idle_timeout: 90s
+upload:
+  spool_path: /mnt/cache-spool
+  max_spool_size: 5GB
 `)
 
 	cfg, err := Load(path)
@@ -64,6 +100,15 @@ cache:
 	if cfg.Upstream.Region != "eu-north-1" {
 		t.Fatalf("Upstream.Region = %q", cfg.Upstream.Region)
 	}
+	if cfg.Upstream.AccessKey != "configured-access" {
+		t.Fatalf("Upstream.AccessKey = %q", cfg.Upstream.AccessKey)
+	}
+	if cfg.Upstream.SecretKey != "configured-secret" {
+		t.Fatalf("Upstream.SecretKey = %q", cfg.Upstream.SecretKey)
+	}
+	if cfg.Upstream.SessionToken != "configured-token" {
+		t.Fatalf("Upstream.SessionToken = %q", cfg.Upstream.SessionToken)
+	}
 	if cfg.Cache.CachePath != "/mnt/cache-bytes" {
 		t.Fatalf("Cache.CachePath = %q", cfg.Cache.CachePath)
 	}
@@ -76,11 +121,35 @@ cache:
 	if cfg.Cache.PageSize != 512<<10 {
 		t.Fatalf("Cache.PageSize = %d, want %d", cfg.Cache.PageSize, int64(512<<10))
 	}
+	if cfg.Upstream.ResponseHeaderTimeout != 45*time.Second {
+		t.Fatalf("Upstream.ResponseHeaderTimeout = %s, want 45s", cfg.Upstream.ResponseHeaderTimeout)
+	}
+	if cfg.HTTP.ReadHeaderTimeout != 3*time.Second {
+		t.Fatalf("HTTP.ReadHeaderTimeout = %s, want 3s", cfg.HTTP.ReadHeaderTimeout)
+	}
+	if cfg.HTTP.ReadTimeout != 2*time.Minute {
+		t.Fatalf("HTTP.ReadTimeout = %s, want 2m", cfg.HTTP.ReadTimeout)
+	}
+	if cfg.HTTP.WriteTimeout != 4*time.Minute {
+		t.Fatalf("HTTP.WriteTimeout = %s, want 4m", cfg.HTTP.WriteTimeout)
+	}
+	if cfg.HTTP.IdleTimeout != 90*time.Second {
+		t.Fatalf("HTTP.IdleTimeout = %s, want 90s", cfg.HTTP.IdleTimeout)
+	}
+	if cfg.Upload.SpoolPath != "/mnt/cache-spool" {
+		t.Fatalf("Upload.SpoolPath = %q", cfg.Upload.SpoolPath)
+	}
+	if cfg.Upload.MaxSpoolSize != 5<<30 {
+		t.Fatalf("Upload.MaxSpoolSize = %d, want %d", cfg.Upload.MaxSpoolSize, int64(5<<30))
+	}
 }
 
 func TestLoadRequiresUpstreamEndpoint(t *testing.T) {
 	path := writeConfig(t, `
 listen: ":8080"
+upstream:
+  access_key: test-access
+  secret_key: test-secret
 `)
 
 	if _, err := Load(path); err == nil {
@@ -92,6 +161,8 @@ func TestLoadRequiresCacheAndMetaPaths(t *testing.T) {
 	path := writeConfig(t, `
 upstream:
   endpoint: http://rustfs:9000
+  access_key: test-access
+  secret_key: test-secret
 cache:
   cache_path: ""
   meta_path: ""
@@ -99,6 +170,17 @@ cache:
 
 	if _, err := Load(path); err == nil {
 		t.Fatal("Load() error = nil, want validation error")
+	}
+}
+
+func TestLoadRequiresUpstreamCredentials(t *testing.T) {
+	path := writeConfig(t, `
+upstream:
+  endpoint: http://rustfs:9000
+`)
+
+	if _, err := Load(path); err == nil {
+		t.Fatal("Load() error = nil, want credential validation error")
 	}
 }
 
@@ -117,6 +199,25 @@ func TestParseBytes(t *testing.T) {
 		}
 		if got != want {
 			t.Fatalf("ParseBytes(%q) = %d, want %d", input, got, want)
+		}
+	}
+}
+
+func TestParseDuration(t *testing.T) {
+	tests := map[string]time.Duration{
+		"1s":   time.Second,
+		"2m":   2 * time.Minute,
+		"1h":   time.Hour,
+		"50ms": 50 * time.Millisecond,
+	}
+
+	for input, want := range tests {
+		got, err := ParseDuration(input)
+		if err != nil {
+			t.Fatalf("ParseDuration(%q) error = %v", input, err)
+		}
+		if got != want {
+			t.Fatalf("ParseDuration(%q) = %s, want %s", input, got, want)
 		}
 	}
 }

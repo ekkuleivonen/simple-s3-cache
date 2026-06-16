@@ -157,6 +157,13 @@ def cache_proxy(e2e_config: E2EConfig, tmp_path_factory: pytest.TempPathFactory)
                 "upstream:",
                 f"  endpoint: {upstream_endpoint}",
                 f"  region: {e2e_config.region}",
+                f"  access_key: {_yaml_quote(e2e_config.access_key_id or '')}",
+                f"  secret_key: {_yaml_quote(e2e_config.secret_access_key or '')}",
+                *(
+                    [f"  session_token: {_yaml_quote(e2e_config.session_token)}"]
+                    if e2e_config.session_token
+                    else []
+                ),
                 "cache:",
                 f"  cache_path: {cache_path}",
                 f"  meta_path: {meta_path}",
@@ -240,6 +247,10 @@ def _first_env(*names: str) -> str | None:
         if value:
             return value
     return None
+
+
+def _yaml_quote(value: str) -> str:
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
 def _free_port() -> int:
