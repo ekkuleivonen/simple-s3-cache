@@ -27,6 +27,12 @@ go.work.sum
 # env file
 .env
 
+# Python / e2e test artifacts
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+
 # Editor/IDE
 # .idea/
 # .vscode/
