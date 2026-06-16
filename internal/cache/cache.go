@@ -1228,7 +1228,7 @@ func (c *Cache) oldestPages(ctx context.Context, limit int) ([]Page, error) {
 	rows, err := c.db.QueryContext(ctx, `
 SELECT object_id, page_index, etag, epoch, size, path
 FROM pages
-ORDER BY last_accessed_at ASC, created_at ASC
+ORDER BY last_accessed_at ASC, created_at ASC, object_id ASC, page_index ASC
 LIMIT ?
 `, limit)
 	if err != nil {
@@ -1256,7 +1256,7 @@ SELECT p.object_id, p.page_index, p.etag, p.epoch, p.size, p.path
 FROM objects o
 JOIN pages p ON p.object_id = o.id
 WHERE o.bucket = ?
-ORDER BY p.last_accessed_at ASC, p.created_at ASC
+ORDER BY p.last_accessed_at ASC, p.created_at ASC, p.object_id ASC, p.page_index ASC
 LIMIT ?
 `, bucket, limit)
 	if err != nil {
