@@ -371,6 +371,14 @@ func (p *Proxy) serveCachedHead(w http.ResponseWriter, r *http.Request, target s
 	}
 
 	stats.cacheResult = "hit"
+	if status, ok, err := cachedConditionalStatus(r, obj); err != nil {
+		stats.cacheResult = "fallback"
+		return p.forward(w, r, stats)
+	} else if ok {
+		writeCachedConditionalHeaders(w.Header(), obj)
+		w.WriteHeader(status)
+		return status, 0, nil
+	}
 	writeCachedObjectHeaders(w.Header(), obj, false)
 	w.WriteHeader(http.StatusOK)
 	return http.StatusOK, 0, nil
@@ -390,6 +398,15 @@ func (p *Proxy) serveCachedRange(w http.ResponseWriter, r *http.Request, target 
 	if !ok {
 		stats.cacheResult = "fallback"
 		return p.forward(w, r, stats)
+	}
+	if status, ok, err := cachedConditionalStatus(r, obj); err != nil {
+		stats.cacheResult = "fallback"
+		return p.forward(w, r, stats)
+	} else if ok {
+		stats.cacheResult = "hit"
+		writeCachedConditionalHeaders(w.Header(), obj)
+		w.WriteHeader(status)
+		return status, 0, nil
 	}
 
 	byteRange, err := cacheplan.ParseRange(r.Header.Get("Range"), obj.Size)
@@ -437,6 +454,15 @@ func (p *Proxy) serveCachedFullObject(w http.ResponseWriter, r *http.Request, ta
 	if !ok {
 		stats.cacheResult = "fallback"
 		return p.forward(w, r, stats)
+	}
+	if status, ok, err := cachedConditionalStatus(r, obj); err != nil {
+		stats.cacheResult = "fallback"
+		return p.forward(w, r, stats)
+	} else if ok {
+		stats.cacheResult = "hit"
+		writeCachedConditionalHeaders(w.Header(), obj)
+		w.WriteHeader(status)
+		return status, 0, nil
 	}
 	stats.bytesRequested = obj.Size
 	if obj.Size == 0 {
@@ -740,6 +766,90 @@ func writeCachedObjectHeaders(dst http.Header, obj cache.Object, rangeResponse b
 		dst.Del("Content-Range")
 		dropRangeResponseHeaders(dst)
 	}
+}
+
+func writeCachedConditionalHeaders(dst http.Header, obj cache.Object) {
+	for _, key := range []string{"ETag", "Last-Modified", "Cache-Control", "Expires"} {
+		if value := obj.Headers.Get(key); value != "" {
+			dst.Set(key, value)
+		}
+	}
+}
+
+func cachedConditionalStatus(r *http.Request, obj cache.Object) (int, bool, error) {
+	ifMatch := r.Header.Get("If-Match")
+	if ifMatch != "" && !strongETagMatches(ifMatch, obj.ETag) {
+		return http.StatusPreconditionFailed, true, nil
+	}
+
+	ifUnmodifiedSince := r.Header.Get("If-Unmodified-Since")
+	if ifUnmodifiedSince != "" && ifMatch == "" {
+		modified, err := cachedLastModified(obj)
+		if err != nil {
+			return 0, false, err
+		}
+		since, err := http.ParseTime(ifUnmodifiedSince)
+		if err != nil {
+			return 0, false, err
+		}
+		if modified.After(since) {
+			return http.StatusPreconditionFailed, true, nil
+		}
+	}
+
+	ifNoneMatch := r.Header.Get("If-None-Match")
+	if ifNoneMatch != "" {
+		if weakETagMatches(ifNoneMatch, obj.ETag) {
+			return http.StatusNotModified, true, nil
+		}
+		return 0, false, nil
+	}
+
+	ifModifiedSince := r.Header.Get("If-Modified-Since")
+	if ifModifiedSince != "" {
+		modified, err := cachedLastModified(obj)
+		if err != nil {
+			return 0, false, err
+		}
+		since, err := http.ParseTime(ifModifiedSince)
+		if err != nil {
+			return 0, false, err
+		}
+		if !modified.After(since) {
+			return http.StatusNotModified, true, nil
+		}
+	}
+
+	return 0, false, nil
+}
+
+func cachedLastModified(obj cache.Object) (time.Time, error) {
+	value := obj.Headers.Get("Last-Modified")
+	if value == "" {
+		return time.Time{}, errors.New("cached metadata missing Last-Modified")
+	}
+	return http.ParseTime(value)
+}
+
+func strongETagMatches(condition, etag string) bool {
+	for _, candidate := range strings.Split(condition, ",") {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "*" || candidate == etag {
+			return true
+		}
+	}
+	return false
+}
+
+func weakETagMatches(condition, etag string) bool {
+	etag = strings.TrimPrefix(strings.TrimSpace(etag), "W/")
+	for _, candidate := range strings.Split(condition, ",") {
+		candidate = strings.TrimPrefix(strings.TrimSpace(candidate), "W/")
+		if candidate == "*" || candidate == etag {
+			return true
+		}
+	}
+	return false
 }
 
 func dropRangeResponseHeaders(header http.Header) {

@@ -984,11 +984,11 @@ Cover:
   - [ ] coalesce concurrent fetches for the same missing page
   - [x] fetch pages with `If-Match` and fence stores with a per-object epoch
 
-- [ ] **Milestone 4: GET, HEAD, and Single Range Cache**
+- [x] **Milestone 4: GET, HEAD, and Single Range Cache**
   - [x] serve `HEAD` from cached metadata
   - [x] serve full-object `GET` through the page cache
   - [x] serve single range requests through the page cache
-  - [ ] honor client conditional requests (`304` from cached metadata)
+  - [x] honor client conditional requests (`304` from cached metadata)
   - [x] fetch and store missing pages from upstream
   - [x] pass through multi-range requests
   - [x] preserve transparent S3 response headers and status codes

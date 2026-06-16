@@ -36,10 +36,6 @@ func Classify(req Request) Classification {
 		return passThrough("sse_c")
 	}
 
-	if hasClientConditionalHeaders(req.Header) {
-		return passThrough("conditional")
-	}
-
 	if req.RawQuery != "" {
 		return passThrough("query")
 	}
@@ -71,21 +67,6 @@ func passThrough(reason string) Classification {
 func hasSSECustomerHeaders(header http.Header) bool {
 	for key := range header {
 		if strings.HasPrefix(strings.ToLower(key), "x-amz-server-side-encryption-customer-") {
-			return true
-		}
-	}
-
-	return false
-}
-
-func hasClientConditionalHeaders(header http.Header) bool {
-	for _, key := range []string{
-		"If-None-Match",
-		"If-Modified-Since",
-		"If-Match",
-		"If-Unmodified-Since",
-	} {
-		if header.Get(key) != "" {
 			return true
 		}
 	}

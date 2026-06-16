@@ -234,6 +234,179 @@ func TestProxyCachesHeadMetadata(t *testing.T) {
 	}
 }
 
+func TestProxyServesConditionalNotModifiedFromCachedMetadata(t *testing.T) {
+	body := []byte("abcdefghijkl")
+	var upstreamRequests int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamRequests++
+		writeObjectResponse(t, w, r, body, `"etag-conditional"`)
+	}))
+	defer upstream.Close()
+
+	p := testProxyWithPageSize(t, upstream.URL, 4)
+	warmReq := httptest.NewRequest(http.MethodHead, "/bucket/conditional.bin", nil)
+	warmRec := httptest.NewRecorder()
+	p.ServeHTTP(warmRec, warmReq)
+	if warmRec.Code != http.StatusOK {
+		t.Fatalf("warm HEAD status = %d, want 200", warmRec.Code)
+	}
+
+	for _, tt := range []struct {
+		name   string
+		method string
+		header string
+		value  string
+	}{
+		{
+			name:   "head if-none-match",
+			method: http.MethodHead,
+			header: "If-None-Match",
+			value:  `"etag-conditional"`,
+		},
+		{
+			name:   "get if-none-match",
+			method: http.MethodGet,
+			header: "If-None-Match",
+			value:  `"etag-conditional"`,
+		},
+		{
+			name:   "get if-modified-since",
+			method: http.MethodGet,
+			header: "If-Modified-Since",
+			value:  "Tue, 16 Jun 2026 00:00:00 GMT",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(tt.method, "/bucket/conditional.bin", nil)
+			req.Header.Set(tt.header, tt.value)
+			rec := httptest.NewRecorder()
+
+			p.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusNotModified {
+				t.Fatalf("status = %d, want 304; body=%q", rec.Code, rec.Body.String())
+			}
+			if rec.Body.Len() != 0 {
+				t.Fatalf("body length = %d, want 0", rec.Body.Len())
+			}
+			if got := rec.Header().Get("ETag"); got != `"etag-conditional"` {
+				t.Fatalf("ETag = %q, want cached etag", got)
+			}
+		})
+	}
+
+	if upstreamRequests != 1 {
+		t.Fatalf("upstream requests = %d, want 1; conditionals should use cached metadata", upstreamRequests)
+	}
+}
+
+func TestProxyServesConditionalPreconditionFailedFromCachedMetadata(t *testing.T) {
+	body := []byte("abcdefghijkl")
+	var upstreamRequests int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamRequests++
+		writeObjectResponse(t, w, r, body, `"etag-precondition"`)
+	}))
+	defer upstream.Close()
+
+	p := testProxyWithPageSize(t, upstream.URL, 4)
+	warmReq := httptest.NewRequest(http.MethodHead, "/bucket/precondition.bin", nil)
+	warmRec := httptest.NewRecorder()
+	p.ServeHTTP(warmRec, warmReq)
+	if warmRec.Code != http.StatusOK {
+		t.Fatalf("warm HEAD status = %d, want 200", warmRec.Code)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/bucket/precondition.bin", nil)
+	req.Header.Set("If-Match", `"different-etag"`)
+	rec := httptest.NewRecorder()
+
+	p.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusPreconditionFailed {
+		t.Fatalf("status = %d, want 412; body=%q", rec.Code, rec.Body.String())
+	}
+	if rec.Body.Len() != 0 {
+		t.Fatalf("body length = %d, want 0", rec.Body.Len())
+	}
+	if upstreamRequests != 1 {
+		t.Fatalf("upstream requests = %d, want 1; precondition should use cached metadata", upstreamRequests)
+	}
+}
+
+func TestProxyUsesStrongETagComparisonForIfMatch(t *testing.T) {
+	body := []byte("abcdefghijkl")
+	var upstreamRequests int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamRequests++
+		writeObjectResponse(t, w, r, body, `"etag-strong"`)
+	}))
+	defer upstream.Close()
+
+	p := testProxyWithPageSize(t, upstream.URL, 4)
+	warmReq := httptest.NewRequest(http.MethodHead, "/bucket/strong-etag.bin", nil)
+	warmRec := httptest.NewRecorder()
+	p.ServeHTTP(warmRec, warmReq)
+	if warmRec.Code != http.StatusOK {
+		t.Fatalf("warm HEAD status = %d, want 200", warmRec.Code)
+	}
+
+	req := httptest.NewRequest(http.MethodHead, "/bucket/strong-etag.bin", nil)
+	req.Header.Set("If-Match", `W/"etag-strong"`)
+	rec := httptest.NewRecorder()
+
+	p.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusPreconditionFailed {
+		t.Fatalf("status = %d, want 412; body=%q", rec.Code, rec.Body.String())
+	}
+	if upstreamRequests != 1 {
+		t.Fatalf("upstream requests = %d, want 1; weak If-Match should be answered from cached metadata", upstreamRequests)
+	}
+}
+
+func TestProxyPassesThroughDateConditionalWhenCachedMetadataIsInsufficient(t *testing.T) {
+	ctx := context.Background()
+	var upstreamRequests []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamRequests = append(upstreamRequests, r.Method+" "+r.Header.Get("If-Modified-Since"))
+		w.Header().Set("ETag", `"etag-no-date"`)
+		w.WriteHeader(http.StatusNotModified)
+	}))
+	defer upstream.Close()
+
+	p := testProxyWithPageSize(t, upstream.URL, 4)
+	_, err := p.cache.PutObject(ctx, cache.ObjectMetadata{
+		Bucket:   "bucket",
+		Key:      "no-last-modified.bin",
+		ETag:     `"etag-no-date"`,
+		Size:     12,
+		PageSize: 4,
+		Headers: http.Header{
+			"Content-Length": []string{"12"},
+			"Content-Type":   []string{"application/octet-stream"},
+			"ETag":           []string{`"etag-no-date"`},
+		},
+	})
+	if err != nil {
+		t.Fatalf("PutObject() error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/bucket/no-last-modified.bin", nil)
+	req.Header.Set("If-Modified-Since", "Tue, 16 Jun 2026 00:00:00 GMT")
+	rec := httptest.NewRecorder()
+
+	p.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotModified {
+		t.Fatalf("status = %d, want 304 from upstream; body=%q", rec.Code, rec.Body.String())
+	}
+	wantRequests := []string{"GET Tue, 16 Jun 2026 00:00:00 GMT"}
+	if !equalStringSlices(upstreamRequests, wantRequests) {
+		t.Fatalf("upstream requests = %q, want %q", upstreamRequests, wantRequests)
+	}
+}
+
 func TestProxyCachesSinglePageRangeRead(t *testing.T) {
 	body := []byte("abcdefghijkl")
 	var upstreamRequests []string
@@ -937,6 +1110,7 @@ func writeObjectResponse(t *testing.T, w http.ResponseWriter, r *http.Request, b
 	w.Header().Set("Accept-Ranges", "bytes")
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("ETag", etag)
+	w.Header().Set("Last-Modified", "Tue, 16 Jun 2026 00:00:00 GMT")
 	w.Header().Set("X-Amz-Meta-Test", "cache")
 
 	if ifMatch := r.Header.Get("If-Match"); ifMatch != "" && ifMatch != etag {

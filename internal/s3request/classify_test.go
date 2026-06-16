@@ -30,6 +30,24 @@ func TestClassifyCacheableObjectReads(t *testing.T) {
 			},
 			want: CacheableRangeObject,
 		},
+		{
+			name: "conditional get object",
+			req: Request{
+				Method: http.MethodGet,
+				Target: Target{Bucket: "bucket", Key: "key"},
+				Header: http.Header{"If-None-Match": []string{`"etag"`}},
+			},
+			want: CacheableFullObject,
+		},
+		{
+			name: "conditional head object",
+			req: Request{
+				Method: http.MethodHead,
+				Target: Target{Bucket: "bucket", Key: "key"},
+				Header: http.Header{"If-Modified-Since": []string{"Tue, 16 Jun 2026 00:00:00 GMT"}},
+			},
+			want: CacheableHeadObject,
+		},
 	}
 
 	for _, tt := range tests {
@@ -141,24 +159,6 @@ func TestClassifyPassThroughRequests(t *testing.T) {
 				Header: http.Header{"Range": []string{"bytes=0-99"}},
 			},
 			wantReason: "range",
-		},
-		{
-			name: "conditional get",
-			req: Request{
-				Method: http.MethodGet,
-				Target: Target{Bucket: "bucket", Key: "key"},
-				Header: http.Header{"If-None-Match": []string{`"etag"`}},
-			},
-			wantReason: "conditional",
-		},
-		{
-			name: "conditional head",
-			req: Request{
-				Method: http.MethodHead,
-				Target: Target{Bucket: "bucket", Key: "key"},
-				Header: http.Header{"If-Modified-Since": []string{"Tue, 16 Jun 2026 00:00:00 GMT"}},
-			},
-			wantReason: "conditional",
 		},
 	}
 
