@@ -70,6 +70,7 @@ type cacheStore interface {
 
 type Proxy struct {
 	upstreamEndpoint *url.URL
+	upstreamHost     string
 	region           string
 	credentials      aws.CredentialsProvider
 	signer           *v4.Signer
@@ -166,6 +167,7 @@ func New(ctx context.Context, cfg appconfig.Config, logger *slog.Logger) (*Proxy
 
 	return &Proxy{
 		upstreamEndpoint: upstreamEndpoint,
+		upstreamHost:     strings.TrimSpace(cfg.Upstream.Host),
 		region:           cfg.Upstream.Region,
 		credentials:      credentialProvider,
 		signer:           v4.NewSigner(),
@@ -443,6 +445,7 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, stats *requestSt
 		removeAWSChunkedHeaders(req.Header)
 	}
 	req.Header.Set("X-Amz-Content-Sha256", unsignedPayload)
+	p.applyUpstreamHost(req)
 
 	if err := p.sign(req); err != nil {
 		http.Error(w, "sign upstream request", http.StatusBadGateway)
@@ -1827,10 +1830,18 @@ func (p *Proxy) newUpstreamRequest(ctx context.Context, r *http.Request, method 
 	if body == nil {
 		req.ContentLength = 0
 	}
+	p.applyUpstreamHost(req)
 	if err := p.sign(req); err != nil {
 		return nil, err
 	}
 	return req, nil
+}
+
+func (p *Proxy) applyUpstreamHost(req *http.Request) {
+	if p.upstreamHost == "" {
+		return
+	}
+	req.Host = p.upstreamHost
 }
 
 func (p *Proxy) sign(req *http.Request) error {

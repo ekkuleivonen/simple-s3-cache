@@ -85,6 +85,7 @@ func TestLoadParsesConfiguredValues(t *testing.T) {
 listen: "127.0.0.1:8081"
 upstream:
   endpoint: https://s3.example.test
+  host: 192.168.30.216:9000
   region: eu-north-1
   access_key: configured-access
   secret_key: configured-secret
@@ -128,6 +129,9 @@ peer:
 	}
 	if cfg.Upstream.Endpoint != "https://s3.example.test" {
 		t.Fatalf("Upstream.Endpoint = %q", cfg.Upstream.Endpoint)
+	}
+	if cfg.Upstream.Host != "192.168.30.216:9000" {
+		t.Fatalf("Upstream.Host = %q", cfg.Upstream.Host)
 	}
 	if cfg.Upstream.Region != "eu-north-1" {
 		t.Fatalf("Upstream.Region = %q", cfg.Upstream.Region)
@@ -368,6 +372,34 @@ upstream:
 
 	if _, err := Load(path); err == nil {
 		t.Fatal("Load() error = nil, want credential validation error")
+	}
+}
+
+func TestLoadRejectsInvalidUpstreamHost(t *testing.T) {
+	tests := []string{
+		"http://rustfs.example.test",
+		"rustfs.example.test/bucket",
+		"rustfs example.test",
+	}
+
+	for _, host := range tests {
+		t.Run(host, func(t *testing.T) {
+			path := writeConfig(t, `
+upstream:
+  endpoint: http://rustfs:9000
+  host: `+host+`
+  access_key: test-access
+  secret_key: test-secret
+`)
+
+			_, err := Load(path)
+			if err == nil {
+				t.Fatal("Load() error = nil, want upstream.host validation error")
+			}
+			if !strings.Contains(err.Error(), "upstream.host") {
+				t.Fatalf("Load() error = %v, want containing upstream.host", err)
+			}
+		})
 	}
 }
 

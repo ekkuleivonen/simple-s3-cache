@@ -365,6 +365,8 @@ listen: ":8080"
 
 upstream:
   endpoint: http://rustfs:9000
+  # Optional: override the Host header and SigV4 host while still dialing endpoint.
+  # host: 192.168.30.216:9000
   region: us-east-1
   access_key: simple-s3-cache
   secret_key: change-me
@@ -415,6 +417,12 @@ all buckets. Metrics and structured logs must expose enough data — read
 amplification, hit rate, evictions, and cached bytes, broken down by bucket — to
 guide steady-state tuning from evidence rather than guesses. See the Tuning
 strategy and Observability sections in [PLAN.md](PLAN.md).
+
+`upstream.endpoint` is the URL the proxy dials. If the upstream S3-compatible
+service expects a different authority in the HTTP Host header and SigV4
+canonical request, set `upstream.host` to that host or `host:port` value. This is
+useful when dialing an internal Kubernetes service name while RustFS or another
+backend validates requests against an external S3 endpoint name.
 
 `upstream.response_header_timeout` bounds how long the proxy waits for upstream
 S3-compatible storage to begin responding after a request is sent. The proxy

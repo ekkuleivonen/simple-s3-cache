@@ -2,6 +2,8 @@ listen: ":8080"
 
 upstream:
   endpoint: http://rustfs:9000
+  # Optional: override the Host header and SigV4 host while still dialing endpoint.
+  # host: 192.168.30.216:9000
   region: us-east-1
   access_key: simple-s3-cache
   secret_key: change-me

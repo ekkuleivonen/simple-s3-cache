@@ -46,6 +46,7 @@ type Config struct {
 
 type UpstreamConfig struct {
 	Endpoint                  string        `yaml:"endpoint"`
+	Host                      string        `yaml:"host"`
 	Region                    string        `yaml:"region"`
 	AccessKey                 string        `yaml:"access_key"`
 	SecretKey                 string        `yaml:"secret_key"`
@@ -259,6 +260,13 @@ func (cfg Config) Validate() error {
 		errs = append(errs, errors.New("upstream.endpoint must use http or https"))
 	} else if parsed.Host == "" {
 		errs = append(errs, errors.New("upstream.endpoint must include a host"))
+	}
+	if host := strings.TrimSpace(cfg.Upstream.Host); host != "" {
+		if parsed, err := url.Parse("//" + host); err != nil {
+			errs = append(errs, fmt.Errorf("upstream.host is invalid: %w", err))
+		} else if parsed.Host != host || parsed.Hostname() == "" || parsed.User != nil || parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" || strings.ContainsAny(host, " \t\r\n") {
+			errs = append(errs, errors.New("upstream.host must be a host or host:port without scheme or path"))
+		}
 	}
 	if strings.TrimSpace(cfg.Upstream.Region) == "" {
 		errs = append(errs, errors.New("upstream.region is required"))

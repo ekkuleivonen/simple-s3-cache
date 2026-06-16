@@ -226,6 +226,57 @@ func TestProxyReSignsInsteadOfForwardingClientSigV4Headers(t *testing.T) {
 	}
 }
 
+func TestProxyUsesConfiguredUpstreamHostWhileDialingEndpoint(t *testing.T) {
+	var gotHost, gotPath string
+	var gotAuthorization string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHost = r.Host
+		gotPath = r.URL.EscapedPath()
+		gotAuthorization = r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	p := testProxyWithUpstreamHost(t, upstream.URL, "192.168.30.216:9000")
+	req := httptest.NewRequest(http.MethodPut, "/bucket/key", strings.NewReader("body"))
+	rec := httptest.NewRecorder()
+
+	p.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%q", rec.Code, rec.Body.String())
+	}
+	if gotHost != "192.168.30.216:9000" {
+		t.Fatalf("upstream Host = %q, want configured signing host", gotHost)
+	}
+	if gotPath != "/bucket/key" {
+		t.Fatalf("upstream path = %q, want path-style bucket/key", gotPath)
+	}
+	if !strings.Contains(gotAuthorization, "SignedHeaders=") || !strings.Contains(gotAuthorization, "host") {
+		t.Fatalf("Authorization = %q, want SigV4 signature over host header", gotAuthorization)
+	}
+}
+
+func TestNewUpstreamRequestKeepsDialEndpointWhenUpstreamHostIsConfigured(t *testing.T) {
+	p := testProxyWithUpstreamHost(t, "http://rustfs-api.rustfs.svc.cluster.local:9000", "192.168.30.216:9000")
+	clientReq := httptest.NewRequest(http.MethodGet, "/bucket/key", nil)
+
+	req, err := p.newUpstreamRequest(context.Background(), clientReq, http.MethodHead, nil)
+	if err != nil {
+		t.Fatalf("newUpstreamRequest() error = %v", err)
+	}
+
+	if req.URL.Host != "rustfs-api.rustfs.svc.cluster.local:9000" {
+		t.Fatalf("URL.Host = %q, want dial endpoint host", req.URL.Host)
+	}
+	if req.Host != "192.168.30.216:9000" {
+		t.Fatalf("Host = %q, want configured signing host", req.Host)
+	}
+	if req.URL.EscapedPath() != "/bucket/key" {
+		t.Fatalf("path = %q, want path-style bucket/key", req.URL.EscapedPath())
+	}
+}
+
 func TestProxyForwardsStreamingPutBodyWithContentLength(t *testing.T) {
 	body := []byte("streamed through chunked transfer encoding")
 	var gotBody []byte
@@ -1911,6 +1962,14 @@ func testProxyWithBucketPageSizes(t *testing.T, endpoint string, pageSize int64,
 
 	p := testProxyWithPageSize(t, endpoint, pageSize)
 	p.pageSizeByBucket = pageSizeByBucket
+	return p
+}
+
+func testProxyWithUpstreamHost(t *testing.T, endpoint, upstreamHost string) *Proxy {
+	t.Helper()
+
+	p := testProxy(t, endpoint)
+	p.upstreamHost = upstreamHost
 	return p
 }
 
