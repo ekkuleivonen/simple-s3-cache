@@ -10,6 +10,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestObjectKeyIsStableAndPathSafe(t *testing.T) {
@@ -596,6 +597,142 @@ func TestOpenTreatsCorruptDatabaseAsEmptyCache(t *testing.T) {
 	}
 }
 
+func TestMetadataGCDeletesOldPageLessObjects(t *testing.T) {
+	ctx := context.Background()
+	c := openTestCache(t)
+	c.metadataMaxAge = time.Hour
+	c.metadataGCBatchSize = 10
+	obj := putTestObject(t, c, "bucket", "old-metadata.bin")
+	old := time.Now().Add(-2 * time.Hour).UnixNano()
+	if _, err := c.execWrite(ctx, `UPDATE objects SET updated_at = ? WHERE id = ?`, old, obj.ID); err != nil {
+		t.Fatalf("age object metadata: %v", err)
+	}
+	if _, err := c.execWrite(ctx, `UPDATE object_generations SET updated_at = ? WHERE id = ?`, old, obj.ID); err != nil {
+		t.Fatalf("age object generation: %v", err)
+	}
+
+	result, err := c.collectMetadata(ctx)
+	if err != nil {
+		t.Fatalf("collectMetadata() error = %v", err)
+	}
+	if result.ObjectsDeleted != 1 {
+		t.Fatalf("ObjectsDeleted = %d, want 1", result.ObjectsDeleted)
+	}
+	if _, ok, err := c.GetObject(ctx, "bucket", "old-metadata.bin"); err != nil {
+		t.Fatalf("GetObject() error = %v", err)
+	} else if ok {
+		t.Fatal("GetObject() ok = true, want old page-less metadata removed")
+	}
+}
+
+func TestMetadataGCPreservesYoungPageLessObjects(t *testing.T) {
+	ctx := context.Background()
+	c := openTestCache(t)
+	c.metadataMaxAge = time.Hour
+	c.metadataGCBatchSize = 10
+	putTestObject(t, c, "bucket", "young-metadata.bin")
+
+	result, err := c.collectMetadata(ctx)
+	if err != nil {
+		t.Fatalf("collectMetadata() error = %v", err)
+	}
+	if result.ObjectsDeleted != 0 {
+		t.Fatalf("ObjectsDeleted = %d, want 0", result.ObjectsDeleted)
+	}
+	if _, ok, err := c.GetObject(ctx, "bucket", "young-metadata.bin"); err != nil {
+		t.Fatalf("GetObject() error = %v", err)
+	} else if !ok {
+		t.Fatal("GetObject() ok = false, want young metadata preserved")
+	}
+}
+
+func TestMetadataGCPreservesObjectsWithPages(t *testing.T) {
+	ctx := context.Background()
+	c := openTestCache(t)
+	c.metadataMaxAge = time.Hour
+	c.metadataGCBatchSize = 10
+	obj := putTestObject(t, c, "bucket", "paged-metadata.bin")
+	if _, err := c.StorePage(ctx, PageWrite{
+		ObjectID: obj.ID,
+		Index:    0,
+		ETag:     obj.ETag,
+		Size:     int64(len("cached page")),
+		Source:   bytes.NewReader([]byte("cached page")),
+	}); err != nil {
+		t.Fatalf("StorePage() error = %v", err)
+	}
+	old := time.Now().Add(-2 * time.Hour).UnixNano()
+	if _, err := c.execWrite(ctx, `UPDATE objects SET updated_at = ? WHERE id = ?`, old, obj.ID); err != nil {
+		t.Fatalf("age object metadata: %v", err)
+	}
+
+	result, err := c.collectMetadata(ctx)
+	if err != nil {
+		t.Fatalf("collectMetadata() error = %v", err)
+	}
+	if result.ObjectsDeleted != 0 {
+		t.Fatalf("ObjectsDeleted = %d, want 0", result.ObjectsDeleted)
+	}
+	if _, ok, err := c.GetObject(ctx, "bucket", "paged-metadata.bin"); err != nil {
+		t.Fatalf("GetObject() error = %v", err)
+	} else if !ok {
+		t.Fatal("GetObject() ok = false, want metadata with pages preserved")
+	}
+	if body, ok, err := c.OpenPage(ctx, obj.ID, 0); err != nil {
+		t.Fatalf("OpenPage() error = %v", err)
+	} else if !ok {
+		t.Fatal("OpenPage() ok = false, want page preserved")
+	} else {
+		body.Close()
+	}
+}
+
+func TestMetadataGCRetainsAndPrunesOldGenerations(t *testing.T) {
+	ctx := context.Background()
+	c := openTestCache(t)
+	c.metadataMaxAge = time.Hour
+	c.metadataGCBatchSize = 10
+	obj := putTestObject(t, c, "bucket", "generation.bin")
+	if err := c.DeleteObject(ctx, "bucket", "generation.bin"); err != nil {
+		t.Fatalf("DeleteObject() error = %v", err)
+	}
+
+	result, err := c.collectMetadata(ctx)
+	if err != nil {
+		t.Fatalf("collectMetadata() error = %v", err)
+	}
+	if result.GenerationsDeleted != 0 {
+		t.Fatalf("GenerationsDeleted = %d, want 0 for recent invalidation", result.GenerationsDeleted)
+	}
+	if !generationExists(t, c, obj.ID) {
+		t.Fatal("generation row was pruned before retention age")
+	}
+
+	old := time.Now().Add(-2 * time.Hour).UnixNano()
+	if _, err := c.execWrite(ctx, `UPDATE object_generations SET updated_at = ? WHERE id = ?`, old, obj.ID); err != nil {
+		t.Fatalf("age object generation: %v", err)
+	}
+	result, err = c.collectMetadata(ctx)
+	if err != nil {
+		t.Fatalf("collectMetadata(second) error = %v", err)
+	}
+	if result.GenerationsDeleted != 1 {
+		t.Fatalf("GenerationsDeleted = %d, want 1", result.GenerationsDeleted)
+	}
+	if generationExists(t, c, obj.ID) {
+		t.Fatal("generation row still present after retention age")
+	}
+}
+
+func TestSQLiteCheckpointRuns(t *testing.T) {
+	ctx := context.Background()
+	c := openTestCache(t)
+
+	if err := c.checkpointSQLite(ctx); err != nil {
+		t.Fatalf("checkpointSQLite() error = %v", err)
+	}
+}
+
 func openTestCache(t *testing.T) *Cache {
 	t.Helper()
 
@@ -639,4 +776,14 @@ func putTestObject(t *testing.T, c *Cache, bucket, key string) Object {
 	}
 
 	return obj
+}
+
+func generationExists(t *testing.T, c *Cache, objectID string) bool {
+	t.Helper()
+
+	var count int
+	if err := c.db.QueryRow(`SELECT COUNT(*) FROM object_generations WHERE id = ?`, objectID).Scan(&count); err != nil {
+		t.Fatalf("query generation count: %v", err)
+	}
+	return count > 0
 }

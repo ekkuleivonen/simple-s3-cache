@@ -112,10 +112,14 @@ func New(ctx context.Context, cfg appconfig.Config, logger *slog.Logger) (*Proxy
 
 	recorder := metrics.NewRecorder(cfg.Cache.MaxSize)
 	cacheStore, err := cache.Open(ctx, cache.Options{
-		CachePath: cfg.Cache.CachePath,
-		MetaPath:  cfg.Cache.MetaPath,
-		MaxSize:   cfg.Cache.MaxSize,
-		Metrics:   recorder,
+		CachePath:                cfg.Cache.CachePath,
+		MetaPath:                 cfg.Cache.MetaPath,
+		MaxSize:                  cfg.Cache.MaxSize,
+		MetadataGCInterval:       cfg.Cache.MetadataGCInterval,
+		MetadataMaxAge:           cfg.Cache.MetadataMaxAge,
+		MetadataGCBatchSize:      cfg.Cache.MetadataGCBatchSize,
+		SQLiteCheckpointInterval: cfg.Cache.SQLiteCheckpointInterval,
+		Metrics:                  recorder,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("open cache: %w", err)

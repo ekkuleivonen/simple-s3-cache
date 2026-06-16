@@ -27,33 +27,45 @@ const (
 	cacheDBMaxIdleConns    = 8
 	evictionBatchSize      = 128
 	metricsRefreshInterval = 5 * time.Second
+	metadataGCInterval     = time.Hour
+	metadataMaxAge         = 24 * time.Hour
+	metadataGCBatchSize    = 512
+	sqliteCheckpointPeriod = 6 * time.Hour
 	touchFlushInterval     = time.Second
 	touchFlushBatchSize    = 256
 	touchQueueSize         = 1024
 )
 
 type Options struct {
-	CachePath string
-	MetaPath  string
-	MaxSize   int64
-	Metrics   *metrics.Recorder
+	CachePath                string
+	MetaPath                 string
+	MaxSize                  int64
+	MetadataGCInterval       time.Duration
+	MetadataMaxAge           time.Duration
+	MetadataGCBatchSize      int
+	SQLiteCheckpointInterval time.Duration
+	Metrics                  *metrics.Recorder
 }
 
 type Cache struct {
-	cacheRoot      string
-	metaRoot       string
-	maxSize        int64
-	db             *sql.DB
-	evictionCh     chan struct{}
-	touchCh        chan pageRef
-	metricsCh      chan struct{}
-	writeMu        sync.Mutex
-	cancelWorker   context.CancelFunc
-	workerWG       sync.WaitGroup
-	metrics        *metrics.Recorder
-	sizeMu         sync.RWMutex
-	cachedSize     int64
-	cachedByBucket map[string]int64
+	cacheRoot                string
+	metaRoot                 string
+	maxSize                  int64
+	metadataGCInterval       time.Duration
+	metadataMaxAge           time.Duration
+	metadataGCBatchSize      int
+	sqliteCheckpointInterval time.Duration
+	db                       *sql.DB
+	evictionCh               chan struct{}
+	touchCh                  chan pageRef
+	metricsCh                chan struct{}
+	writeMu                  sync.Mutex
+	cancelWorker             context.CancelFunc
+	workerWG                 sync.WaitGroup
+	metrics                  *metrics.Recorder
+	sizeMu                   sync.RWMutex
+	cachedSize               int64
+	cachedByBucket           map[string]int64
 }
 
 type ObjectMetadata struct {
@@ -98,6 +110,11 @@ type pageRef struct {
 	index    int64
 }
 
+type metadataGCResult struct {
+	ObjectsDeleted     int64
+	GenerationsDeleted int64
+}
+
 var storePageAfterValidationHook func()
 
 func openCacheDB(dbPath string) (*sql.DB, error) {
@@ -131,6 +148,18 @@ func Open(ctx context.Context, opts Options) (*Cache, error) {
 	if opts.MaxSize <= 0 {
 		opts.MaxSize = 1 << 60
 	}
+	if opts.MetadataGCInterval <= 0 {
+		opts.MetadataGCInterval = metadataGCInterval
+	}
+	if opts.MetadataMaxAge <= 0 {
+		opts.MetadataMaxAge = metadataMaxAge
+	}
+	if opts.MetadataGCBatchSize <= 0 {
+		opts.MetadataGCBatchSize = metadataGCBatchSize
+	}
+	if opts.SQLiteCheckpointInterval <= 0 {
+		opts.SQLiteCheckpointInterval = sqliteCheckpointPeriod
+	}
 	if err := os.MkdirAll(filepath.Join(opts.CachePath, "objects"), 0o755); err != nil {
 		return nil, fmt.Errorf("create cache directories: %w", err)
 	}
@@ -146,16 +175,20 @@ func Open(ctx context.Context, opts Options) (*Cache, error) {
 
 	workerCtx, cancelWorker := context.WithCancel(context.Background())
 	c := &Cache{
-		cacheRoot:      opts.CachePath,
-		metaRoot:       opts.MetaPath,
-		maxSize:        opts.MaxSize,
-		db:             db,
-		evictionCh:     make(chan struct{}, 1),
-		touchCh:        make(chan pageRef, touchQueueSize),
-		metricsCh:      make(chan struct{}, 1),
-		cancelWorker:   cancelWorker,
-		metrics:        opts.Metrics,
-		cachedByBucket: map[string]int64{},
+		cacheRoot:                opts.CachePath,
+		metaRoot:                 opts.MetaPath,
+		maxSize:                  opts.MaxSize,
+		metadataGCInterval:       opts.MetadataGCInterval,
+		metadataMaxAge:           opts.MetadataMaxAge,
+		metadataGCBatchSize:      opts.MetadataGCBatchSize,
+		sqliteCheckpointInterval: opts.SQLiteCheckpointInterval,
+		db:                       db,
+		evictionCh:               make(chan struct{}, 1),
+		touchCh:                  make(chan pageRef, touchQueueSize),
+		metricsCh:                make(chan struct{}, 1),
+		cancelWorker:             cancelWorker,
+		metrics:                  opts.Metrics,
+		cachedByBucket:           map[string]int64{},
 	}
 	initErr := c.init(ctx)
 	if initErr != nil && isCorruptDatabaseError(initErr) {
@@ -318,20 +351,21 @@ func (c *Cache) DeleteObject(ctx context.Context, bucket, key string) error {
 		return err
 	}
 
+	now := time.Now().UnixNano()
 	tx, unlock, err := c.beginWriteTx(ctx)
 	if err != nil {
 		return fmt.Errorf("begin delete object: %w", err)
 	}
 	defer unlock()
 	if _, err := tx.ExecContext(ctx, `
-INSERT INTO object_generations (id, epoch)
-VALUES (?, 0)
+INSERT INTO object_generations (id, epoch, updated_at)
+VALUES (?, 0, ?)
 ON CONFLICT(id) DO NOTHING
-`, obj.ID); err != nil {
+`, obj.ID, now); err != nil {
 		_ = tx.Rollback()
 		return fmt.Errorf("ensure object generation: %w", err)
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE object_generations SET epoch = epoch + 1 WHERE id = ?`, obj.ID); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE object_generations SET epoch = epoch + 1, updated_at = ? WHERE id = ?`, now, obj.ID); err != nil {
 		_ = tx.Rollback()
 		return fmt.Errorf("bump object generation: %w", err)
 	}
@@ -703,6 +737,91 @@ func (c *Cache) Evict(ctx context.Context) error {
 	}
 }
 
+func (c *Cache) collectMetadata(ctx context.Context) (metadataGCResult, error) {
+	cutoff := time.Now().Add(-c.metadataMaxAge).UnixNano()
+	objectsDeleted, err := c.deleteOldPageLessObjects(ctx, cutoff, c.metadataGCBatchSize)
+	if err != nil {
+		return metadataGCResult{}, err
+	}
+	generationsDeleted, err := c.deleteOldUnreferencedGenerations(ctx, cutoff, c.metadataGCBatchSize)
+	if err != nil {
+		return metadataGCResult{}, err
+	}
+	return metadataGCResult{
+		ObjectsDeleted:     objectsDeleted,
+		GenerationsDeleted: generationsDeleted,
+	}, nil
+}
+
+func (c *Cache) deleteOldPageLessObjects(ctx context.Context, olderThan int64, limit int) (int64, error) {
+	result, err := c.execWrite(ctx, `
+WITH victims(id) AS (
+	SELECT o.id
+	FROM objects o
+	WHERE o.updated_at < ?
+		AND NOT EXISTS (
+			SELECT 1
+			FROM pages p
+			WHERE p.object_id = o.id
+		)
+	LIMIT ?
+)
+DELETE FROM objects
+WHERE id IN (SELECT id FROM victims)
+`, olderThan, limit)
+	if err != nil {
+		return 0, fmt.Errorf("delete old page-less objects: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("read old page-less object count: %w", err)
+	}
+	return rows, nil
+}
+
+func (c *Cache) deleteOldUnreferencedGenerations(ctx context.Context, olderThan int64, limit int) (int64, error) {
+	result, err := c.execWrite(ctx, `
+WITH victims(id) AS (
+	SELECT g.id
+	FROM object_generations g
+	WHERE g.updated_at < ?
+		AND NOT EXISTS (
+			SELECT 1
+			FROM objects o
+			WHERE o.id = g.id
+		)
+	LIMIT ?
+)
+DELETE FROM object_generations
+WHERE id IN (SELECT id FROM victims)
+`, olderThan, limit)
+	if err != nil {
+		return 0, fmt.Errorf("delete old object generations: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("read old object generation count: %w", err)
+	}
+	return rows, nil
+}
+
+func (c *Cache) checkpointSQLite(ctx context.Context) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+
+	rows, err := c.db.QueryContext(ctx, `PRAGMA wal_checkpoint(PASSIVE)`)
+	if err != nil {
+		return fmt.Errorf("checkpoint cache db: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("checkpoint cache db: %w", err)
+	}
+	return nil
+}
+
 func (c *Cache) pagePath(objectID string, index int64) string {
 	return filepath.Join("objects", objectID[:2], objectID[2:4], objectID, fmt.Sprintf("page-%012d", index))
 }
@@ -741,7 +860,8 @@ func (c *Cache) init(ctx context.Context) error {
 		`PRAGMA foreign_keys = ON`,
 		`CREATE TABLE IF NOT EXISTS object_generations (
 			id TEXT PRIMARY KEY,
-			epoch INTEGER NOT NULL
+			epoch INTEGER NOT NULL,
+			updated_at INTEGER NOT NULL DEFAULT 0
 		)`,
 		`CREATE TABLE IF NOT EXISTS objects (
 			id TEXT PRIMARY KEY,
@@ -766,8 +886,6 @@ func (c *Cache) init(ctx context.Context) error {
 			PRIMARY KEY (object_id, page_index),
 			FOREIGN KEY (object_id) REFERENCES objects(id) ON DELETE CASCADE
 		)`,
-		`INSERT OR IGNORE INTO object_generations (id, epoch)
-			SELECT id, epoch FROM objects`,
 		`CREATE INDEX IF NOT EXISTS pages_object_idx ON pages(object_id)`,
 		`CREATE INDEX IF NOT EXISTS pages_lru_idx ON pages(last_accessed_at, created_at)`,
 	}
@@ -777,15 +895,58 @@ func (c *Cache) init(ctx context.Context) error {
 			return fmt.Errorf("init cache db: %w", err)
 		}
 	}
+	if err := c.ensureObjectGenerationUpdatedAtColumn(ctx); err != nil {
+		return err
+	}
+	if _, err := c.db.ExecContext(ctx, `
+INSERT OR IGNORE INTO object_generations (id, epoch, updated_at)
+SELECT id, epoch, updated_at FROM objects
+`); err != nil {
+		return fmt.Errorf("init object generations: %w", err)
+	}
+	return nil
+}
+
+func (c *Cache) ensureObjectGenerationUpdatedAtColumn(ctx context.Context) error {
+	rows, err := c.db.QueryContext(ctx, `PRAGMA table_info(object_generations)`)
+	if err != nil {
+		return fmt.Errorf("inspect object generations schema: %w", err)
+	}
+	defer rows.Close()
+
+	hasUpdatedAt := false
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notNull int
+		var defaultValue sql.NullString
+		var pk int
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
+			return fmt.Errorf("scan object generations schema: %w", err)
+		}
+		if name == "updated_at" {
+			hasUpdatedAt = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("inspect object generations schema: %w", err)
+	}
+	if hasUpdatedAt {
+		return nil
+	}
+
+	if _, err := c.execWrite(ctx, `ALTER TABLE object_generations ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0`); err != nil {
+		return fmt.Errorf("migrate object generations schema: %w", err)
+	}
 	return nil
 }
 
 func (c *Cache) ensureGeneration(ctx context.Context, objectID string) error {
 	_, err := c.execWrite(ctx, `
-INSERT INTO object_generations (id, epoch)
-VALUES (?, 0)
+INSERT INTO object_generations (id, epoch, updated_at)
+VALUES (?, 0, ?)
 ON CONFLICT(id) DO NOTHING
-`, objectID)
+`, objectID, time.Now().UnixNano())
 	if err != nil {
 		return fmt.Errorf("ensure object generation: %w", err)
 	}
@@ -1003,6 +1164,10 @@ func (c *Cache) maintenanceLoop(ctx context.Context) {
 	defer touchTicker.Stop()
 	metricsTicker := time.NewTicker(metricsRefreshInterval)
 	defer metricsTicker.Stop()
+	metadataGCTicker := time.NewTicker(c.metadataGCInterval)
+	defer metadataGCTicker.Stop()
+	sqliteCheckpointTicker := time.NewTicker(c.sqliteCheckpointInterval)
+	defer sqliteCheckpointTicker.Stop()
 	pendingTouches := map[pageRef]struct{}{}
 	metricsDirty := false
 
@@ -1023,6 +1188,10 @@ func (c *Cache) maintenanceLoop(ctx context.Context) {
 			}
 		case <-touchTicker.C:
 			_ = c.flushTouches(ctx, pendingTouches)
+		case <-metadataGCTicker.C:
+			_, _ = c.collectMetadata(ctx)
+		case <-sqliteCheckpointTicker.C:
+			_ = c.checkpointSQLite(ctx)
 		case <-metricsTicker.C:
 			if metricsDirty {
 				c.publishCacheSizeMetrics()

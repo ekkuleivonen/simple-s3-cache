@@ -38,6 +38,18 @@ upstream:
 	if cfg.Cache.MaxSize != 1<<40 {
 		t.Fatalf("Cache.MaxSize = %d, want %d", cfg.Cache.MaxSize, int64(1<<40))
 	}
+	if cfg.Cache.MetadataGCInterval != time.Hour {
+		t.Fatalf("Cache.MetadataGCInterval = %s, want 1h", cfg.Cache.MetadataGCInterval)
+	}
+	if cfg.Cache.MetadataMaxAge != 24*time.Hour {
+		t.Fatalf("Cache.MetadataMaxAge = %s, want 24h", cfg.Cache.MetadataMaxAge)
+	}
+	if cfg.Cache.MetadataGCBatchSize != 512 {
+		t.Fatalf("Cache.MetadataGCBatchSize = %d, want 512", cfg.Cache.MetadataGCBatchSize)
+	}
+	if cfg.Cache.SQLiteCheckpointInterval != 6*time.Hour {
+		t.Fatalf("Cache.SQLiteCheckpointInterval = %s, want 6h", cfg.Cache.SQLiteCheckpointInterval)
+	}
 	if cfg.Upstream.ResponseHeaderTimeout != 30*time.Second {
 		t.Fatalf("Upstream.ResponseHeaderTimeout = %s, want 30s", cfg.Upstream.ResponseHeaderTimeout)
 	}
@@ -76,6 +88,10 @@ cache:
   meta_path: /mnt/cache-meta
   max_size: 2GB
   page_size: 512KB
+  metadata_gc_interval: 30m
+  metadata_max_age: 12h
+  metadata_gc_batch_size: 128
+  sqlite_checkpoint_interval: 2h
 http:
   read_header_timeout: 3s
   read_timeout: 2m
@@ -120,6 +136,18 @@ upload:
 	}
 	if cfg.Cache.PageSize != 512<<10 {
 		t.Fatalf("Cache.PageSize = %d, want %d", cfg.Cache.PageSize, int64(512<<10))
+	}
+	if cfg.Cache.MetadataGCInterval != 30*time.Minute {
+		t.Fatalf("Cache.MetadataGCInterval = %s, want 30m", cfg.Cache.MetadataGCInterval)
+	}
+	if cfg.Cache.MetadataMaxAge != 12*time.Hour {
+		t.Fatalf("Cache.MetadataMaxAge = %s, want 12h", cfg.Cache.MetadataMaxAge)
+	}
+	if cfg.Cache.MetadataGCBatchSize != 128 {
+		t.Fatalf("Cache.MetadataGCBatchSize = %d, want 128", cfg.Cache.MetadataGCBatchSize)
+	}
+	if cfg.Cache.SQLiteCheckpointInterval != 2*time.Hour {
+		t.Fatalf("Cache.SQLiteCheckpointInterval = %s, want 2h", cfg.Cache.SQLiteCheckpointInterval)
 	}
 	if cfg.Upstream.ResponseHeaderTimeout != 45*time.Second {
 		t.Fatalf("Upstream.ResponseHeaderTimeout = %s, want 45s", cfg.Upstream.ResponseHeaderTimeout)
@@ -181,6 +209,21 @@ upstream:
 
 	if _, err := Load(path); err == nil {
 		t.Fatal("Load() error = nil, want credential validation error")
+	}
+}
+
+func TestLoadRequiresValidCacheMaintenanceConfig(t *testing.T) {
+	path := writeConfig(t, `
+upstream:
+  endpoint: http://rustfs:9000
+  access_key: test-access
+  secret_key: test-secret
+cache:
+  metadata_gc_batch_size: 0
+`)
+
+	if _, err := Load(path); err == nil {
+		t.Fatal("Load() error = nil, want maintenance validation error")
 	}
 }
 

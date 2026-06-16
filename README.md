@@ -235,6 +235,10 @@ Cached object pages are stored on local disk.
 A local SQLite index tracks cached pages and object metadata. It is part of the
 disposable cache, not a source of truth.
 
+The cache automatically prunes old object metadata that no longer has cached
+pages, keeps invalidation generation fences for a retention window, and
+periodically checkpoints SQLite WAL state.
+
 The cache is disposable.
 
 Deleting the cache data or metadata paths should never result in data loss.
@@ -300,6 +304,10 @@ rate, and upstream latency.
 
 Most storage is consumed by cached page files.
 
+Cached page bytes are bounded by `cache.max_size`. SQLite metadata is maintained
+automatically with conservative background cleanup defaults, so long-running
+deployments should not need routine manual pruning.
+
 ## Configuration
 
 ```yaml
@@ -317,6 +325,10 @@ cache:
   meta_path: /cache/meta
   max_size: 1TB
   page_size: 4MB
+  metadata_gc_interval: 1h
+  metadata_max_age: 24h
+  metadata_gc_batch_size: 512
+  sqlite_checkpoint_interval: 6h
 
 http:
   read_header_timeout: 5s
@@ -337,6 +349,12 @@ Page size is the primary tuning knob. Larger pages reduce metadata overhead but
 amplify over-fetch on small scattered reads (a tiny Parquet footer still pulls a
 whole page). The 4 MB default favors the analytical and random-access workloads
 this cache targets.
+
+Metadata cleanup is enabled by default. `metadata_gc_interval` controls how
+often old page-less metadata is considered for deletion, `metadata_max_age`
+keeps recently observed metadata and invalidation fences around long enough to
+avoid racing in-flight work, and `sqlite_checkpoint_interval` bounds WAL growth
+without requiring routine online `VACUUM`.
 
 Production deployments use one global `page_size` and one global `max_size` for
 all buckets. Metrics and structured logs must expose enough data — read

@@ -12,6 +12,10 @@ cache:
   meta_path: /cache/meta
   max_size: 1TB
   page_size: 4MB
+  metadata_gc_interval: 1h
+  metadata_max_age: 24h
+  metadata_gc_batch_size: 512
+  sqlite_checkpoint_interval: 6h
 
 http:
   read_header_timeout: 5s

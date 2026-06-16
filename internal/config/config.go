@@ -19,6 +19,10 @@ const (
 	defaultMetaPath                      = "/cache/meta"
 	defaultMaxSize                       = int64(1 << 40) // 1 TiB
 	defaultPageSize                      = int64(4 << 20) // 4 MiB
+	defaultMetadataGCInterval            = time.Hour
+	defaultMetadataMaxAge                = 24 * time.Hour
+	defaultMetadataGCBatchSize           = 512
+	defaultSQLiteCheckpointInterval      = 6 * time.Hour
 	defaultRegion                        = "us-east-1"
 	defaultUpstreamResponseHeaderTimeout = 30 * time.Second
 	defaultReadHeaderTimeout             = 5 * time.Second
@@ -48,13 +52,20 @@ type UpstreamConfig struct {
 }
 
 type CacheConfig struct {
-	CachePath string `yaml:"cache_path"`
-	MetaPath  string `yaml:"meta_path"`
-	MaxSize   int64  `yaml:"-"`
-	PageSize  int64  `yaml:"-"`
+	CachePath                string        `yaml:"cache_path"`
+	MetaPath                 string        `yaml:"meta_path"`
+	MaxSize                  int64         `yaml:"-"`
+	PageSize                 int64         `yaml:"-"`
+	MetadataGCInterval       time.Duration `yaml:"-"`
+	MetadataMaxAge           time.Duration `yaml:"-"`
+	MetadataGCBatchSize      int           `yaml:"metadata_gc_batch_size"`
+	SQLiteCheckpointInterval time.Duration `yaml:"-"`
 
-	MaxSizeText  string `yaml:"max_size"`
-	PageSizeText string `yaml:"page_size"`
+	MaxSizeText                  string `yaml:"max_size"`
+	PageSizeText                 string `yaml:"page_size"`
+	MetadataGCIntervalText       string `yaml:"metadata_gc_interval"`
+	MetadataMaxAgeText           string `yaml:"metadata_max_age"`
+	SQLiteCheckpointIntervalText string `yaml:"sqlite_checkpoint_interval"`
 }
 
 type HTTPConfig struct {
@@ -108,10 +119,14 @@ func Default() Config {
 			ResponseHeaderTimeout: defaultUpstreamResponseHeaderTimeout,
 		},
 		Cache: CacheConfig{
-			CachePath: defaultCachePath,
-			MetaPath:  defaultMetaPath,
-			MaxSize:   defaultMaxSize,
-			PageSize:  defaultPageSize,
+			CachePath:                defaultCachePath,
+			MetaPath:                 defaultMetaPath,
+			MaxSize:                  defaultMaxSize,
+			PageSize:                 defaultPageSize,
+			MetadataGCInterval:       defaultMetadataGCInterval,
+			MetadataMaxAge:           defaultMetadataMaxAge,
+			MetadataGCBatchSize:      defaultMetadataGCBatchSize,
+			SQLiteCheckpointInterval: defaultSQLiteCheckpointInterval,
 		},
 		HTTP: HTTPConfig{
 			ReadHeaderTimeout: defaultReadHeaderTimeout,
@@ -159,6 +174,9 @@ func (cfg *Config) applyParsedDurations() error {
 		value *time.Duration
 	}{
 		{"upstream.response_header_timeout", cfg.Upstream.ResponseHeaderTimeoutText, &cfg.Upstream.ResponseHeaderTimeout},
+		{"cache.metadata_gc_interval", cfg.Cache.MetadataGCIntervalText, &cfg.Cache.MetadataGCInterval},
+		{"cache.metadata_max_age", cfg.Cache.MetadataMaxAgeText, &cfg.Cache.MetadataMaxAge},
+		{"cache.sqlite_checkpoint_interval", cfg.Cache.SQLiteCheckpointIntervalText, &cfg.Cache.SQLiteCheckpointInterval},
 		{"http.read_header_timeout", cfg.HTTP.ReadHeaderTimeoutText, &cfg.HTTP.ReadHeaderTimeout},
 		{"http.read_timeout", cfg.HTTP.ReadTimeoutText, &cfg.HTTP.ReadTimeout},
 		{"http.write_timeout", cfg.HTTP.WriteTimeoutText, &cfg.HTTP.WriteTimeout},
@@ -223,6 +241,18 @@ func (cfg Config) Validate() error {
 	}
 	if cfg.Cache.MaxSize > 0 && cfg.Cache.PageSize > cfg.Cache.MaxSize {
 		errs = append(errs, errors.New("cache.page_size must not exceed cache.max_size"))
+	}
+	if cfg.Cache.MetadataGCInterval <= 0 {
+		errs = append(errs, errors.New("cache.metadata_gc_interval must be greater than zero"))
+	}
+	if cfg.Cache.MetadataMaxAge <= 0 {
+		errs = append(errs, errors.New("cache.metadata_max_age must be greater than zero"))
+	}
+	if cfg.Cache.MetadataGCBatchSize <= 0 {
+		errs = append(errs, errors.New("cache.metadata_gc_batch_size must be greater than zero"))
+	}
+	if cfg.Cache.SQLiteCheckpointInterval <= 0 {
+		errs = append(errs, errors.New("cache.sqlite_checkpoint_interval must be greater than zero"))
 	}
 	if cfg.HTTP.ReadHeaderTimeout <= 0 {
 		errs = append(errs, errors.New("http.read_header_timeout must be greater than zero"))
