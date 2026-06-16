@@ -177,6 +177,41 @@ func TestOpenPageTreatsMissingFileAsMissAndRemovesStaleRow(t *testing.T) {
 	}
 }
 
+func TestDeleteObjectRemovesMetadataRowsAndPageFiles(t *testing.T) {
+	ctx := context.Background()
+	c := openTestCache(t)
+	obj := putTestObject(t, c, "bucket", "delete.bin")
+	page, err := c.StorePage(ctx, PageWrite{
+		ObjectID: obj.ID,
+		Index:    0,
+		ETag:     obj.ETag,
+		Data:     []byte("cached page"),
+	})
+	if err != nil {
+		t.Fatalf("StorePage() error = %v", err)
+	}
+
+	if err := c.DeleteObject(ctx, "bucket", "delete.bin"); err != nil {
+		t.Fatalf("DeleteObject() error = %v", err)
+	}
+
+	if _, ok, err := c.GetObject(ctx, "bucket", "delete.bin"); err != nil {
+		t.Fatalf("GetObject() error = %v", err)
+	} else if ok {
+		t.Fatal("GetObject() ok = true, want false")
+	}
+	pages, err := c.ListPages(ctx, obj.ID)
+	if err != nil {
+		t.Fatalf("ListPages() error = %v", err)
+	}
+	if len(pages) != 0 {
+		t.Fatalf("pages len = %d, want 0", len(pages))
+	}
+	if _, err := os.Stat(filepath.Join(c.cacheRoot, page.Path)); !os.IsNotExist(err) {
+		t.Fatalf("page file stat error = %v, want not exist", err)
+	}
+}
+
 func TestOpenUsesSeparateCacheAndMetaPaths(t *testing.T) {
 	ctx := context.Background()
 	cachePath := filepath.Join(t.TempDir(), "cache-bytes")

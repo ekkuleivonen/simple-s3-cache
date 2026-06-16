@@ -3,15 +3,20 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"path/filepath"
+	"strconv"
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
+
+	"github.com/ekkuleivonen/simple-s3-cache/internal/cache"
 )
 
 func TestProxyForwardsPassThroughRequests(t *testing.T) {
@@ -152,7 +157,7 @@ func TestProxyReSignsInsteadOfForwardingClientSigV4Headers(t *testing.T) {
 	defer upstream.Close()
 
 	p := testProxy(t, upstream.URL)
-	req := httptest.NewRequest(http.MethodGet, "/bucket/key", nil)
+	req := httptest.NewRequest(http.MethodGet, "/bucket/key?tagging=", nil)
 	req.Header.Set("Authorization", "client signature")
 	req.Header.Set("X-Amz-Date", "20000101T000000Z")
 	req.Header.Set("X-Amz-Security-Token", "client-token")
@@ -178,13 +183,310 @@ func TestProxyReSignsInsteadOfForwardingClientSigV4Headers(t *testing.T) {
 	}
 }
 
+func TestProxyCachesHeadMetadata(t *testing.T) {
+	var upstreamRequests int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamRequests++
+		if r.Method != http.MethodHead {
+			t.Fatalf("upstream method = %q, want HEAD", r.Method)
+		}
+		w.Header().Set("Content-Length", "11")
+		w.Header().Set("Content-Type", "text/plain")
+		w.Header().Set("ETag", `"etag-head"`)
+		w.Header().Set("X-Amz-Meta-Test", "metadata")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	p := testProxyWithPageSize(t, upstream.URL, 4)
+	for i := 0; i < 2; i++ {
+		req := httptest.NewRequest(http.MethodHead, "/bucket/object.txt", nil)
+		rec := httptest.NewRecorder()
+
+		p.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("HEAD %d status = %d, want 200", i+1, rec.Code)
+		}
+		if got := rec.Header().Get("Content-Type"); got != "text/plain" {
+			t.Fatalf("HEAD %d Content-Type = %q, want text/plain", i+1, got)
+		}
+		if got := rec.Header().Get("ETag"); got != `"etag-head"` {
+			t.Fatalf("HEAD %d ETag = %q, want etag", i+1, got)
+		}
+		if got := rec.Header().Get("X-Amz-Meta-Test"); got != "metadata" {
+			t.Fatalf("HEAD %d metadata = %q, want metadata", i+1, got)
+		}
+	}
+
+	if upstreamRequests != 1 {
+		t.Fatalf("upstream requests = %d, want 1", upstreamRequests)
+	}
+}
+
+func TestProxyCachesSinglePageRangeRead(t *testing.T) {
+	body := []byte("abcdefghijkl")
+	var upstreamRequests []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamRequests = append(upstreamRequests, r.Method+" "+r.Header.Get("Range"))
+		writeObjectResponse(t, w, r, body, `"etag-range"`)
+	}))
+	defer upstream.Close()
+
+	p := testProxyWithPageSize(t, upstream.URL, 4)
+	for i := 0; i < 2; i++ {
+		req := httptest.NewRequest(http.MethodGet, "/bucket/object.bin", nil)
+		req.Header.Set("Range", "bytes=1-3")
+		rec := httptest.NewRecorder()
+
+		p.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusPartialContent {
+			t.Fatalf("GET range %d status = %d, want 206; body=%q", i+1, rec.Code, rec.Body.String())
+		}
+		if got := rec.Body.Bytes(); !bytes.Equal(got, body[1:4]) {
+			t.Fatalf("GET range %d body = %q, want %q", i+1, got, body[1:4])
+		}
+		if got := rec.Header().Get("Content-Range"); got != "bytes 1-3/12" {
+			t.Fatalf("GET range %d Content-Range = %q", i+1, got)
+		}
+	}
+
+	wantRequests := []string{"HEAD ", "GET bytes=0-3"}
+	if !equalStringSlices(upstreamRequests, wantRequests) {
+		t.Fatalf("upstream requests = %q, want %q", upstreamRequests, wantRequests)
+	}
+}
+
+func TestProxyCachesMultiPageRangeRead(t *testing.T) {
+	body := []byte("abcdefghijkl")
+	var upstreamRequests []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamRequests = append(upstreamRequests, r.Method+" "+r.Header.Get("Range"))
+		writeObjectResponse(t, w, r, body, `"etag-multi-range"`)
+	}))
+	defer upstream.Close()
+
+	p := testProxyWithPageSize(t, upstream.URL, 4)
+	for i := 0; i < 2; i++ {
+		req := httptest.NewRequest(http.MethodGet, "/bucket/object.bin", nil)
+		req.Header.Set("Range", "bytes=2-7")
+		rec := httptest.NewRecorder()
+
+		p.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusPartialContent {
+			t.Fatalf("GET multi-page range %d status = %d, want 206; body=%q", i+1, rec.Code, rec.Body.String())
+		}
+		if got := rec.Body.Bytes(); !bytes.Equal(got, body[2:8]) {
+			t.Fatalf("GET multi-page range %d body = %q, want %q", i+1, got, body[2:8])
+		}
+		if got := rec.Header().Get("Content-Range"); got != "bytes 2-7/12" {
+			t.Fatalf("GET multi-page range %d Content-Range = %q", i+1, got)
+		}
+	}
+
+	wantRequests := []string{"HEAD ", "GET bytes=0-3", "GET bytes=4-7"}
+	if !equalStringSlices(upstreamRequests, wantRequests) {
+		t.Fatalf("upstream requests = %q, want %q", upstreamRequests, wantRequests)
+	}
+}
+
+func TestProxyStreamsMultiPageFullGetThroughCache(t *testing.T) {
+	body := []byte("abcdefghijkl")
+	var upstreamRequests []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamRequests = append(upstreamRequests, r.Method+" "+r.Header.Get("Range"))
+		writeObjectResponse(t, w, r, body, `"etag-full"`)
+	}))
+	defer upstream.Close()
+
+	p := testProxyWithPageSize(t, upstream.URL, 5)
+	for i := 0; i < 2; i++ {
+		req := httptest.NewRequest(http.MethodGet, "/bucket/full.bin", nil)
+		rec := httptest.NewRecorder()
+
+		p.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("full GET %d status = %d, want 200; body=%q", i+1, rec.Code, rec.Body.String())
+		}
+		if got := rec.Body.Bytes(); !bytes.Equal(got, body) {
+			t.Fatalf("full GET %d body = %q, want %q", i+1, got, body)
+		}
+		if got := rec.Header().Get("Content-Length"); got != "12" {
+			t.Fatalf("full GET %d Content-Length = %q, want 12", i+1, got)
+		}
+	}
+
+	wantRequests := []string{"HEAD ", "GET bytes=0-4", "GET bytes=5-9", "GET bytes=10-11"}
+	if !equalStringSlices(upstreamRequests, wantRequests) {
+		t.Fatalf("upstream requests = %q, want %q", upstreamRequests, wantRequests)
+	}
+}
+
+func TestProxyDoesNotCommitHeadersWhenFirstPageFetchFails(t *testing.T) {
+	var upstreamRequests []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamRequests = append(upstreamRequests, r.Method+" "+r.Header.Get("Range"))
+		w.Header().Set("Content-Length", "12")
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("ETag", `"etag-fail"`)
+		if r.Method == http.MethodHead {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte("upstream unavailable"))
+	}))
+	defer upstream.Close()
+
+	p := testProxyWithPageSize(t, upstream.URL, 4)
+	req := httptest.NewRequest(http.MethodGet, "/bucket/fail.bin", nil)
+	rec := httptest.NewRecorder()
+
+	p.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502; body=%q", rec.Code, rec.Body.String())
+	}
+	if rec.Body.Len() == 12 {
+		t.Fatalf("body length = %d, expected error response rather than promised object body", rec.Body.Len())
+	}
+	wantRequests := []string{"HEAD ", "GET bytes=0-3"}
+	if !equalStringSlices(upstreamRequests, wantRequests) {
+		t.Fatalf("upstream requests = %q, want %q", upstreamRequests, wantRequests)
+	}
+}
+
+func TestProxyInvalidatesAndRefetchesMetadataOnPreconditionFailure(t *testing.T) {
+	ctx := context.Background()
+	body := []byte("new-version")
+	var upstreamRequests []string
+
+	p := testProxyWithPageSize(t, "", 4)
+	_, err := p.cache.PutObject(ctx, cache.ObjectMetadata{
+		Bucket:   "bucket",
+		Key:      "changed.bin",
+		ETag:     `"old-etag"`,
+		Size:     int64(len(body)),
+		PageSize: 4,
+		Headers: http.Header{
+			"Content-Length": []string{"11"},
+			"Content-Type":   []string{"application/octet-stream"},
+			"ETag":           []string{`"old-etag"`},
+		},
+	})
+	if err != nil {
+		t.Fatalf("PutObject(stale) error = %v", err)
+	}
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamRequests = append(upstreamRequests, r.Method+" "+r.Header.Get("Range")+" "+r.Header.Get("If-Match"))
+		if r.Method == http.MethodHead {
+			w.Header().Set("Content-Length", "11")
+			w.Header().Set("Content-Type", "application/octet-stream")
+			w.Header().Set("ETag", `"new-etag"`)
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if r.Header.Get("If-Match") == `"old-etag"` {
+			w.WriteHeader(http.StatusPreconditionFailed)
+			return
+		}
+		writeObjectResponse(t, w, r, body, `"new-etag"`)
+	}))
+	defer upstream.Close()
+
+	parsed, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("parse upstream URL: %v", err)
+	}
+	p.upstreamEndpoint = parsed
+
+	req := httptest.NewRequest(http.MethodGet, "/bucket/changed.bin", nil)
+	req.Header.Set("Range", "bytes=4-7")
+	rec := httptest.NewRecorder()
+
+	p.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusPartialContent {
+		t.Fatalf("status = %d, want 206; body=%q", rec.Code, rec.Body.String())
+	}
+	if got := rec.Body.Bytes(); !bytes.Equal(got, body[4:8]) {
+		t.Fatalf("body = %q, want %q", got, body[4:8])
+	}
+	wantRequests := []string{
+		"GET bytes=4-7 \"old-etag\"",
+		"HEAD  ",
+		"GET bytes=4-7 \"new-etag\"",
+	}
+	if !equalStringSlices(upstreamRequests, wantRequests) {
+		t.Fatalf("upstream requests = %q, want %q", upstreamRequests, wantRequests)
+	}
+}
+
+func TestProxyFallsBackToPassThroughWhenMetadataStoreFails(t *testing.T) {
+	body := []byte("metadata store failure still reads")
+	var upstreamRequests []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamRequests = append(upstreamRequests, r.Method+" "+r.Header.Get("Range"))
+		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+		w.Header().Set("Content-Type", "text/plain")
+		w.Header().Set("ETag", `"etag-pass-through"`)
+		if r.Method == http.MethodHead {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(body)
+	}))
+	defer upstream.Close()
+
+	p := testProxyWithPageSize(t, upstream.URL, 4)
+	p.cache = metadataStoreFailingCache{cacheStore: p.cache}
+	req := httptest.NewRequest(http.MethodGet, "/bucket/object.txt", nil)
+	rec := httptest.NewRecorder()
+
+	p.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%q", rec.Code, rec.Body.String())
+	}
+	if got := rec.Body.Bytes(); !bytes.Equal(got, body) {
+		t.Fatalf("body = %q, want %q", got, body)
+	}
+	wantRequests := []string{"HEAD ", "GET "}
+	if !equalStringSlices(upstreamRequests, wantRequests) {
+		t.Fatalf("upstream requests = %q, want %q", upstreamRequests, wantRequests)
+	}
+}
+
 func testProxy(t *testing.T, endpoint string) *Proxy {
+	t.Helper()
+	return testProxyWithPageSize(t, endpoint, 4<<20)
+}
+
+func testProxyWithPageSize(t *testing.T, endpoint string, pageSize int64) *Proxy {
 	t.Helper()
 
 	parsed, err := url.Parse(endpoint)
 	if err != nil {
 		t.Fatalf("parse endpoint: %v", err)
 	}
+	root := t.TempDir()
+	cacheStore, err := cache.Open(context.Background(), cache.Options{
+		CachePath: filepath.Join(root, "cache-bytes"),
+		MetaPath:  filepath.Join(root, "cache-meta"),
+	})
+	if err != nil {
+		t.Fatalf("open cache: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cacheStore.Close(); err != nil {
+			t.Fatalf("close cache: %v", err)
+		}
+	})
 
 	return &Proxy{
 		upstreamEndpoint: parsed,
@@ -196,14 +498,24 @@ func testProxy(t *testing.T, endpoint string) *Proxy {
 				Source:          "test",
 			}, nil
 		}),
-		signer: v4.NewSigner(),
-		client: upstreamClient(endpoint),
-		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		signer:   v4.NewSigner(),
+		client:   upstreamClient(endpoint),
+		logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+		cache:    cacheStore,
+		pageSize: pageSize,
 	}
 }
 
 func upstreamClient(_ string) *http.Client {
 	return http.DefaultClient
+}
+
+type metadataStoreFailingCache struct {
+	cacheStore
+}
+
+func (c metadataStoreFailingCache) PutObject(context.Context, cache.ObjectMetadata) (cache.Object, error) {
+	return cache.Object{}, errors.New("metadata store failed")
 }
 
 func equalStringSlices(a, b []string) bool {
@@ -216,4 +528,58 @@ func equalStringSlices(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+func writeObjectResponse(t *testing.T, w http.ResponseWriter, r *http.Request, body []byte, etag string) {
+	t.Helper()
+
+	w.Header().Set("Accept-Ranges", "bytes")
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("ETag", etag)
+	w.Header().Set("X-Amz-Meta-Test", "cache")
+
+	if ifMatch := r.Header.Get("If-Match"); ifMatch != "" && ifMatch != etag {
+		w.WriteHeader(http.StatusPreconditionFailed)
+		return
+	}
+
+	if r.Method == http.MethodHead {
+		w.Header().Set("Content-Length", "12")
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	switch r.Header.Get("Range") {
+	case "":
+		w.Header().Set("Content-Length", "12")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(body)
+	case "bytes=0-3":
+		w.Header().Set("Content-Length", "4")
+		w.Header().Set("Content-Range", "bytes 0-3/12")
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(body[0:4])
+	case "bytes=0-4":
+		w.Header().Set("Content-Length", "5")
+		w.Header().Set("Content-Range", "bytes 0-4/12")
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(body[0:5])
+	case "bytes=4-7":
+		w.Header().Set("Content-Length", "4")
+		w.Header().Set("Content-Range", "bytes 4-7/12")
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(body[4:8])
+	case "bytes=5-9":
+		w.Header().Set("Content-Length", "5")
+		w.Header().Set("Content-Range", "bytes 5-9/12")
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(body[5:10])
+	case "bytes=10-11":
+		w.Header().Set("Content-Length", "2")
+		w.Header().Set("Content-Range", "bytes 10-11/12")
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(body[10:12])
+	default:
+		t.Fatalf("unexpected upstream range %q", r.Header.Get("Range"))
+	}
 }

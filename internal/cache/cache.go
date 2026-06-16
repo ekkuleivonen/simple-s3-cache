@@ -174,6 +174,34 @@ WHERE id = ?
 	return obj, true, nil
 }
 
+func (c *Cache) DeleteObject(ctx context.Context, bucket, key string) error {
+	obj, ok, err := c.GetObject(ctx, bucket, key)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return nil
+	}
+
+	pages, err := c.ListPages(ctx, obj.ID)
+	if err != nil {
+		return err
+	}
+
+	_, err = c.db.ExecContext(ctx, `DELETE FROM objects WHERE id = ?`, obj.ID)
+	if err != nil {
+		return fmt.Errorf("delete object: %w", err)
+	}
+
+	for _, page := range pages {
+		if err := os.Remove(filepath.Join(c.cacheRoot, page.Path)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("delete page file: %w", err)
+		}
+	}
+
+	return nil
+}
+
 func (c *Cache) PutPage(ctx context.Context, page Page) error {
 	if err := validatePage(page); err != nil {
 		return err

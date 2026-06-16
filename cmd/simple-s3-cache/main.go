@@ -37,6 +37,11 @@ func run() int {
 		logger.Error("create proxy", slog.String("error", err.Error()))
 		return 1
 	}
+	defer func() {
+		if err := proxyHandler.Close(); err != nil {
+			logger.Error("close proxy", slog.String("error", err.Error()))
+		}
+	}()
 
 	srv := server.New(cfg, logger, proxyHandler)
 	errCh := make(chan error, 1)
