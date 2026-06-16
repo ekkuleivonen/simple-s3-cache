@@ -67,37 +67,34 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		Header:   r.Header,
 	})
 
-	if !isReadOnlySupported(classification.Disposition) {
-		http.Error(w, "request is not supported by read-only pass-through proxy", http.StatusNotImplemented)
-		return
-	}
-
 	start := time.Now()
 	status, bytesWritten, err := p.forward(w, r)
 	attrs := []slog.Attr{
 		slog.String("bucket", target.Bucket),
 		slog.String("key", target.Key),
 		slog.String("classification", string(classification.Disposition)),
+		slog.String("classification_reason", classification.Reason),
 		slog.Int("upstream_status", status),
 		slog.Int64("upstream_duration_ms", time.Since(start).Milliseconds()),
 		slog.Int64("upstream_bytes", bytesWritten),
 	}
 	if err != nil {
 		attrs = append(attrs, slog.String("error", err.Error()))
-		p.logger.LogAttrs(r.Context(), slog.LevelError, "proxy read failed", attrs...)
+		p.logger.LogAttrs(r.Context(), slog.LevelError, "proxy request failed", attrs...)
 		return
 	}
 
-	p.logger.LogAttrs(r.Context(), slog.LevelInfo, "proxy read", attrs...)
+	p.logger.LogAttrs(r.Context(), slog.LevelInfo, "proxy request", attrs...)
 }
 
 func (p *Proxy) forward(w http.ResponseWriter, r *http.Request) (int, int64, error) {
 	upstreamURL := p.upstreamURL(r)
-	req, err := http.NewRequestWithContext(r.Context(), r.Method, upstreamURL.String(), nil)
+	req, err := http.NewRequestWithContext(r.Context(), r.Method, upstreamURL.String(), r.Body)
 	if err != nil {
 		http.Error(w, "build upstream request", http.StatusInternalServerError)
 		return 0, 0, err
 	}
+	req.ContentLength = r.ContentLength
 	copyRequestHeaders(req.Header, r.Header)
 	req.Header.Set("X-Amz-Content-Sha256", unsignedPayload)
 
@@ -141,23 +138,23 @@ func (p *Proxy) upstreamURL(r *http.Request) url.URL {
 	return upstreamURL
 }
 
-func isReadOnlySupported(disposition s3request.Disposition) bool {
-	switch disposition {
-	case s3request.CacheableFullObject, s3request.CacheableHeadObject, s3request.CacheableRangeObject:
-		return true
-	default:
-		return false
-	}
-}
-
 func copyRequestHeaders(dst, src http.Header) {
 	for key, values := range src {
-		if isHopByHopHeader(key) || strings.EqualFold(key, "Authorization") {
+		if isHopByHopHeader(key) || isClientSigningHeader(key) {
 			continue
 		}
 		for _, value := range values {
 			dst.Add(key, value)
 		}
+	}
+}
+
+func isClientSigningHeader(key string) bool {
+	switch strings.ToLower(key) {
+	case "authorization", "x-amz-date", "x-amz-security-token", "x-amz-content-sha256":
+		return true
+	default:
+		return false
 	}
 }
 
