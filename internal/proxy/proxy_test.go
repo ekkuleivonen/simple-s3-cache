@@ -17,6 +17,7 @@ import (
 	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 
 	"github.com/ekkuleivonen/simple-s3-cache/internal/cache"
+	"github.com/ekkuleivonen/simple-s3-cache/internal/s3request"
 )
 
 func TestProxyForwardsPassThroughRequests(t *testing.T) {
@@ -426,6 +427,277 @@ func TestProxyInvalidatesAndRefetchesMetadataOnPreconditionFailure(t *testing.T)
 	}
 }
 
+func TestProxyInvalidatesCachedObjectAfterSuccessfulWrites(t *testing.T) {
+	tests := []struct {
+		name    string
+		method  string
+		path    string
+		query   string
+		headers http.Header
+		status  int
+	}{
+		{
+			name:   "put object",
+			method: http.MethodPut,
+			path:   "/bucket/write.bin",
+			status: http.StatusOK,
+		},
+		{
+			name:   "delete object",
+			method: http.MethodDelete,
+			path:   "/bucket/write.bin",
+			status: http.StatusNoContent,
+		},
+		{
+			name:   "copy object destination",
+			method: http.MethodPut,
+			path:   "/bucket/write.bin",
+			headers: http.Header{
+				"X-Amz-Copy-Source": []string{"/bucket/source.bin"},
+			},
+			status: http.StatusOK,
+		},
+		{
+			name:   "multipart complete",
+			method: http.MethodPost,
+			path:   "/bucket/write.bin",
+			query:  "uploadId=upload-123",
+			status: http.StatusOK,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			body := []byte("abcdefghijkl")
+			var upstreamRequests []string
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				upstreamRequests = append(upstreamRequests, r.Method+" "+r.Header.Get("Range")+" "+r.URL.RawQuery)
+				if r.Method == tt.method {
+					w.WriteHeader(tt.status)
+					return
+				}
+				writeObjectResponse(t, w, r, body, `"etag-write"`)
+			}))
+			defer upstream.Close()
+
+			p := testProxyWithPageSize(t, upstream.URL, 4)
+			cachedReq := httptest.NewRequest(http.MethodGet, "/bucket/write.bin", nil)
+			cachedReq.Header.Set("Range", "bytes=0-3")
+			cachedRec := httptest.NewRecorder()
+			p.ServeHTTP(cachedRec, cachedReq)
+			if cachedRec.Code != http.StatusPartialContent {
+				t.Fatalf("warm cache status = %d, want 206; body=%q", cachedRec.Code, cachedRec.Body.String())
+			}
+			if _, ok, err := p.cache.GetObject(context.Background(), "bucket", "write.bin"); err != nil {
+				t.Fatalf("GetObject(warmed) error = %v", err)
+			} else if !ok {
+				t.Fatal("GetObject(warmed) ok = false, want true")
+			}
+
+			writeURL := tt.path
+			if tt.query != "" {
+				writeURL += "?" + tt.query
+			}
+			writeReq := httptest.NewRequest(tt.method, writeURL, bytes.NewReader([]byte("new body")))
+			for key, values := range tt.headers {
+				writeReq.Header[key] = append([]string(nil), values...)
+			}
+			writeRec := httptest.NewRecorder()
+			p.ServeHTTP(writeRec, writeReq)
+
+			if writeRec.Code != tt.status {
+				t.Fatalf("write status = %d, want %d; body=%q", writeRec.Code, tt.status, writeRec.Body.String())
+			}
+			if _, ok, err := p.cache.GetObject(context.Background(), "bucket", "write.bin"); err != nil {
+				t.Fatalf("GetObject(after write) error = %v", err)
+			} else if ok {
+				t.Fatal("GetObject(after write) ok = true, want false")
+			}
+			if len(upstreamRequests) == 0 || upstreamRequests[len(upstreamRequests)-1] != tt.method+"  "+tt.query {
+				t.Fatalf("last upstream request = %q, want %q", upstreamRequests, tt.method+"  "+tt.query)
+			}
+		})
+	}
+}
+
+func TestWriteInvalidationClassification(t *testing.T) {
+	tests := []struct {
+		name    string
+		method  string
+		rawURL  string
+		headers http.Header
+		want    bool
+	}{
+		{
+			name:   "plain put invalidates",
+			method: http.MethodPut,
+			rawURL: "/bucket/object.bin",
+			want:   true,
+		},
+		{
+			name:   "upload part does not invalidate before completion",
+			method: http.MethodPut,
+			rawURL: "/bucket/object.bin?partNumber=1&uploadId=upload-123",
+			want:   false,
+		},
+		{
+			name:   "upload part copy does not invalidate destination before completion",
+			method: http.MethodPut,
+			rawURL: "/bucket/object.bin?partNumber=1&uploadId=upload-123",
+			headers: http.Header{
+				"X-Amz-Copy-Source": []string{"/bucket/source.bin"},
+			},
+			want: false,
+		},
+		{
+			name:   "copy object invalidates destination",
+			method: http.MethodPut,
+			rawURL: "/bucket/object.bin",
+			headers: http.Header{
+				"X-Amz-Copy-Source": []string{"/bucket/source.bin"},
+			},
+			want: true,
+		},
+		{
+			name:   "multipart complete invalidates destination",
+			method: http.MethodPost,
+			rawURL: "/bucket/object.bin?uploadId=upload-123",
+			want:   true,
+		},
+		{
+			name:   "bucket operation does not invalidate",
+			method: http.MethodPut,
+			rawURL: "/bucket",
+			want:   false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(tt.method, tt.rawURL, nil)
+			for key, values := range tt.headers {
+				req.Header[key] = append([]string(nil), values...)
+			}
+			target, ok := s3request.ParsePathStyle(req.URL.EscapedPath())
+			if !ok {
+				t.Fatalf("ParsePathStyle(%q) ok = false", req.URL.EscapedPath())
+			}
+
+			if got := shouldInvalidateAfterWrite(req, target); got != tt.want {
+				t.Fatalf("shouldInvalidateAfterWrite() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestProxyCopyInvalidatesDestinationOnly(t *testing.T) {
+	body := []byte("abcdefghijkl")
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut && r.Header.Get("X-Amz-Copy-Source") != "" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		writeObjectResponse(t, w, r, body, `"etag-copy"`)
+	}))
+	defer upstream.Close()
+
+	p := testProxyWithPageSize(t, upstream.URL, 4)
+	for _, path := range []string{"/bucket/source.bin", "/bucket/destination.bin"} {
+		req := httptest.NewRequest(http.MethodHead, path, nil)
+		rec := httptest.NewRecorder()
+		p.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("warm %s status = %d, want 200", path, rec.Code)
+		}
+	}
+
+	copyReq := httptest.NewRequest(http.MethodPut, "/bucket/destination.bin", nil)
+	copyReq.Header.Set("X-Amz-Copy-Source", "/bucket/source.bin")
+	copyRec := httptest.NewRecorder()
+	p.ServeHTTP(copyRec, copyReq)
+	if copyRec.Code != http.StatusOK {
+		t.Fatalf("copy status = %d, want 200", copyRec.Code)
+	}
+
+	if _, ok, err := p.cache.GetObject(context.Background(), "bucket", "source.bin"); err != nil {
+		t.Fatalf("GetObject(source) error = %v", err)
+	} else if !ok {
+		t.Fatal("source cache entry was invalidated, want it preserved")
+	}
+	if _, ok, err := p.cache.GetObject(context.Background(), "bucket", "destination.bin"); err != nil {
+		t.Fatalf("GetObject(destination) error = %v", err)
+	} else if ok {
+		t.Fatal("destination cache entry was preserved, want invalidated")
+	}
+}
+
+func TestProxyDoesNotFailSuccessfulWriteWhenInvalidationFails(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("write ok"))
+	}))
+	defer upstream.Close()
+
+	p := testProxy(t, upstream.URL)
+	p.cache = invalidationFailingCache{cacheStore: p.cache}
+	req := httptest.NewRequest(http.MethodPut, "/bucket/object.bin", bytes.NewReader([]byte("new body")))
+	rec := httptest.NewRecorder()
+
+	status, bytesWritten, err := p.handle(rec, req, s3request.Target{Bucket: "bucket", Key: "object.bin"}, s3request.Classification{
+		Disposition: s3request.PassThrough,
+	})
+	if err != nil {
+		t.Fatalf("handle() error = %v, want nil because upstream write already succeeded", err)
+	}
+	if status != http.StatusOK || rec.Code != http.StatusOK {
+		t.Fatalf("status = %d recorder = %d, want 200", status, rec.Code)
+	}
+	if bytesWritten == 0 {
+		t.Fatal("bytesWritten = 0, want upstream response bytes copied")
+	}
+}
+
+func TestProxyDoesNotInvalidateCachedObjectAfterFailedWrite(t *testing.T) {
+	body := []byte("abcdefghijkl")
+	var headRequests int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		if r.Method == http.MethodHead {
+			headRequests++
+		}
+		writeObjectResponse(t, w, r, body, `"etag-failed-write"`)
+	}))
+	defer upstream.Close()
+
+	p := testProxyWithPageSize(t, upstream.URL, 4)
+	warmReq := httptest.NewRequest(http.MethodHead, "/bucket/failed-write.bin", nil)
+	warmRec := httptest.NewRecorder()
+	p.ServeHTTP(warmRec, warmReq)
+	if warmRec.Code != http.StatusOK {
+		t.Fatalf("warm HEAD status = %d, want 200", warmRec.Code)
+	}
+
+	writeReq := httptest.NewRequest(http.MethodPut, "/bucket/failed-write.bin", bytes.NewReader([]byte("new body")))
+	writeRec := httptest.NewRecorder()
+	p.ServeHTTP(writeRec, writeReq)
+	if writeRec.Code != http.StatusInternalServerError {
+		t.Fatalf("write status = %d, want 500", writeRec.Code)
+	}
+
+	cachedReq := httptest.NewRequest(http.MethodHead, "/bucket/failed-write.bin", nil)
+	cachedRec := httptest.NewRecorder()
+	p.ServeHTTP(cachedRec, cachedReq)
+	if cachedRec.Code != http.StatusOK {
+		t.Fatalf("cached HEAD status = %d, want 200", cachedRec.Code)
+	}
+	if headRequests != 1 {
+		t.Fatalf("upstream HEAD requests = %d, want 1; failed write should not invalidate metadata", headRequests)
+	}
+}
+
 func TestProxyFallsBackToPassThroughWhenMetadataStoreFails(t *testing.T) {
 	body := []byte("metadata store failure still reads")
 	var upstreamRequests []string
@@ -516,6 +788,14 @@ type metadataStoreFailingCache struct {
 
 func (c metadataStoreFailingCache) PutObject(context.Context, cache.ObjectMetadata) (cache.Object, error) {
 	return cache.Object{}, errors.New("metadata store failed")
+}
+
+type invalidationFailingCache struct {
+	cacheStore
+}
+
+func (c invalidationFailingCache) DeleteObject(context.Context, string, string) error {
+	return errors.New("invalidation failed")
 }
 
 func equalStringSlices(a, b []string) bool {

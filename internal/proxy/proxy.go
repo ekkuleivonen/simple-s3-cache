@@ -139,7 +139,17 @@ func (p *Proxy) handle(w http.ResponseWriter, r *http.Request, target s3request.
 	case s3request.CacheableFullObject:
 		return p.serveCachedFullObject(w, r, target)
 	default:
-		return p.forward(w, r)
+		status, bytesWritten, err := p.forward(w, r)
+		if err == nil && isSuccessfulStatus(status) && shouldInvalidateAfterWrite(r, target) {
+			if deleteErr := p.cache.DeleteObject(r.Context(), target.Bucket, target.Key); deleteErr != nil {
+				p.logger.WarnContext(r.Context(), "cache invalidation failed after successful write",
+					slog.String("bucket", target.Bucket),
+					slog.String("key", target.Key),
+					slog.String("error", deleteErr.Error()),
+				)
+			}
+		}
+		return status, bytesWritten, err
 	}
 }
 
@@ -179,6 +189,34 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request) (int, int64, err
 	}
 
 	return resp.StatusCode, bytesWritten, nil
+}
+
+func shouldInvalidateAfterWrite(r *http.Request, target s3request.Target) bool {
+	if !target.IsObject() {
+		return false
+	}
+
+	query := r.URL.Query()
+	switch r.Method {
+	case http.MethodPut:
+		if query.Get("uploadId") != "" && query.Get("partNumber") != "" {
+			return false
+		}
+		if r.Header.Get("X-Amz-Copy-Source") != "" {
+			return true
+		}
+		return query.Get("uploadId") == "" && query.Get("partNumber") == ""
+	case http.MethodDelete:
+		return true
+	case http.MethodPost:
+		return query.Get("uploadId") != ""
+	default:
+		return false
+	}
+}
+
+func isSuccessfulStatus(status int) bool {
+	return status >= http.StatusOK && status < http.StatusMultipleChoices
 }
 
 func (p *Proxy) serveCachedHead(w http.ResponseWriter, r *http.Request, target s3request.Target) (int, int64, error) {
@@ -437,10 +475,11 @@ func (p *Proxy) pageData(ctx context.Context, r *http.Request, target s3request.
 	}
 
 	if _, err := p.cache.StorePage(ctx, cache.PageWrite{
-		ObjectID: obj.ID,
-		Index:    index,
-		ETag:     obj.ETag,
-		Data:     data,
+		ObjectID:      obj.ID,
+		Index:         index,
+		ETag:          obj.ETag,
+		ExpectedEpoch: obj.Epoch,
+		Data:          data,
 	}); err != nil {
 		p.logger.WarnContext(ctx, "cache page store failed",
 			slog.String("bucket", target.Bucket),

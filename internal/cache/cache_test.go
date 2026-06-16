@@ -212,6 +212,53 @@ func TestDeleteObjectRemovesMetadataRowsAndPageFiles(t *testing.T) {
 	}
 }
 
+func TestStorePageRejectsStaleObjectEpochAfterInvalidation(t *testing.T) {
+	ctx := context.Background()
+	c := openTestCache(t)
+
+	oldObj := putTestObject(t, c, "bucket", "race.bin")
+	if oldObj.Epoch != 0 {
+		t.Fatalf("initial epoch = %d, want 0", oldObj.Epoch)
+	}
+	if err := c.DeleteObject(ctx, "bucket", "race.bin"); err != nil {
+		t.Fatalf("DeleteObject() error = %v", err)
+	}
+
+	newObj, err := c.PutObject(ctx, ObjectMetadata{
+		Bucket:   "bucket",
+		Key:      "race.bin",
+		ETag:     `"etag-2"`,
+		Size:     1024,
+		PageSize: 128,
+		Headers:  http.Header{"Content-Type": []string{"application/octet-stream"}},
+	})
+	if err != nil {
+		t.Fatalf("PutObject(new) error = %v", err)
+	}
+	if newObj.Epoch <= oldObj.Epoch {
+		t.Fatalf("new epoch = %d, want greater than old epoch %d", newObj.Epoch, oldObj.Epoch)
+	}
+
+	if _, err := c.StorePage(ctx, PageWrite{
+		ObjectID:      oldObj.ID,
+		Index:         0,
+		ETag:          oldObj.ETag,
+		ExpectedEpoch: oldObj.Epoch,
+		Data:          []byte("stale page"),
+	}); err == nil {
+		t.Fatal("StorePage(stale) error = nil, want stale epoch error")
+	}
+
+	body, ok, err := c.OpenPage(ctx, newObj.ID, 0)
+	if err != nil {
+		t.Fatalf("OpenPage() error = %v", err)
+	}
+	if ok {
+		body.Close()
+		t.Fatal("OpenPage() ok = true, want false")
+	}
+}
+
 func TestOpenUsesSeparateCacheAndMetaPaths(t *testing.T) {
 	ctx := context.Background()
 	cachePath := filepath.Join(t.TempDir(), "cache-bytes")

@@ -57,10 +57,11 @@ type Page struct {
 }
 
 type PageWrite struct {
-	ObjectID string
-	Index    int64
-	ETag     string
-	Data     []byte
+	ObjectID      string
+	Index         int64
+	ETag          string
+	ExpectedEpoch int64
+	Data          []byte
 }
 
 func Open(ctx context.Context, opts Options) (*Cache, error) {
@@ -124,9 +125,17 @@ func (c *Cache) PutObject(ctx context.Context, meta ObjectMetadata) (Object, err
 		return Object{}, err
 	}
 
+	if err := c.ensureGeneration(ctx, id); err != nil {
+		return Object{}, err
+	}
+	epoch, err := c.generation(ctx, id)
+	if err != nil {
+		return Object{}, err
+	}
+
 	_, err = c.db.ExecContext(ctx, `
 INSERT INTO objects (id, bucket, key, etag, size, page_size, headers_json, epoch, updated_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET
 	bucket = excluded.bucket,
 	key = excluded.key,
@@ -134,8 +143,9 @@ ON CONFLICT(id) DO UPDATE SET
 	size = excluded.size,
 	page_size = excluded.page_size,
 	headers_json = excluded.headers_json,
+	epoch = excluded.epoch,
 	updated_at = excluded.updated_at
-`, id, meta.Bucket, meta.Key, meta.ETag, meta.Size, meta.PageSize, headersJSON, time.Now().UnixNano())
+`, id, meta.Bucket, meta.Key, meta.ETag, meta.Size, meta.PageSize, headersJSON, epoch, time.Now().UnixNano())
 	if err != nil {
 		return Object{}, fmt.Errorf("put object: %w", err)
 	}
@@ -188,9 +198,28 @@ func (c *Cache) DeleteObject(ctx context.Context, bucket, key string) error {
 		return err
 	}
 
-	_, err = c.db.ExecContext(ctx, `DELETE FROM objects WHERE id = ?`, obj.ID)
+	tx, err := c.db.BeginTx(ctx, nil)
 	if err != nil {
+		return fmt.Errorf("begin delete object: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+INSERT INTO object_generations (id, epoch)
+VALUES (?, 0)
+ON CONFLICT(id) DO NOTHING
+`, obj.ID); err != nil {
+		_ = tx.Rollback()
+		return fmt.Errorf("ensure object generation: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE object_generations SET epoch = epoch + 1 WHERE id = ?`, obj.ID); err != nil {
+		_ = tx.Rollback()
+		return fmt.Errorf("bump object generation: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM objects WHERE id = ?`, obj.ID); err != nil {
+		_ = tx.Rollback()
 		return fmt.Errorf("delete object: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit delete object: %w", err)
 	}
 
 	for _, page := range pages {
@@ -259,6 +288,9 @@ func (c *Cache) StorePage(ctx context.Context, write PageWrite) (Page, error) {
 	if write.ETag == "" {
 		return Page{}, errors.New("etag is required")
 	}
+	if err := c.validatePageCommit(ctx, write.ObjectID, write.ETag, write.ExpectedEpoch); err != nil {
+		return Page{}, err
+	}
 
 	relPath := c.pagePath(write.ObjectID, write.Index)
 	absPath := filepath.Join(c.cacheRoot, relPath)
@@ -302,7 +334,8 @@ func (c *Cache) StorePage(ctx context.Context, write PageWrite) (Page, error) {
 		Size:     int64(len(write.Data)),
 		Path:     relPath,
 	}
-	if err := c.PutPage(ctx, page); err != nil {
+	if err := c.putPageIfCurrent(ctx, page, write.ExpectedEpoch); err != nil {
+		_ = os.Remove(absPath)
 		return Page{}, err
 	}
 
@@ -341,6 +374,10 @@ func (c *Cache) init(ctx context.Context) error {
 		`PRAGMA journal_mode = WAL`,
 		`PRAGMA busy_timeout = 5000`,
 		`PRAGMA foreign_keys = ON`,
+		`CREATE TABLE IF NOT EXISTS object_generations (
+			id TEXT PRIMARY KEY,
+			epoch INTEGER NOT NULL
+		)`,
 		`CREATE TABLE IF NOT EXISTS objects (
 			id TEXT PRIMARY KEY,
 			bucket TEXT NOT NULL,
@@ -364,6 +401,8 @@ func (c *Cache) init(ctx context.Context) error {
 			PRIMARY KEY (object_id, page_index),
 			FOREIGN KEY (object_id) REFERENCES objects(id) ON DELETE CASCADE
 		)`,
+		`INSERT OR IGNORE INTO object_generations (id, epoch)
+			SELECT id, epoch FROM objects`,
 		`CREATE INDEX IF NOT EXISTS pages_object_idx ON pages(object_id)`,
 	}
 
@@ -371,6 +410,102 @@ func (c *Cache) init(ctx context.Context) error {
 		if _, err := c.db.ExecContext(ctx, statement); err != nil {
 			return fmt.Errorf("init cache db: %w", err)
 		}
+	}
+	return nil
+}
+
+func (c *Cache) ensureGeneration(ctx context.Context, objectID string) error {
+	_, err := c.db.ExecContext(ctx, `
+INSERT INTO object_generations (id, epoch)
+VALUES (?, 0)
+ON CONFLICT(id) DO NOTHING
+`, objectID)
+	if err != nil {
+		return fmt.Errorf("ensure object generation: %w", err)
+	}
+	return nil
+}
+
+func (c *Cache) generation(ctx context.Context, objectID string) (int64, error) {
+	row := c.db.QueryRowContext(ctx, `SELECT epoch FROM object_generations WHERE id = ?`, objectID)
+	var epoch int64
+	if err := row.Scan(&epoch); err != nil {
+		return 0, fmt.Errorf("read object generation: %w", err)
+	}
+	return epoch, nil
+}
+
+func (c *Cache) validatePageCommit(ctx context.Context, objectID, etag string, expectedEpoch int64) error {
+	var currentETag string
+	var currentEpoch int64
+	err := c.db.QueryRowContext(ctx, `
+SELECT o.etag, g.epoch
+FROM objects o
+JOIN object_generations g ON g.id = o.id
+WHERE o.id = ?
+`, objectID).Scan(&currentETag, &currentEpoch)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return errors.New("object metadata is not current")
+		}
+		return fmt.Errorf("validate page commit: %w", err)
+	}
+	if currentEpoch != expectedEpoch {
+		return fmt.Errorf("object epoch changed from %d to %d", expectedEpoch, currentEpoch)
+	}
+	if currentETag != etag {
+		return fmt.Errorf("object etag changed from %s to %s", etag, currentETag)
+	}
+	return nil
+}
+
+func (c *Cache) putPageIfCurrent(ctx context.Context, page Page, expectedEpoch int64) error {
+	if err := validatePage(page); err != nil {
+		return err
+	}
+
+	tx, err := c.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin put page: %w", err)
+	}
+	var currentETag string
+	var currentEpoch int64
+	err = tx.QueryRowContext(ctx, `
+SELECT o.etag, g.epoch
+FROM objects o
+JOIN object_generations g ON g.id = o.id
+WHERE o.id = ?
+`, page.ObjectID).Scan(&currentETag, &currentEpoch)
+	if err != nil {
+		_ = tx.Rollback()
+		if errors.Is(err, sql.ErrNoRows) {
+			return errors.New("object metadata is not current")
+		}
+		return fmt.Errorf("validate page commit: %w", err)
+	}
+	if currentEpoch != expectedEpoch {
+		_ = tx.Rollback()
+		return fmt.Errorf("object epoch changed from %d to %d", expectedEpoch, currentEpoch)
+	}
+	if currentETag != page.ETag {
+		_ = tx.Rollback()
+		return fmt.Errorf("object etag changed from %s to %s", page.ETag, currentETag)
+	}
+	_, err = tx.ExecContext(ctx, `
+INSERT INTO pages (object_id, page_index, etag, size, path, created_at, last_accessed_at)
+VALUES (?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(object_id, page_index) DO UPDATE SET
+	etag = excluded.etag,
+	size = excluded.size,
+	path = excluded.path,
+	last_accessed_at = excluded.last_accessed_at
+`, page.ObjectID, page.Index, page.ETag, page.Size, page.Path, time.Now().UnixNano(), time.Now().UnixNano())
+	if err != nil {
+		_ = tx.Rollback()
+		return fmt.Errorf("put page: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit put page: %w", err)
 	}
 	return nil
 }
