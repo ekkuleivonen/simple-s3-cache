@@ -26,3 +26,15 @@ http:
 upload:
   spool_path: /cache/spool
   max_spool_size: 10GB
+
+peer:
+  mode: single
+  forward_timeout: 10m
+  # To run in peer mode, set mode: peer, give each pod a unique local_id, and
+  # provide the same static peer list on every pod.
+  # local_id: simple-s3-cache-0
+  # peers:
+  #   - id: simple-s3-cache-0
+  #     url: http://simple-s3-cache-0.simple-s3-cache-peers:8080
+  #   - id: simple-s3-cache-1
+  #     url: http://simple-s3-cache-1.simple-s3-cache-peers:8080

@@ -72,6 +72,12 @@ upstream:
 	if cfg.Upload.MaxSpoolSize != 10<<30 {
 		t.Fatalf("Upload.MaxSpoolSize = %d, want %d", cfg.Upload.MaxSpoolSize, int64(10<<30))
 	}
+	if cfg.Peer.Mode != "single" {
+		t.Fatalf("Peer.Mode = %q, want single", cfg.Peer.Mode)
+	}
+	if cfg.Peer.ForwardTimeout != 10*time.Minute {
+		t.Fatalf("Peer.ForwardTimeout = %s, want 10m", cfg.Peer.ForwardTimeout)
+	}
 }
 
 func TestLoadParsesConfiguredValues(t *testing.T) {
@@ -101,6 +107,15 @@ http:
 upload:
   spool_path: /mnt/cache-spool
   max_spool_size: 5GB
+peer:
+  mode: peer
+  local_id: cache-0
+  forward_timeout: 2m
+  peers:
+    - id: cache-0
+      url: http://cache-0.cache-peers:8080
+    - id: cache-1
+      url: http://cache-1.cache-peers:8080
 `)
 
 	cfg, err := Load(path)
@@ -170,6 +185,18 @@ upload:
 	}
 	if cfg.Upload.MaxSpoolSize != 5<<30 {
 		t.Fatalf("Upload.MaxSpoolSize = %d, want %d", cfg.Upload.MaxSpoolSize, int64(5<<30))
+	}
+	if cfg.Peer.Mode != "peer" {
+		t.Fatalf("Peer.Mode = %q", cfg.Peer.Mode)
+	}
+	if cfg.Peer.LocalID != "cache-0" {
+		t.Fatalf("Peer.LocalID = %q", cfg.Peer.LocalID)
+	}
+	if cfg.Peer.ForwardTimeout != 2*time.Minute {
+		t.Fatalf("Peer.ForwardTimeout = %s", cfg.Peer.ForwardTimeout)
+	}
+	if len(cfg.Peer.Peers) != 2 {
+		t.Fatalf("len(Peer.Peers) = %d, want 2", len(cfg.Peer.Peers))
 	}
 }
 
@@ -356,6 +383,106 @@ cache:
 
 	if _, err := Load(path); err == nil {
 		t.Fatal("Load() error = nil, want maintenance validation error")
+	}
+}
+
+func TestLoadRejectsInvalidPeerConfig(t *testing.T) {
+	tests := []struct {
+		name      string
+		config    string
+		wantError string
+	}{
+		{
+			name: "unknown mode",
+			config: `
+upstream:
+  endpoint: http://rustfs:9000
+  access_key: test-access
+  secret_key: test-secret
+peer:
+  mode: cluster
+`,
+			wantError: "peer.mode",
+		},
+		{
+			name: "peer mode missing local id",
+			config: `
+upstream:
+  endpoint: http://rustfs:9000
+  access_key: test-access
+  secret_key: test-secret
+peer:
+  mode: peer
+  peers:
+    - id: cache-0
+      url: http://cache-0:8080
+`,
+			wantError: "peer.local_id",
+		},
+		{
+			name: "local id absent from peers",
+			config: `
+upstream:
+  endpoint: http://rustfs:9000
+  access_key: test-access
+  secret_key: test-secret
+peer:
+  mode: peer
+  local_id: cache-0
+  peers:
+    - id: cache-1
+      url: http://cache-1:8080
+`,
+			wantError: "peer.peers must include peer.local_id",
+		},
+		{
+			name: "duplicate peer id",
+			config: `
+upstream:
+  endpoint: http://rustfs:9000
+  access_key: test-access
+  secret_key: test-secret
+peer:
+  mode: peer
+  local_id: cache-0
+  peers:
+    - id: cache-0
+      url: http://cache-0:8080
+    - id: cache-0
+      url: http://cache-0-alt:8080
+`,
+			wantError: "duplicated",
+		},
+		{
+			name: "invalid peer url",
+			config: `
+upstream:
+  endpoint: http://rustfs:9000
+  access_key: test-access
+  secret_key: test-secret
+peer:
+  mode: peer
+  local_id: cache-0
+  peers:
+    - id: cache-0
+      url: ftp://cache-0:8080
+`,
+			wantError: "must use http or https",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := writeConfig(t, tt.config)
+
+			_, err := Load(path)
+			if err == nil {
+				t.Fatal("Load() error = nil, want validation error")
+			}
+			if !strings.Contains(err.Error(), tt.wantError) {
+				t.Fatalf("Load() error = %v, want containing %q", err, tt.wantError)
+			}
+		})
 	}
 }
 

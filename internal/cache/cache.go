@@ -40,6 +40,7 @@ type Options struct {
 	CachePath                string
 	MetaPath                 string
 	MaxSize                  int64
+	MaxSizeByBucket          map[string]int64
 	MetadataGCInterval       time.Duration
 	MetadataMaxAge           time.Duration
 	MetadataGCBatchSize      int
@@ -51,6 +52,7 @@ type Cache struct {
 	cacheRoot                string
 	metaRoot                 string
 	maxSize                  int64
+	maxSizeByBucket          map[string]int64
 	metadataGCInterval       time.Duration
 	metadataMaxAge           time.Duration
 	metadataGCBatchSize      int
@@ -178,6 +180,7 @@ func Open(ctx context.Context, opts Options) (*Cache, error) {
 		cacheRoot:                opts.CachePath,
 		metaRoot:                 opts.MetaPath,
 		maxSize:                  opts.MaxSize,
+		maxSizeByBucket:          copyMaxSizeByBucket(opts.MaxSizeByBucket),
 		metadataGCInterval:       opts.MetadataGCInterval,
 		metadataMaxAge:           opts.MetadataMaxAge,
 		metadataGCBatchSize:      opts.MetadataGCBatchSize,
@@ -226,6 +229,19 @@ func Open(ctx context.Context, opts Options) (*Cache, error) {
 	go c.maintenanceLoop(workerCtx)
 
 	return c, nil
+}
+
+func copyMaxSizeByBucket(input map[string]int64) map[string]int64 {
+	if len(input) == 0 {
+		return nil
+	}
+	out := make(map[string]int64, len(input))
+	for bucket, size := range input {
+		if size > 0 {
+			out[bucket] = size
+		}
+	}
+	return out
 }
 
 func (c *Cache) Close() error {
@@ -468,6 +484,13 @@ func (c *Cache) StorePage(ctx context.Context, write PageWrite) (Page, error) {
 	if err := c.validatePageCommit(ctx, write.ObjectID, write.ETag, write.ExpectedEpoch); err != nil {
 		return Page{}, err
 	}
+	bucket, err := c.pageBucket(ctx, write.ObjectID)
+	if err != nil {
+		return Page{}, err
+	}
+	if maxSize := c.maxSizeForBucket(bucket); maxSize > 0 && write.Size > maxSize {
+		return Page{}, fmt.Errorf("page size %d exceeds cache max size %d for bucket %q", write.Size, maxSize, bucket)
+	}
 	if storePageAfterValidationHook != nil {
 		storePageAfterValidationHook()
 	}
@@ -663,6 +686,13 @@ func (c *Cache) currentSizeByBucket() map[string]int64 {
 	return byBucket
 }
 
+func (c *Cache) maxSizeForBucket(bucket string) int64 {
+	if c.maxSizeByBucket == nil {
+		return 0
+	}
+	return c.maxSizeByBucket[bucket]
+}
+
 func (c *Cache) adjustCacheSize(bucket string, delta int64) {
 	if delta == 0 {
 		return
@@ -709,6 +739,9 @@ func pagesSize(pages []Page) int64 {
 }
 
 func (c *Cache) Evict(ctx context.Context) error {
+	if err := c.evictBuckets(ctx); err != nil {
+		return err
+	}
 	for {
 		size := c.currentSize()
 		if size <= c.maxSize {
@@ -735,6 +768,36 @@ func (c *Cache) Evict(ctx context.Context) error {
 			}
 		}
 	}
+}
+
+func (c *Cache) evictBuckets(ctx context.Context) error {
+	for bucket, maxSize := range c.maxSizeByBucket {
+		for {
+			size := c.currentSizeByBucket()[bucket]
+			if size <= maxSize {
+				break
+			}
+			pages, err := c.oldestPagesForBucket(ctx, bucket, evictionBatchSize)
+			if err != nil {
+				return err
+			}
+			if len(pages) == 0 {
+				break
+			}
+			targetBytes := size - maxSize
+			var removedBytes int64
+			for _, page := range pages {
+				if err := c.removePage(ctx, page); err != nil {
+					return err
+				}
+				removedBytes += page.Size
+				if removedBytes >= targetBytes {
+					break
+				}
+			}
+		}
+	}
+	return nil
 }
 
 func (c *Cache) collectMetadata(ctx context.Context) (metadataGCResult, error) {
@@ -1108,6 +1171,34 @@ LIMIT ?
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("select eviction candidates: %w", err)
+	}
+	return pages, nil
+}
+
+func (c *Cache) oldestPagesForBucket(ctx context.Context, bucket string, limit int) ([]Page, error) {
+	rows, err := c.db.QueryContext(ctx, `
+SELECT p.object_id, p.page_index, p.etag, p.size, p.path
+FROM pages p
+JOIN objects o ON o.id = p.object_id
+WHERE o.bucket = ?
+ORDER BY p.last_accessed_at ASC, p.created_at ASC
+LIMIT ?
+`, bucket, limit)
+	if err != nil {
+		return nil, fmt.Errorf("select bucket eviction candidates: %w", err)
+	}
+	defer rows.Close()
+
+	var pages []Page
+	for rows.Next() {
+		var page Page
+		if err := rows.Scan(&page.ObjectID, &page.Index, &page.ETag, &page.Size, &page.Path); err != nil {
+			return nil, fmt.Errorf("scan bucket eviction candidate: %w", err)
+		}
+		pages = append(pages, page)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("select bucket eviction candidates: %w", err)
 	}
 	return pages, nil
 }

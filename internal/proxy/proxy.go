@@ -24,10 +24,17 @@ import (
 	"github.com/ekkuleivonen/simple-s3-cache/internal/cacheplan"
 	appconfig "github.com/ekkuleivonen/simple-s3-cache/internal/config"
 	"github.com/ekkuleivonen/simple-s3-cache/internal/metrics"
+	peerrouter "github.com/ekkuleivonen/simple-s3-cache/internal/peer"
 	"github.com/ekkuleivonen/simple-s3-cache/internal/s3request"
 )
 
 const unsignedPayload = "UNSIGNED-PAYLOAD"
+
+const (
+	peerForwardedHeader = "X-Simple-S3-Cache-Peer-Forwarded"
+	peerOwnerHeader     = "X-Simple-S3-Cache-Peer-Owner"
+	peerFromHeader      = "X-Simple-S3-Cache-Peer-From"
+)
 
 const (
 	upstreamDialTimeout           = 10 * time.Second
@@ -69,8 +76,12 @@ type Proxy struct {
 	logger           *slog.Logger
 	cache            cacheStore
 	pageSize         int64
+	pageSizeByBucket map[string]int64
 	upload           uploadOptions
 	metrics          *metrics.Recorder
+	peerRouter       *peerrouter.Router
+	peerClient       *http.Client
+	peerTimeout      time.Duration
 	pageFillMu       sync.Mutex
 	pageFills        map[pageFillKey]*pageFillCall
 }
@@ -102,6 +113,11 @@ type requestStats struct {
 	upstreamDuration     time.Duration
 	cacheServeDuration   time.Duration
 	status               int
+	peerMode             string
+	peerLocalID          string
+	peerOwnerID          string
+	peerForwarded        bool
+	peerForwardDuration  time.Duration
 }
 
 func New(ctx context.Context, cfg appconfig.Config, logger *slog.Logger) (*Proxy, error) {
@@ -115,6 +131,7 @@ func New(ctx context.Context, cfg appconfig.Config, logger *slog.Logger) (*Proxy
 		CachePath:                cfg.Cache.CachePath,
 		MetaPath:                 cfg.Cache.MetaPath,
 		MaxSize:                  cfg.Cache.MaxSize,
+		MaxSizeByBucket:          maxSizeByBucket(cfg.Cache.Buckets),
 		MetadataGCInterval:       cfg.Cache.MetadataGCInterval,
 		MetadataMaxAge:           cfg.Cache.MetadataMaxAge,
 		MetadataGCBatchSize:      cfg.Cache.MetadataGCBatchSize,
@@ -135,6 +152,15 @@ func New(ctx context.Context, cfg appconfig.Config, logger *slog.Logger) (*Proxy
 		return nil, fmt.Errorf("load upstream credentials: %w", err)
 	}
 
+	var router *peerrouter.Router
+	if cfg.Peer.Mode == "peer" {
+		router, err = newPeerRouter(cfg.Peer)
+		if err != nil {
+			_ = cacheStore.Close()
+			return nil, fmt.Errorf("create peer router: %w", err)
+		}
+	}
+
 	return &Proxy{
 		upstreamEndpoint: upstreamEndpoint,
 		region:           cfg.Upstream.Region,
@@ -144,11 +170,15 @@ func New(ctx context.Context, cfg appconfig.Config, logger *slog.Logger) (*Proxy
 		logger:           logger,
 		cache:            cacheStore,
 		pageSize:         cfg.Cache.PageSize,
+		pageSizeByBucket: pageSizeByBucket(cfg.Cache.Buckets),
 		upload: uploadOptions{
 			spoolPath:    cfg.Upload.SpoolPath,
 			maxSpoolSize: cfg.Upload.MaxSpoolSize,
 		},
-		metrics: recorder,
+		metrics:     recorder,
+		peerRouter:  router,
+		peerClient:  newPeerHTTPClient(cfg.Peer.ForwardTimeout),
+		peerTimeout: cfg.Peer.ForwardTimeout,
 	}, nil
 }
 
@@ -168,6 +198,52 @@ func newUpstreamHTTPClient(cfg appconfig.UpstreamConfig) *http.Client {
 		ResponseHeaderTimeout: cfg.ResponseHeaderTimeout,
 	}
 	return &http.Client{Transport: transport}
+}
+
+func newPeerRouter(cfg appconfig.PeerConfig) (*peerrouter.Router, error) {
+	peers := make([]peerrouter.Peer, 0, len(cfg.Peers))
+	for _, p := range cfg.Peers {
+		peers = append(peers, peerrouter.Peer{ID: p.ID, URL: p.URL})
+	}
+	return peerrouter.NewRouter(cfg.LocalID, peers)
+}
+
+func newPeerHTTPClient(timeout time.Duration) *http.Client {
+	transport := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   upstreamDialTimeout,
+			KeepAlive: upstreamKeepAlive,
+		}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          upstreamMaxIdleConns,
+		MaxIdleConnsPerHost:   upstreamMaxIdleConnsPerHost,
+		IdleConnTimeout:       upstreamIdleConnTimeout,
+		TLSHandshakeTimeout:   upstreamTLSHandshakeTimeout,
+		ExpectContinueTimeout: upstreamExpectContinueTimeout,
+		ResponseHeaderTimeout: timeout,
+	}
+	return &http.Client{Transport: transport}
+}
+
+func maxSizeByBucket(buckets map[string]appconfig.BucketCacheConfig) map[string]int64 {
+	out := make(map[string]int64)
+	for bucket, cfg := range buckets {
+		if cfg.MaxSize > 0 {
+			out[bucket] = cfg.MaxSize
+		}
+	}
+	return out
+}
+
+func pageSizeByBucket(buckets map[string]appconfig.BucketCacheConfig) map[string]int64 {
+	out := make(map[string]int64)
+	for bucket, cfg := range buckets {
+		if cfg.PageSize > 0 {
+			out[bucket] = cfg.PageSize
+		}
+	}
+	return out
 }
 
 func (p *Proxy) MetricsHandler() http.Handler {
@@ -199,6 +275,9 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	})
 
 	stats := newRequestStats(r, target)
+	if p.shouldForwardToPeer(w, r, target, stats) {
+		return
+	}
 	start := time.Now()
 	status, bytesWritten, err := p.handle(w, r, target, classification, stats)
 	stats.status = status
@@ -228,6 +307,15 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		slog.Int64("request_duration_ms", time.Since(start).Milliseconds()),
 		slog.Int64("upstream_bytes", stats.bytesFetchedUpstream),
 	}
+	if stats.peerMode != "" {
+		attrs = append(attrs,
+			slog.String("peer_mode", stats.peerMode),
+			slog.String("peer_local_id", stats.peerLocalID),
+			slog.String("peer_owner_id", stats.peerOwnerID),
+			slog.Bool("peer_forwarded", stats.peerForwarded),
+			slog.Int64("peer_forward_duration_ms", stats.peerForwardDuration.Milliseconds()),
+		)
+	}
 	if err != nil {
 		attrs = append(attrs, slog.String("error", err.Error()))
 		p.logger.LogAttrs(r.Context(), slog.LevelError, "proxy request failed", attrs...)
@@ -235,6 +323,71 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	p.logger.LogAttrs(r.Context(), slog.LevelInfo, "proxy request", attrs...)
+}
+
+func (p *Proxy) shouldForwardToPeer(w http.ResponseWriter, r *http.Request, target s3request.Target, stats *requestStats) bool {
+	if p.peerRouter == nil || !target.IsObject() {
+		return false
+	}
+
+	owner := p.peerRouter.Owner(target.Bucket, target.Key)
+	stats.peerMode = "peer"
+	stats.peerLocalID = p.peerRouter.LocalID()
+	stats.peerOwnerID = owner.ID
+	if owner.ID == p.peerRouter.LocalID() {
+		if p.metrics != nil {
+			p.metrics.RecordPeerDecision(target.Bucket, "local")
+		}
+		return false
+	}
+
+	if r.Header.Get(peerForwardedHeader) != "" {
+		stats.peerForwarded = true
+		stats.cacheResult = "peer_routing_mismatch"
+		if p.metrics != nil {
+			p.metrics.RecordPeerForwardFailure(target.Bucket, owner.ID)
+		}
+		http.Error(w, "peer routing mismatch", http.StatusBadGateway)
+		return true
+	}
+
+	stats.peerForwarded = true
+	stats.cacheResult = "peer_forward"
+	if p.metrics != nil {
+		p.metrics.RecordPeerDecision(target.Bucket, "remote")
+	}
+	start := time.Now()
+	status, bytesWritten, err := p.forwardToPeer(w, r, owner)
+	stats.peerForwardDuration = time.Since(start)
+	stats.status = status
+	stats.bytesSent = bytesWritten
+	if err != nil {
+		if p.metrics != nil {
+			p.metrics.RecordPeerForwardFailure(target.Bucket, owner.ID)
+		}
+		p.logger.ErrorContext(r.Context(), "peer forward failed",
+			slog.String("bucket", target.Bucket),
+			slog.String("key", target.Key),
+			slog.String("peer_owner_id", owner.ID),
+			slog.String("error", err.Error()),
+		)
+		return true
+	}
+	if p.metrics != nil {
+		p.metrics.RecordPeerForward(target.Bucket, owner.ID)
+		p.metrics.ObservePeerForwardDuration(target.Bucket, owner.ID, stats.peerForwardDuration)
+	}
+	p.logger.InfoContext(r.Context(), "peer request forwarded",
+		slog.String("method", r.Method),
+		slog.String("bucket", target.Bucket),
+		slog.String("key", target.Key),
+		slog.Int("status", status),
+		slog.Int64("bytes_sent", bytesWritten),
+		slog.String("peer_local_id", p.peerRouter.LocalID()),
+		slog.String("peer_owner_id", owner.ID),
+		slog.Int64("peer_forward_duration_ms", stats.peerForwardDuration.Milliseconds()),
+	)
+	return true
 }
 
 func (p *Proxy) handle(w http.ResponseWriter, r *http.Request, target s3request.Target, classification s3request.Classification, stats *requestStats) (int, int64, error) {
@@ -345,6 +498,44 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, stats *requestSt
 	}
 
 	return resp.StatusCode, bytesWritten, nil
+}
+
+func (p *Proxy) forwardToPeer(w http.ResponseWriter, r *http.Request, owner peerrouter.Peer) (int, int64, error) {
+	peerURL := strings.TrimRight(owner.URL, "/") + r.URL.RequestURI()
+	ctx := r.Context()
+	if p.peerTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, p.peerTimeout)
+		defer cancel()
+	}
+
+	req, err := http.NewRequestWithContext(ctx, r.Method, peerURL, r.Body)
+	if err != nil {
+		http.Error(w, "build peer request", http.StatusInternalServerError)
+		return 0, 0, err
+	}
+	req.ContentLength = r.ContentLength
+	copyPeerRequestHeaders(req.Header, r.Header)
+	if p.peerRouter != nil {
+		req.Header.Set(peerFromHeader, p.peerRouter.LocalID())
+	}
+	req.Header.Set(peerForwardedHeader, "1")
+	req.Header.Set(peerOwnerHeader, owner.ID)
+
+	resp, err := p.peerClient.Do(req)
+	if err != nil {
+		http.Error(w, "peer request failed", http.StatusBadGateway)
+		return 0, 0, err
+	}
+	defer resp.Body.Close()
+
+	copyResponseHeaders(w.Header(), resp.Header)
+	w.WriteHeader(resp.StatusCode)
+	if r.Method == http.MethodHead {
+		return resp.StatusCode, 0, nil
+	}
+	bytesWritten, copyErr := io.Copy(w, resp.Body)
+	return resp.StatusCode, bytesWritten, copyErr
 }
 
 func forwardBody(r *http.Request, opts uploadOptions) (io.Reader, int64, func() (io.ReadCloser, error), func(), bool, error) {
@@ -1092,7 +1283,7 @@ func (p *Proxy) fetchMetadata(ctx context.Context, r *http.Request, target s3req
 		Key:      target.Key,
 		ETag:     headers.Get("ETag"),
 		Size:     size,
-		PageSize: p.pageSize,
+		PageSize: p.pageSizeForBucket(target.Bucket),
 		Headers:  headers,
 	})
 	if err != nil {
@@ -1100,6 +1291,15 @@ func (p *Proxy) fetchMetadata(ctx context.Context, r *http.Request, target s3req
 	}
 
 	return obj, resp.StatusCode, headers, true, nil
+}
+
+func (p *Proxy) pageSizeForBucket(bucket string) int64 {
+	if p.pageSizeByBucket != nil {
+		if pageSize := p.pageSizeByBucket[bucket]; pageSize > 0 {
+			return pageSize
+		}
+	}
+	return p.pageSize
 }
 
 func (p *Proxy) prepareFirstPage(r *http.Request, target s3request.Target, obj cache.Object, byteRange cacheplan.ByteRange, stats *requestStats) ([]cacheplan.PageSpan, io.ReadCloser, error) {
@@ -1743,13 +1943,30 @@ func dropRangeResponseHeaders(header http.Header) {
 
 func copyRequestHeaders(dst, src http.Header) {
 	for key, values := range src {
-		if isHopByHopHeader(key) || isClientSigningHeader(key) {
+		if isHopByHopHeader(key) || isClientSigningHeader(key) || isPeerHeader(key) {
 			continue
 		}
 		for _, value := range values {
 			dst.Add(key, value)
 		}
 	}
+}
+
+func copyPeerRequestHeaders(dst, src http.Header) {
+	for key, values := range src {
+		if isHopByHopHeader(key) || isPeerHeader(key) {
+			continue
+		}
+		for _, value := range values {
+			dst.Add(key, value)
+		}
+	}
+}
+
+func isPeerHeader(key string) bool {
+	return strings.EqualFold(key, peerForwardedHeader) ||
+		strings.EqualFold(key, peerOwnerHeader) ||
+		strings.EqualFold(key, peerFromHeader)
 }
 
 func isClientSigningHeader(key string) bool {

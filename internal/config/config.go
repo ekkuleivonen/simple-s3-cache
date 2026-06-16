@@ -30,6 +30,8 @@ const (
 	defaultWriteTimeout                  = 10 * time.Minute
 	defaultIdleTimeout                   = 2 * time.Minute
 	defaultMaxSpoolSize                  = int64(10 << 30) // 10 GiB
+	defaultPeerMode                      = "single"
+	defaultPeerForwardTimeout            = 10 * time.Minute
 )
 
 // Config is the process configuration loaded from YAML.
@@ -39,6 +41,7 @@ type Config struct {
 	Cache    CacheConfig    `yaml:"cache"`
 	HTTP     HTTPConfig     `yaml:"http"`
 	Upload   UploadConfig   `yaml:"upload"`
+	Peer     PeerConfig     `yaml:"peer"`
 }
 
 type UpstreamConfig struct {
@@ -52,20 +55,28 @@ type UpstreamConfig struct {
 }
 
 type CacheConfig struct {
-	CachePath                string        `yaml:"cache_path"`
-	MetaPath                 string        `yaml:"meta_path"`
-	MaxSize                  int64         `yaml:"-"`
-	PageSize                 int64         `yaml:"-"`
-	MetadataGCInterval       time.Duration `yaml:"-"`
-	MetadataMaxAge           time.Duration `yaml:"-"`
-	MetadataGCBatchSize      int           `yaml:"metadata_gc_batch_size"`
-	SQLiteCheckpointInterval time.Duration `yaml:"-"`
+	CachePath                string                       `yaml:"cache_path"`
+	MetaPath                 string                       `yaml:"meta_path"`
+	MaxSize                  int64                        `yaml:"-"`
+	PageSize                 int64                        `yaml:"-"`
+	Buckets                  map[string]BucketCacheConfig `yaml:"buckets"`
+	MetadataGCInterval       time.Duration                `yaml:"-"`
+	MetadataMaxAge           time.Duration                `yaml:"-"`
+	MetadataGCBatchSize      int                          `yaml:"metadata_gc_batch_size"`
+	SQLiteCheckpointInterval time.Duration                `yaml:"-"`
 
 	MaxSizeText                  string `yaml:"max_size"`
 	PageSizeText                 string `yaml:"page_size"`
 	MetadataGCIntervalText       string `yaml:"metadata_gc_interval"`
 	MetadataMaxAgeText           string `yaml:"metadata_max_age"`
 	SQLiteCheckpointIntervalText string `yaml:"sqlite_checkpoint_interval"`
+}
+
+type BucketCacheConfig struct {
+	MaxSize      int64  `yaml:"-"`
+	PageSize     int64  `yaml:"-"`
+	MaxSizeText  string `yaml:"max_size"`
+	PageSizeText string `yaml:"page_size"`
 }
 
 type HTTPConfig struct {
@@ -83,6 +94,19 @@ type UploadConfig struct {
 	SpoolPath        string `yaml:"spool_path"`
 	MaxSpoolSize     int64  `yaml:"-"`
 	MaxSpoolSizeText string `yaml:"max_spool_size"`
+}
+
+type PeerConfig struct {
+	Mode               string        `yaml:"mode"`
+	LocalID            string        `yaml:"local_id"`
+	Peers              []Peer        `yaml:"peers"`
+	ForwardTimeout     time.Duration `yaml:"-"`
+	ForwardTimeoutText string        `yaml:"forward_timeout"`
+}
+
+type Peer struct {
+	ID  string `yaml:"id"`
+	URL string `yaml:"url"`
 }
 
 // Load reads a YAML config file, applies defaults, and validates required fields.
@@ -137,6 +161,10 @@ func Default() Config {
 		Upload: UploadConfig{
 			MaxSpoolSize: defaultMaxSpoolSize,
 		},
+		Peer: PeerConfig{
+			Mode:           defaultPeerMode,
+			ForwardTimeout: defaultPeerForwardTimeout,
+		},
 	}
 }
 
@@ -163,6 +191,23 @@ func (cfg *Config) applyParsedSizes() error {
 		}
 		cfg.Upload.MaxSpoolSize = size
 	}
+	for name, bucket := range cfg.Cache.Buckets {
+		if bucket.MaxSizeText != "" {
+			size, err := ParseBytes(bucket.MaxSizeText)
+			if err != nil {
+				return fmt.Errorf("cache.buckets.%s.max_size: %w", name, err)
+			}
+			bucket.MaxSize = size
+		}
+		if bucket.PageSizeText != "" {
+			size, err := ParseBytes(bucket.PageSizeText)
+			if err != nil {
+				return fmt.Errorf("cache.buckets.%s.page_size: %w", name, err)
+			}
+			bucket.PageSize = size
+		}
+		cfg.Cache.Buckets[name] = bucket
+	}
 
 	return nil
 }
@@ -181,6 +226,7 @@ func (cfg *Config) applyParsedDurations() error {
 		{"http.read_timeout", cfg.HTTP.ReadTimeoutText, &cfg.HTTP.ReadTimeout},
 		{"http.write_timeout", cfg.HTTP.WriteTimeoutText, &cfg.HTTP.WriteTimeout},
 		{"http.idle_timeout", cfg.HTTP.IdleTimeoutText, &cfg.HTTP.IdleTimeout},
+		{"peer.forward_timeout", cfg.Peer.ForwardTimeoutText, &cfg.Peer.ForwardTimeout},
 	}
 	for _, field := range durationFields {
 		if strings.TrimSpace(field.text) == "" {
@@ -242,6 +288,24 @@ func (cfg Config) Validate() error {
 	if cfg.Cache.MaxSize > 0 && cfg.Cache.PageSize > cfg.Cache.MaxSize {
 		errs = append(errs, errors.New("cache.page_size must not exceed cache.max_size"))
 	}
+	for name, bucket := range cfg.Cache.Buckets {
+		if strings.TrimSpace(name) == "" {
+			errs = append(errs, errors.New("cache.buckets bucket name must not be empty"))
+			continue
+		}
+		if bucket.MaxSize < 0 {
+			errs = append(errs, fmt.Errorf("cache.buckets.%s.max_size must not be negative", name))
+		}
+		if bucket.PageSize < 0 {
+			errs = append(errs, fmt.Errorf("cache.buckets.%s.page_size must not be negative", name))
+		}
+		if bucket.MaxSize > 0 && bucket.PageSize > bucket.MaxSize {
+			errs = append(errs, fmt.Errorf("cache.buckets.%s.page_size must not exceed cache.buckets.%s.max_size", name, name))
+		}
+		if bucket.MaxSize == 0 && bucket.PageSize > cfg.Cache.MaxSize {
+			errs = append(errs, fmt.Errorf("cache.buckets.%s.page_size must not exceed cache.max_size", name))
+		}
+	}
 	if cfg.Cache.MetadataGCInterval <= 0 {
 		errs = append(errs, errors.New("cache.metadata_gc_interval must be greater than zero"))
 	}
@@ -269,8 +333,65 @@ func (cfg Config) Validate() error {
 	if cfg.Upload.MaxSpoolSize <= 0 {
 		errs = append(errs, errors.New("upload.max_spool_size must be greater than zero"))
 	}
+	errs = append(errs, cfg.validatePeer()...)
 
 	return errors.Join(errs...)
+}
+
+func (cfg Config) validatePeer() []error {
+	var errs []error
+	mode := strings.TrimSpace(cfg.Peer.Mode)
+	switch mode {
+	case "", "single":
+		return nil
+	case "peer":
+	default:
+		return []error{fmt.Errorf("peer.mode must be single or peer")}
+	}
+
+	if strings.TrimSpace(cfg.Peer.LocalID) == "" {
+		errs = append(errs, errors.New("peer.local_id is required in peer mode"))
+	}
+	if cfg.Peer.ForwardTimeout <= 0 {
+		errs = append(errs, errors.New("peer.forward_timeout must be greater than zero"))
+	}
+	if len(cfg.Peer.Peers) == 0 {
+		errs = append(errs, errors.New("peer.peers must contain at least one peer in peer mode"))
+	}
+
+	seen := map[string]struct{}{}
+	hasLocal := false
+	for i, peer := range cfg.Peer.Peers {
+		id := strings.TrimSpace(peer.ID)
+		if id == "" {
+			errs = append(errs, fmt.Errorf("peer.peers[%d].id is required", i))
+		} else {
+			if _, ok := seen[id]; ok {
+				errs = append(errs, fmt.Errorf("peer.peers id %q is duplicated", id))
+			}
+			seen[id] = struct{}{}
+			if id == cfg.Peer.LocalID {
+				hasLocal = true
+			}
+		}
+		peerURL := strings.TrimSpace(peer.URL)
+		if peerURL == "" {
+			errs = append(errs, fmt.Errorf("peer.peers[%d].url is required", i))
+			continue
+		}
+		parsed, err := url.Parse(peerURL)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("peer.peers[%d].url is invalid: %w", i, err))
+		} else if parsed.Scheme != "http" && parsed.Scheme != "https" {
+			errs = append(errs, fmt.Errorf("peer.peers[%d].url must use http or https", i))
+		} else if parsed.Host == "" {
+			errs = append(errs, fmt.Errorf("peer.peers[%d].url must include a host", i))
+		}
+	}
+	if len(cfg.Peer.Peers) > 0 && !hasLocal {
+		errs = append(errs, errors.New("peer.peers must include peer.local_id"))
+	}
+	return errs
 }
 
 func ParseBytes(input string) (int64, error) {

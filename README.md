@@ -178,7 +178,7 @@ cached pages for the affected object on success.
 
 ## Deployment Model
 
-simple-s3-cache is designed for a single active cache instance.
+simple-s3-cache defaults to a single active cache instance.
 
 ```text
 Client
@@ -192,9 +192,57 @@ S3-compatible storage
 
 This keeps cache invalidation local and avoids distributed coordination.
 
-Multiple independent cache instances do not coordinate invalidation. If a write
-is routed through one cache instance, other cache instances may continue serving
-stale cached metadata or pages for the same object.
+Multiple independent cache instances outside peer mode do not coordinate
+invalidation. If a write is routed through one cache instance, other instances
+may continue serving stale cached metadata or pages for the same object.
+
+Peer mode is available when more local cache capacity or disk bandwidth is
+needed. In peer mode, every instance has the same static peer list and uses
+rendezvous hashing over `bucket/key` to choose exactly one owner for each object.
+Any instance may receive a request, but all object requests — reads, writes,
+deletes, COPY destinations, and multipart completion or abort requests — are
+owned by the destination `bucket/key`. Non-owners stream the request to the owner
+before any local cache handling begins.
+
+```text
+Client
+  ↓
+LB / Service
+  ↓
+simple-s3-cache peer that received the request
+  ↓ if needed
+simple-s3-cache peer that owns /bucket/key
+  ↓
+S3-compatible storage
+```
+
+Reads and writes for a given object therefore converge on the same owner, so the
+existing local invalidation path remains authoritative for that object. Bucket
+operations and other requests without a single object owner are handled by the
+receiving peer and pass through to upstream.
+
+Peer forwarding uses internal coordination headers:
+
+```text
+X-Simple-S3-Cache-Peer-Forwarded: 1
+X-Simple-S3-Cache-Peer-Owner: <owner-id>
+X-Simple-S3-Cache-Peer-From: <sender-id>
+```
+
+If a peer receives `X-Simple-S3-Cache-Peer-Forwarded: 1` but the request does
+not belong to that peer, it returns `502` instead of forwarding again. This makes
+peer-list disagreement fail closed.
+
+Peer mode is intentionally static in this version. It is a good fit for a
+Kubernetes StatefulSet with stable peer IDs and a headless Service, for example
+`simple-s3-cache-0.simple-s3-cache-peers`. All peers must run the same peer list.
+Changing the peer list moves some object ownership and makes those objects cold
+on the new owner. Mixed peer-list rollouts are a correctness hazard because two
+peers may temporarily believe they own the same object; avoid them.
+
+If the owner peer is unavailable, remote-owner object requests fail closed
+instead of being served by the wrong local cache. Restarting the owner with an
+empty cache is safe because upstream storage remains the source of truth.
 
 If the cache instance fails, it can be restarted with an empty cache. No object
 data is lost because upstream S3-compatible storage remains the source of truth.
@@ -222,7 +270,9 @@ against cached metadata so responses match upstream behavior.
 
 Successful writes immediately invalidate cached data for affected objects.
 
-COPY invalidates the destination object only.
+COPY invalidates the destination object only. In peer mode, COPY requests route
+by the destination `bucket/key`; cached pages for the source object are not
+affected.
 
 ## Storage
 
@@ -339,6 +389,10 @@ http:
 upload:
   spool_path: /cache/spool
   max_spool_size: 10GB
+
+peer:
+  mode: single
+  forward_timeout: 10m
 ```
 
 `cache_path` stores cached page files. `meta_path` stores the SQLite cache
@@ -375,6 +429,25 @@ unknown-length uploads are spooled to `upload.spool_path` before forwarding so
 the proxy can re-sign them with a fixed content length. `upload.max_spool_size`
 bounds that fallback disk usage.
 
+`peer.mode` defaults to `single`. To enable peer mode, set `peer.mode: peer`,
+configure `peer.local_id`, and provide a complete static peer list:
+
+```yaml
+peer:
+  mode: peer
+  local_id: simple-s3-cache-0
+  forward_timeout: 10m
+  peers:
+    - id: simple-s3-cache-0
+      url: http://simple-s3-cache-0.simple-s3-cache-peers:8080
+    - id: simple-s3-cache-1
+      url: http://simple-s3-cache-1.simple-s3-cache-peers:8080
+```
+
+Every peer must use the same `peers` list and a unique `local_id` matching its
+StatefulSet ordinal or other stable identity. Peer forwarding is internal HTTP;
+protect it with Kubernetes networking controls appropriate for the cluster.
+
 ## Observability
 
 Metrics and structured logs are part of production readiness, not an
@@ -389,6 +462,11 @@ Key signals include page hit/miss rate, bytes from cache vs upstream, bytes
 fetched to fill cache, evictions, and cached bytes — globally and **per bucket**.
 Full counter, gauge, histogram, and log-field requirements are in
 [PLAN.md](PLAN.md#observability).
+
+Peer mode also emits structured log fields for `peer_mode`, `peer_local_id`,
+`peer_owner_id`, `peer_forwarded`, and `peer_forward_duration_ms`, plus metrics
+for owner decisions, forwarded requests, forwarding failures, and peer forwarding
+duration.
 
 ## Why?
 

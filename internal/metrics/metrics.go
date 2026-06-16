@@ -45,6 +45,7 @@ func NewRecorder(cacheMaxBytes int64) *Recorder {
 	r.registerHistogram("simple_s3_cache_read_amplification", []float64{0, 1, 1.25, 1.5, 2, 4, 8, 16, 32})
 	r.registerHistogram("simple_s3_cache_upstream_duration_seconds", []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10})
 	r.registerHistogram("simple_s3_cache_hit_duration_seconds", []float64{0.0001, 0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1})
+	r.registerHistogram("simple_s3_cache_peer_forward_duration_seconds", []float64{0.0001, 0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5})
 	return r
 }
 
@@ -83,6 +84,18 @@ func (r *Recorder) RecordUpstreamFailure(bucket, operation string) {
 	r.inc("simple_s3_cache_upstream_request_failures_total", labels(label{"bucket", bucket}, label{"operation", operation}), 1)
 }
 
+func (r *Recorder) RecordPeerDecision(bucket, decision string) {
+	r.inc("simple_s3_cache_peer_owner_decisions_total", labels(label{"bucket", bucket}, label{"decision", decision}), 1)
+}
+
+func (r *Recorder) RecordPeerForward(bucket, peerID string) {
+	r.inc("simple_s3_cache_peer_forwarded_requests_total", labels(label{"bucket", bucket}, label{"peer_id", peerID}), 1)
+}
+
+func (r *Recorder) RecordPeerForwardFailure(bucket, peerID string) {
+	r.inc("simple_s3_cache_peer_forward_failures_total", labels(label{"bucket", bucket}, label{"peer_id", peerID}), 1)
+}
+
 func (r *Recorder) RecordBytesServedFromCache(bucket string, bytes int64) {
 	r.inc("simple_s3_cache_bytes_served_from_cache_total", bucketLabels(bucket), float64(bytes))
 }
@@ -113,6 +126,10 @@ func (r *Recorder) ObserveUpstreamDuration(bucket, operation string, d time.Dura
 
 func (r *Recorder) ObserveCacheServeDuration(bucket string, d time.Duration) {
 	r.observe("simple_s3_cache_hit_duration_seconds", bucketLabels(bucket), d.Seconds())
+}
+
+func (r *Recorder) ObservePeerForwardDuration(bucket, peerID string, d time.Duration) {
+	r.observe("simple_s3_cache_peer_forward_duration_seconds", labels(label{"bucket", bucket}, label{"peer_id", peerID}), d.Seconds())
 }
 
 func (r *Recorder) SetCachedBytes(total int64, byBucket map[string]int64) {

@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -27,6 +28,7 @@ import (
 	"github.com/ekkuleivonen/simple-s3-cache/internal/cache"
 	appconfig "github.com/ekkuleivonen/simple-s3-cache/internal/config"
 	"github.com/ekkuleivonen/simple-s3-cache/internal/metrics"
+	peerrouter "github.com/ekkuleivonen/simple-s3-cache/internal/peer"
 	"github.com/ekkuleivonen/simple-s3-cache/internal/s3request"
 )
 
@@ -1476,6 +1478,212 @@ func TestProxyFallsBackToPassThroughWhenMetadataStoreFails(t *testing.T) {
 	if !equalStringSlices(upstreamRequests, wantRequests) {
 		t.Fatalf("upstream requests = %q, want %q", upstreamRequests, wantRequests)
 	}
+}
+
+func TestProxyPeerModeForwardsRemoteOwnerRequest(t *testing.T) {
+	var peerRequests int
+	peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		peerRequests++
+		if got := r.Header.Get(peerForwardedHeader); got != "1" {
+			t.Fatalf("peer forwarded header = %q, want 1", got)
+		}
+		if got := r.Header.Get(peerOwnerHeader); got != "cache-1" {
+			t.Fatalf("peer owner header = %q, want cache-1", got)
+		}
+		if got := r.Header.Get(peerFromHeader); got != "cache-0" {
+			t.Fatalf("peer from header = %q, want cache-0", got)
+		}
+		if got := r.Header.Get("Authorization"); got != "client-signature" {
+			t.Fatalf("Authorization = %q, want client-signature", got)
+		}
+		w.Header().Set("ETag", `"peer-etag"`)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("from-peer"))
+	}))
+	defer peer.Close()
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Fatal("upstream should not receive remotely owned request")
+	}))
+	defer upstream.Close()
+
+	p := testProxy(t, upstream.URL)
+	router := enablePeerMode(t, p, "cache-0", []peerrouter.Peer{
+		{ID: "cache-0", URL: "http://cache-0.invalid"},
+		{ID: "cache-1", URL: peer.URL},
+	})
+	key := keyOwnedBy(t, router, "bucket", "cache-1")
+	req := httptest.NewRequest(http.MethodGet, "/bucket/"+key, nil)
+	req.Header.Set("Authorization", "client-signature")
+	rec := httptest.NewRecorder()
+
+	p.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%q", rec.Code, rec.Body.String())
+	}
+	if got := rec.Body.String(); got != "from-peer" {
+		t.Fatalf("body = %q, want from-peer", got)
+	}
+	if peerRequests != 1 {
+		t.Fatalf("peer requests = %d, want 1", peerRequests)
+	}
+	metricsBody := renderProxyMetrics(t, p.metrics)
+	if !strings.Contains(metricsBody, `simple_s3_cache_peer_forwarded_requests_total{bucket="bucket",peer_id="cache-1"} 1`) {
+		t.Fatalf("metrics missing peer forward:\n%s", metricsBody)
+	}
+}
+
+func TestProxyPeerModeHandlesLocalOwnerRequestLocally(t *testing.T) {
+	peer := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Fatal("peer should not receive locally owned request")
+	}))
+	defer peer.Close()
+
+	var upstreamRequests int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamRequests++
+		if r.Method != http.MethodPut {
+			t.Fatalf("upstream method = %q, want PUT", r.Method)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	p := testProxy(t, upstream.URL)
+	router := enablePeerMode(t, p, "cache-0", []peerrouter.Peer{
+		{ID: "cache-0", URL: "http://cache-0.invalid"},
+		{ID: "cache-1", URL: peer.URL},
+	})
+	key := keyOwnedBy(t, router, "bucket", "cache-0")
+	req := httptest.NewRequest(http.MethodPut, "/bucket/"+key, strings.NewReader("body"))
+	rec := httptest.NewRecorder()
+
+	p.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%q", rec.Code, rec.Body.String())
+	}
+	if upstreamRequests != 1 {
+		t.Fatalf("upstream requests = %d, want 1", upstreamRequests)
+	}
+}
+
+func TestProxyPeerModeForwardedWriteInvalidatesOnOwner(t *testing.T) {
+	var upstreamDeletes int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete {
+			t.Fatalf("upstream method = %q, want DELETE", r.Method)
+		}
+		if got := r.Header.Get(peerForwardedHeader); got != "" {
+			t.Fatalf("upstream peer forwarded header = %q, want empty", got)
+		}
+		if got := r.Header.Get(peerOwnerHeader); got != "" {
+			t.Fatalf("upstream peer owner header = %q, want empty", got)
+		}
+		if got := r.Header.Get(peerFromHeader); got != "" {
+			t.Fatalf("upstream peer from header = %q, want empty", got)
+		}
+		upstreamDeletes++
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+
+	owner := testProxy(t, upstream.URL)
+	router, err := peerrouter.NewRouter("cache-1", []peerrouter.Peer{
+		{ID: "cache-0", URL: "http://cache-0.invalid"},
+		{ID: "cache-1", URL: "http://cache-1.invalid"},
+	})
+	if err != nil {
+		t.Fatalf("NewRouter(owner) error = %v", err)
+	}
+	key := keyOwnedBy(t, router, "bucket", "cache-1")
+	if _, err := owner.cache.PutObject(context.Background(), cache.ObjectMetadata{
+		Bucket:   "bucket",
+		Key:      key,
+		ETag:     `"etag"`,
+		Size:     12,
+		PageSize: 4,
+		Headers:  http.Header{"ETag": []string{`"etag"`}},
+	}); err != nil {
+		t.Fatalf("PutObject() error = %v", err)
+	}
+	owner.peerRouter = router
+
+	ownerServer := httptest.NewServer(owner)
+	defer ownerServer.Close()
+
+	receiver := testProxy(t, upstream.URL)
+	enablePeerMode(t, receiver, "cache-0", []peerrouter.Peer{
+		{ID: "cache-0", URL: "http://cache-0.invalid"},
+		{ID: "cache-1", URL: ownerServer.URL},
+	})
+	req := httptest.NewRequest(http.MethodDelete, "/bucket/"+key, nil)
+	rec := httptest.NewRecorder()
+
+	receiver.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204; body=%q", rec.Code, rec.Body.String())
+	}
+	if upstreamDeletes != 1 {
+		t.Fatalf("upstream deletes = %d, want 1", upstreamDeletes)
+	}
+	if _, ok, err := owner.cache.GetObject(context.Background(), "bucket", key); err != nil {
+		t.Fatalf("GetObject() error = %v", err)
+	} else if ok {
+		t.Fatal("object metadata still cached on owner after forwarded DELETE")
+	}
+}
+
+func TestProxyPeerModeRejectsForwardingLoop(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Fatal("upstream should not receive looped peer request")
+	}))
+	defer upstream.Close()
+
+	p := testProxy(t, upstream.URL)
+	router := enablePeerMode(t, p, "cache-0", []peerrouter.Peer{
+		{ID: "cache-0", URL: "http://cache-0.invalid"},
+		{ID: "cache-1", URL: "http://cache-1.invalid"},
+	})
+	key := keyOwnedBy(t, router, "bucket", "cache-1")
+	req := httptest.NewRequest(http.MethodGet, "/bucket/"+key, nil)
+	req.Header.Set(peerForwardedHeader, "1")
+	req.Header.Set(peerFromHeader, "cache-1")
+	rec := httptest.NewRecorder()
+
+	p.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502; body=%q", rec.Code, rec.Body.String())
+	}
+}
+
+func enablePeerMode(t *testing.T, p *Proxy, localID string, peers []peerrouter.Peer) *peerrouter.Router {
+	t.Helper()
+
+	router, err := peerrouter.NewRouter(localID, peers)
+	if err != nil {
+		t.Fatalf("NewRouter() error = %v", err)
+	}
+	p.peerRouter = router
+	p.peerClient = http.DefaultClient
+	p.peerTimeout = time.Minute
+	return router
+}
+
+func keyOwnedBy(t *testing.T, router *peerrouter.Router, bucket, ownerID string) string {
+	t.Helper()
+
+	for i := 0; i < 10_000; i++ {
+		key := fmt.Sprintf("object-%d.bin", i)
+		if router.Owner(bucket, key).ID == ownerID {
+			return key
+		}
+	}
+	t.Fatalf("could not find key owned by %s", ownerID)
+	return ""
 }
 
 func testProxy(t *testing.T, endpoint string) *Proxy {
