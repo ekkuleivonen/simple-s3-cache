@@ -526,6 +526,95 @@ func TestEvictLRURemovesOldestPagesUntilUnderMaxSize(t *testing.T) {
 	}
 }
 
+func TestStorePageRejectsPageLargerThanBucketMaxSize(t *testing.T) {
+	ctx := context.Background()
+	c := openTestCacheWithBucketMaxSizes(t, 100, map[string]int64{
+		"analytics": 4,
+	})
+	analyticsObj := putTestObject(t, c, "analytics", "too-large.bin")
+	mediaObj := putTestObject(t, c, "media", "fits-global.bin")
+
+	if _, err := c.StorePage(ctx, PageWrite{
+		ObjectID: analyticsObj.ID,
+		Index:    0,
+		ETag:     analyticsObj.ETag,
+		Size:     int64(len("12345")),
+		Source:   bytes.NewReader([]byte("12345")),
+	}); err == nil {
+		t.Fatal("StorePage(analytics) error = nil, want bucket max-size rejection")
+	}
+
+	if _, err := c.StorePage(ctx, PageWrite{
+		ObjectID: mediaObj.ID,
+		Index:    0,
+		ETag:     mediaObj.ETag,
+		Size:     int64(len("12345")),
+		Source:   bytes.NewReader([]byte("12345")),
+	}); err != nil {
+		t.Fatalf("StorePage(media) error = %v, want page to fit global max size", err)
+	}
+	if got, err := c.CurrentSize(ctx); err != nil {
+		t.Fatalf("CurrentSize() error = %v", err)
+	} else if got != 5 {
+		t.Fatalf("CurrentSize() = %d, want 5", got)
+	}
+}
+
+func TestEvictRemovesOldestPagesFromBucketsOverTheirOwnMaxSize(t *testing.T) {
+	ctx := context.Background()
+	c := openTestCacheWithBucketMaxSizes(t, 100, map[string]int64{
+		"analytics": 7,
+		"media":     90,
+	})
+	mediaObj := putTestObject(t, c, "media", "old-but-within-budget.bin")
+	analyticsObj := putTestObject(t, c, "analytics", "over-budget.bin")
+
+	storeTestPage(t, c, mediaObj, 0, []byte("mmmmmmmmmm"))
+	for i, data := range [][]byte{[]byte("1111"), []byte("2222"), []byte("3333")} {
+		storeTestPage(t, c, analyticsObj, int64(i), data)
+	}
+
+	if err := c.Evict(ctx); err != nil {
+		t.Fatalf("Evict() error = %v", err)
+	}
+
+	assertPagePresent(t, c, mediaObj.ID, 0, true)
+	assertPagePresent(t, c, analyticsObj.ID, 0, false)
+	assertPagePresent(t, c, analyticsObj.ID, 1, false)
+	assertPagePresent(t, c, analyticsObj.ID, 2, true)
+	if got, err := c.CurrentSize(ctx); err != nil {
+		t.Fatalf("CurrentSize() error = %v", err)
+	} else if got != 14 {
+		t.Fatalf("CurrentSize() = %d, want 14", got)
+	}
+}
+
+func TestEvictStillEnforcesGlobalMaxSizeWithBucketMaxSizes(t *testing.T) {
+	ctx := context.Background()
+	c := openTestCacheWithBucketMaxSizes(t, 10, map[string]int64{
+		"analytics": 100,
+		"media":     100,
+	})
+	analyticsObj := putTestObject(t, c, "analytics", "oldest.bin")
+	mediaObj := putTestObject(t, c, "media", "newer.bin")
+
+	storeTestPage(t, c, analyticsObj, 0, []byte("1111"))
+	storeTestPage(t, c, mediaObj, 0, []byte("2222"))
+	storeTestPage(t, c, mediaObj, 1, []byte("3333"))
+
+	if err := c.Evict(ctx); err != nil {
+		t.Fatalf("Evict() error = %v", err)
+	}
+
+	if got, err := c.CurrentSize(ctx); err != nil {
+		t.Fatalf("CurrentSize() error = %v", err)
+	} else if got > 10 {
+		t.Fatalf("CurrentSize() = %d, want <= 10", got)
+	}
+	assertPagePresent(t, c, analyticsObj.ID, 0, false)
+	assertPagePresent(t, c, mediaObj.ID, 1, true)
+}
+
 func TestOpenPageTreatsSizeMismatchAsMissAndRemovesCorruptFile(t *testing.T) {
 	ctx := context.Background()
 	c := openTestCache(t)
@@ -760,6 +849,28 @@ func openTestCacheWithMaxSize(t *testing.T, maxSize int64) *Cache {
 	return c
 }
 
+func openTestCacheWithBucketMaxSizes(t *testing.T, maxSize int64, maxSizeByBucket map[string]int64) *Cache {
+	t.Helper()
+
+	root := t.TempDir()
+	c, err := Open(context.Background(), Options{
+		CachePath:       filepath.Join(root, "cache-bytes"),
+		MetaPath:        filepath.Join(root, "cache-meta"),
+		MaxSize:         maxSize,
+		MaxSizeByBucket: maxSizeByBucket,
+	})
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := c.Close(); err != nil {
+			t.Fatalf("Close() error = %v", err)
+		}
+	})
+
+	return c
+}
+
 func putTestObject(t *testing.T, c *Cache, bucket, key string) Object {
 	t.Helper()
 
@@ -776,6 +887,37 @@ func putTestObject(t *testing.T, c *Cache, bucket, key string) Object {
 	}
 
 	return obj
+}
+
+func storeTestPage(t *testing.T, c *Cache, obj Object, index int64, data []byte) Page {
+	t.Helper()
+
+	page, err := c.StorePage(context.Background(), PageWrite{
+		ObjectID: obj.ID,
+		Index:    index,
+		ETag:     obj.ETag,
+		Size:     int64(len(data)),
+		Source:   bytes.NewReader(data),
+	})
+	if err != nil {
+		t.Fatalf("StorePage(%s/%s page %d) error = %v", obj.Bucket, obj.Key, index, err)
+	}
+	return page
+}
+
+func assertPagePresent(t *testing.T, c *Cache, objectID string, index int64, wantPresent bool) {
+	t.Helper()
+
+	body, ok, err := c.OpenPage(context.Background(), objectID, index)
+	if err != nil {
+		t.Fatalf("OpenPage(%s, %d) error = %v", objectID, index, err)
+	}
+	if ok {
+		_ = body.Close()
+	}
+	if ok != wantPresent {
+		t.Fatalf("OpenPage(%s, %d) present = %v, want %v", objectID, index, ok, wantPresent)
+	}
 }
 
 func generationExists(t *testing.T, c *Cache, objectID string) bool {

@@ -409,6 +409,125 @@ func TestProxyCachesHeadMetadata(t *testing.T) {
 	}
 }
 
+func TestProxyStoresBucketSpecificPageSizeInMetadata(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodHead {
+			t.Fatalf("upstream method = %q, want HEAD", r.Method)
+		}
+		w.Header().Set("Content-Length", "12")
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("ETag", `"etag-page-size"`)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	p := testProxyWithBucketPageSizes(t, upstream.URL, 4, map[string]int64{
+		"analytics": 2,
+		"media":     8,
+	})
+
+	for _, tt := range []struct {
+		bucket       string
+		wantPageSize int64
+	}{
+		{bucket: "analytics", wantPageSize: 2},
+		{bucket: "media", wantPageSize: 8},
+		{bucket: "other", wantPageSize: 4},
+	} {
+		req := httptest.NewRequest(http.MethodHead, "/"+tt.bucket+"/object.bin", nil)
+		rec := httptest.NewRecorder()
+
+		p.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s HEAD status = %d, want 200", tt.bucket, rec.Code)
+		}
+		obj, ok, err := p.cache.GetObject(context.Background(), tt.bucket, "object.bin")
+		if err != nil {
+			t.Fatalf("%s GetObject() error = %v", tt.bucket, err)
+		}
+		if !ok {
+			t.Fatalf("%s object metadata was not cached", tt.bucket)
+		}
+		if obj.PageSize != tt.wantPageSize {
+			t.Fatalf("%s PageSize = %d, want %d", tt.bucket, obj.PageSize, tt.wantPageSize)
+		}
+	}
+}
+
+func TestProxyUsesBucketSpecificPageSizeForRangeFetch(t *testing.T) {
+	body := []byte("abcdefghijkl")
+	var upstreamRequests []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamRequests = append(upstreamRequests, r.Method+" "+r.URL.Path+" "+r.Header.Get("Range"))
+		w.Header().Set("Accept-Ranges", "bytes")
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("ETag", `"etag-bucket-page-size"`)
+		if r.Method == http.MethodHead {
+			w.Header().Set("Content-Length", "12")
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		switch r.Header.Get("Range") {
+		case "bytes=3-5":
+			w.Header().Set("Content-Length", "3")
+			w.Header().Set("Content-Range", "bytes 3-5/12")
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(body[3:6])
+		case "bytes=0-5":
+			w.Header().Set("Content-Length", "6")
+			w.Header().Set("Content-Range", "bytes 0-5/12")
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(body[0:6])
+		case "bytes=4-7":
+			w.Header().Set("Content-Length", "4")
+			w.Header().Set("Content-Range", "bytes 4-7/12")
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(body[4:8])
+		default:
+			t.Fatalf("unexpected upstream range %q", r.Header.Get("Range"))
+		}
+	}))
+	defer upstream.Close()
+
+	p := testProxyWithBucketPageSizes(t, upstream.URL, 4, map[string]int64{
+		"analytics": 3,
+		"media":     6,
+	})
+
+	for _, path := range []string{
+		"/analytics/object.bin",
+		"/media/object.bin",
+		"/other/object.bin",
+	} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.Header.Set("Range", "bytes=4-4")
+		rec := httptest.NewRecorder()
+
+		p.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusPartialContent {
+			t.Fatalf("%s status = %d, want 206; body=%q", path, rec.Code, rec.Body.String())
+		}
+		if got := rec.Body.String(); got != "e" {
+			t.Fatalf("%s body = %q, want %q", path, got, "e")
+		}
+	}
+
+	wantRequests := []string{
+		"HEAD /analytics/object.bin ",
+		"GET /analytics/object.bin bytes=3-5",
+		"HEAD /media/object.bin ",
+		"GET /media/object.bin bytes=0-5",
+		"HEAD /other/object.bin ",
+		"GET /other/object.bin bytes=4-7",
+	}
+	if !equalStringSlices(upstreamRequests, wantRequests) {
+		t.Fatalf("upstream requests = %q, want %q", upstreamRequests, wantRequests)
+	}
+}
+
 func TestProxyServesConditionalNotModifiedFromCachedMetadata(t *testing.T) {
 	body := []byte("abcdefghijkl")
 	var upstreamRequests int
@@ -1407,6 +1526,14 @@ func testProxyWithPageSize(t *testing.T, endpoint string, pageSize int64) *Proxy
 		},
 		metrics: recorder,
 	}
+}
+
+func testProxyWithBucketPageSizes(t *testing.T, endpoint string, pageSize int64, pageSizeByBucket map[string]int64) *Proxy {
+	t.Helper()
+
+	p := testProxyWithPageSize(t, endpoint, pageSize)
+	p.pageSizeByBucket = pageSizeByBucket
+	return p
 }
 
 func upstreamClient(_ string) *http.Client {

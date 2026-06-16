@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -169,6 +170,137 @@ upload:
 	}
 	if cfg.Upload.MaxSpoolSize != 5<<30 {
 		t.Fatalf("Upload.MaxSpoolSize = %d, want %d", cfg.Upload.MaxSpoolSize, int64(5<<30))
+	}
+}
+
+func TestLoadParsesBucketCacheOverrides(t *testing.T) {
+	path := writeConfig(t, `
+upstream:
+  endpoint: http://rustfs:9000
+  access_key: test-access
+  secret_key: test-secret
+cache:
+  max_size: 1GB
+  page_size: 4MB
+  buckets:
+    analytics:
+      max_size: 128MB
+      page_size: 512KB
+    media:
+      max_size: 768MB
+      page_size: 16MB
+    logs:
+      page_size: 1MB
+`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	analytics := cfg.Cache.Buckets["analytics"]
+	if analytics.MaxSize != 128<<20 {
+		t.Fatalf("analytics MaxSize = %d, want %d", analytics.MaxSize, int64(128<<20))
+	}
+	if analytics.PageSize != 512<<10 {
+		t.Fatalf("analytics PageSize = %d, want %d", analytics.PageSize, int64(512<<10))
+	}
+
+	media := cfg.Cache.Buckets["media"]
+	if media.MaxSize != 768<<20 {
+		t.Fatalf("media MaxSize = %d, want %d", media.MaxSize, int64(768<<20))
+	}
+	if media.PageSize != 16<<20 {
+		t.Fatalf("media PageSize = %d, want %d", media.PageSize, int64(16<<20))
+	}
+
+	logs := cfg.Cache.Buckets["logs"]
+	if logs.MaxSize != 0 {
+		t.Fatalf("logs MaxSize = %d, want unset bucket-specific cap", logs.MaxSize)
+	}
+	if logs.PageSize != 1<<20 {
+		t.Fatalf("logs PageSize = %d, want %d", logs.PageSize, int64(1<<20))
+	}
+}
+
+func TestLoadRejectsInvalidBucketCacheOverrideSizes(t *testing.T) {
+	tests := []struct {
+		name      string
+		config    string
+		wantError string
+	}{
+		{
+			name: "invalid bucket max size",
+			config: `
+upstream:
+  endpoint: http://rustfs:9000
+  access_key: test-access
+  secret_key: test-secret
+cache:
+  buckets:
+    analytics:
+      max_size: not-a-size
+`,
+			wantError: "cache.buckets.analytics.max_size",
+		},
+		{
+			name: "invalid bucket page size",
+			config: `
+upstream:
+  endpoint: http://rustfs:9000
+  access_key: test-access
+  secret_key: test-secret
+cache:
+  buckets:
+    analytics:
+      page_size: nope
+`,
+			wantError: "cache.buckets.analytics.page_size",
+		},
+		{
+			name: "bucket page size exceeds explicit bucket max size",
+			config: `
+upstream:
+  endpoint: http://rustfs:9000
+  access_key: test-access
+  secret_key: test-secret
+cache:
+  buckets:
+    analytics:
+      max_size: 1MB
+      page_size: 2MB
+`,
+			wantError: "cache.buckets.analytics.page_size must not exceed cache.buckets.analytics.max_size",
+		},
+		{
+			name: "bucket page size exceeds global max size",
+			config: `
+upstream:
+  endpoint: http://rustfs:9000
+  access_key: test-access
+  secret_key: test-secret
+cache:
+  max_size: 1MB
+  buckets:
+    analytics:
+      page_size: 2MB
+`,
+			wantError: "cache.buckets.analytics.page_size must not exceed cache.max_size",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := writeConfig(t, tt.config)
+
+			_, err := Load(path)
+			if err == nil {
+				t.Fatal("Load() error = nil, want validation error")
+			}
+			if !strings.Contains(err.Error(), tt.wantError) {
+				t.Fatalf("Load() error = %v, want containing %q", err, tt.wantError)
+			}
+		})
 	}
 }
 
