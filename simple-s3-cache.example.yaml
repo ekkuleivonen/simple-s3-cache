@@ -1,0 +1,40 @@
+listen: ":8080"
+
+upstream:
+  endpoint: http://rustfs:9000
+  region: us-east-1
+  access_key: simple-s3-cache
+  secret_key: change-me
+  response_header_timeout: 30s
+
+cache:
+  cache_path: /cache/objects
+  meta_path: /cache/meta
+  max_size: 1TB
+  page_size: 4MB
+  metadata_gc_interval: 1h
+  metadata_max_age: 24h
+  metadata_gc_batch_size: 512
+  sqlite_checkpoint_interval: 6h
+
+http:
+  read_header_timeout: 5s
+  read_timeout: 10m
+  write_timeout: 10m
+  idle_timeout: 2m
+
+upload:
+  spool_path: /cache/spool
+  max_spool_size: 10GB
+
+peer:
+  mode: single
+  forward_timeout: 10m
+  # To run in peer mode, set mode: peer, give each pod a unique local_id, and
+  # provide the same static peer list on every pod.
+  # local_id: simple-s3-cache-0
+  # peers:
+  #   - id: simple-s3-cache-0
+  #     url: http://simple-s3-cache-0.simple-s3-cache-peers:8080
+  #   - id: simple-s3-cache-1
+  #     url: http://simple-s3-cache-1.simple-s3-cache-peers:8080

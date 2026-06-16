@@ -178,7 +178,7 @@ cached pages for the affected object on success.
 
 ## Deployment Model
 
-simple-s3-cache is designed for a single active cache instance.
+simple-s3-cache defaults to a single active cache instance.
 
 ```text
 Client
@@ -192,9 +192,57 @@ S3-compatible storage
 
 This keeps cache invalidation local and avoids distributed coordination.
 
-Multiple independent cache instances do not coordinate invalidation. If a write
-is routed through one cache instance, other cache instances may continue serving
-stale cached metadata or pages for the same object.
+Multiple independent cache instances outside peer mode do not coordinate
+invalidation. If a write is routed through one cache instance, other instances
+may continue serving stale cached metadata or pages for the same object.
+
+Peer mode is available when more local cache capacity or disk bandwidth is
+needed. In peer mode, every instance has the same static peer list and uses
+rendezvous hashing over `bucket/key` to choose exactly one owner for each object.
+Any instance may receive a request, but all object requests — reads, writes,
+deletes, COPY destinations, and multipart completion or abort requests — are
+owned by the destination `bucket/key`. Non-owners stream the request to the owner
+before any local cache handling begins.
+
+```text
+Client
+  ↓
+LB / Service
+  ↓
+simple-s3-cache peer that received the request
+  ↓ if needed
+simple-s3-cache peer that owns /bucket/key
+  ↓
+S3-compatible storage
+```
+
+Reads and writes for a given object therefore converge on the same owner, so the
+existing local invalidation path remains authoritative for that object. Bucket
+operations and other requests without a single object owner are handled by the
+receiving peer and pass through to upstream.
+
+Peer forwarding uses internal coordination headers:
+
+```text
+X-Simple-S3-Cache-Peer-Forwarded: 1
+X-Simple-S3-Cache-Peer-Owner: <owner-id>
+X-Simple-S3-Cache-Peer-From: <sender-id>
+```
+
+If a peer receives `X-Simple-S3-Cache-Peer-Forwarded: 1` but the request does
+not belong to that peer, it returns `502` instead of forwarding again. This makes
+peer-list disagreement fail closed.
+
+Peer mode is intentionally static in this version. It is a good fit for a
+Kubernetes StatefulSet with stable peer IDs and a headless Service, for example
+`simple-s3-cache-0.simple-s3-cache-peers`. All peers must run the same peer list.
+Changing the peer list moves some object ownership and makes those objects cold
+on the new owner. Mixed peer-list rollouts are a correctness hazard because two
+peers may temporarily believe they own the same object; avoid them.
+
+If the owner peer is unavailable, remote-owner object requests fail closed
+instead of being served by the wrong local cache. Restarting the owner with an
+empty cache is safe because upstream storage remains the source of truth.
 
 If the cache instance fails, it can be restarted with an empty cache. No object
 data is lost because upstream S3-compatible storage remains the source of truth.
@@ -222,7 +270,9 @@ against cached metadata so responses match upstream behavior.
 
 Successful writes immediately invalidate cached data for affected objects.
 
-COPY invalidates the destination object only.
+COPY invalidates the destination object only. In peer mode, COPY requests route
+by the destination `bucket/key`; cached pages for the source object are not
+affected.
 
 ## Storage
 
@@ -235,9 +285,13 @@ Cached object pages are stored on local disk.
 A local SQLite index tracks cached pages and object metadata. It is part of the
 disposable cache, not a source of truth.
 
+The cache automatically prunes old object metadata that no longer has cached
+pages, keeps invalidation generation fences for a retention window, and
+periodically checkpoints SQLite WAL state.
+
 The cache is disposable.
 
-Deleting the cache directory should never result in data loss.
+Deleting the cache data or metadata paths should never result in data loss.
 
 ## Consistency
 
@@ -300,6 +354,10 @@ rate, and upstream latency.
 
 Most storage is consumed by cached page files.
 
+Cached page bytes are bounded by `cache.max_size`. SQLite metadata is maintained
+automatically with conservative background cleanup defaults, so long-running
+deployments should not need routine manual pruning.
+
 ## Configuration
 
 ```yaml
@@ -307,23 +365,88 @@ listen: ":8080"
 
 upstream:
   endpoint: http://rustfs:9000
+  region: us-east-1
+  access_key: simple-s3-cache
+  secret_key: change-me
+  response_header_timeout: 30s
 
 cache:
-  path: /cache
+  cache_path: /cache/objects
+  meta_path: /cache/meta
   max_size: 1TB
   page_size: 4MB
+  metadata_gc_interval: 1h
+  metadata_max_age: 24h
+  metadata_gc_batch_size: 512
+  sqlite_checkpoint_interval: 6h
+
+http:
+  read_header_timeout: 5s
+  read_timeout: 10m
+  write_timeout: 10m
+  idle_timeout: 2m
+
+upload:
+  spool_path: /cache/spool
+  max_spool_size: 10GB
+
+peer:
+  mode: single
+  forward_timeout: 10m
 ```
+
+`cache_path` stores cached page files. `meta_path` stores the SQLite cache
+index. Both are disposable cache state, but they may be placed on separate
+volumes when that is operationally useful.
 
 Page size is the primary tuning knob. Larger pages reduce metadata overhead but
 amplify over-fetch on small scattered reads (a tiny Parquet footer still pulls a
 whole page). The 4 MB default favors the analytical and random-access workloads
 this cache targets.
 
+Metadata cleanup is enabled by default. `metadata_gc_interval` controls how
+often old page-less metadata is considered for deletion, `metadata_max_age`
+keeps recently observed metadata and invalidation fences around long enough to
+avoid racing in-flight work, and `sqlite_checkpoint_interval` bounds WAL growth
+without requiring routine online `VACUUM`.
+
 Production deployments use one global `page_size` and one global `max_size` for
 all buckets. Metrics and structured logs must expose enough data — read
 amplification, hit rate, evictions, and cached bytes, broken down by bucket — to
 guide steady-state tuning from evidence rather than guesses. See the Tuning
 strategy and Observability sections in [PLAN.md](PLAN.md).
+
+`upstream.response_header_timeout` bounds how long the proxy waits for upstream
+S3-compatible storage to begin responding after a request is sent. The proxy
+also configures upstream connection, TLS handshake, idle connection, and
+expect-continue timeouts internally. `http.*_timeout` values bound client-facing
+server connections; tune `read_timeout` and `write_timeout` high enough for the
+largest expected uploads and downloads.
+
+AWS SigV4 streaming uploads (`Content-Encoding: aws-chunked`) are decoded and
+streamed directly upstream when `X-Amz-Decoded-Content-Length` is present. Other
+unknown-length uploads are spooled to `upload.spool_path` before forwarding so
+the proxy can re-sign them with a fixed content length. `upload.max_spool_size`
+bounds that fallback disk usage.
+
+`peer.mode` defaults to `single`. To enable peer mode, set `peer.mode: peer`,
+configure `peer.local_id`, and provide a complete static peer list:
+
+```yaml
+peer:
+  mode: peer
+  local_id: simple-s3-cache-0
+  forward_timeout: 10m
+  peers:
+    - id: simple-s3-cache-0
+      url: http://simple-s3-cache-0.simple-s3-cache-peers:8080
+    - id: simple-s3-cache-1
+      url: http://simple-s3-cache-1.simple-s3-cache-peers:8080
+```
+
+Every peer must use the same `peers` list and a unique `local_id` matching its
+StatefulSet ordinal or other stable identity. Peer forwarding is internal HTTP;
+protect it with Kubernetes networking controls appropriate for the cluster.
 
 ## Observability
 
@@ -339,6 +462,13 @@ Key signals include page hit/miss rate, bytes from cache vs upstream, bytes
 fetched to fill cache, evictions, and cached bytes — globally and **per bucket**.
 Full counter, gauge, histogram, and log-field requirements are in
 [PLAN.md](PLAN.md#observability).
+
+Peer mode also emits structured log fields for `peer_mode`, `peer_local_id`,
+`peer_owner_id`, `peer_forwarded`, and `peer_forward_duration_ms`. Metrics expose
+owner decisions by `bucket`, `decision`, and `owner_id`; forwarded requests by
+`bucket`, `peer_id`, `method`, and `status_class`; forwarding failures by
+`bucket`, `peer_id`, and bounded `reason`; peer response bytes; and peer
+forwarding duration.
 
 ## Why?
 

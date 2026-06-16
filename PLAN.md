@@ -126,13 +126,13 @@ the request must be passed through. Serving a `200` where upstream would return
 Objects are cached as fixed-size pages rather than complete files. Only
 requested pages are stored locally.
 
-Cached pages are stored under the configured cache directory. A cached object
+Cached pages are stored under the configured `cache.cache_path`. A cached object
 may be fully cached, partially cached, or not cached.
 
-The cache also keeps a local SQLite index at the root of the cache directory.
-SQLite is part of the disposable cache, not a source of truth.
+The cache also keeps a local SQLite index under the configured
+`cache.meta_path`. SQLite is part of the disposable cache, not a source of truth.
 
-The cache directory contains:
+The cache paths contain:
 
 - zero or more immutable page files
 - `cache.db`, which tracks objects, pages, headers, sizes, and access times
@@ -141,7 +141,8 @@ Example:
 
 ```text
 /cache/
-  cache.db
+  meta/
+    cache.db
   objects/
     ab/cd/object-hash/
       page-000000
@@ -225,7 +226,8 @@ upstream:
   path_style: true
 
 cache:
-  path: /cache
+  cache_path: /cache/objects
+  meta_path: /cache/meta
   max_size: 1TB
   page_size: 4MB
 ```
@@ -663,7 +665,7 @@ in `HAZARDS.md`.
 Cache storage failure must not turn a readable upstream object into a failed
 client read unless the upstream read itself failed.
 
-If a page cannot be stored because the cache directory is full, SQLite is
+If a page cannot be stored because the cache data path is full, SQLite is
 locked, permissions changed, or a disk write fails:
 
 - continue streaming the upstream response to the client when possible
@@ -746,8 +748,8 @@ request contract.
 
 ### Storage And Failure Behavior
 
-- Cache state is disposable: deleting the cache directory never loses upstream
-  data.
+- Cache state is disposable: deleting the cache data or metadata paths never
+  loses upstream data.
 - Missing or corrupt `cache.db` starts cleanly with an empty cache.
 - Missing page files, orphaned page files, interrupted downloads, and failed
   cache writes are tolerated.
@@ -828,6 +830,10 @@ Global totals, plus the same counters **labeled by `bucket`** wherever cheap:
 - bytes served from upstream
 - **bytes fetched upstream to fill cache** (on misses; may exceed client
   requested bytes because whole pages are pulled)
+- peer owner decisions by `bucket`, `decision`, and `owner_id`
+- peer forwarded requests by `bucket`, `peer_id`, `method`, and `status_class`
+- peer forwarding failures by `bucket`, `peer_id`, and bounded `reason`
+- peer response bytes and peer forwarding duration by bounded peer labels
 
 Derived ratios worth exposing or computing in dashboards:
 
@@ -943,7 +949,7 @@ Cover:
 Cover:
 
 - interrupted upstream download does not create visible pages
-- cache directory deletion does not lose upstream data
+- cache data or metadata path deletion does not lose upstream data
 - missing or corrupt `cache.db` starts with an empty cache
 - stale SQLite page rows are ignored and removed
 - orphaned page files are ignored
@@ -958,64 +964,57 @@ Cover:
 
 ## Milestones
 
-### Milestone 1: Skeleton
+- [x] **Milestone 1: Skeleton**
+  - [x] initialize Go module
+  - [x] add config loading
+  - [x] start HTTP server
+  - [x] add health endpoint
+  - [x] add basic request logging
 
-- initialize Go module
-- add config loading
-- start HTTP server
-- add health endpoint
-- add basic request logging
+- [x] **Milestone 2: Pass-Through Proxy**
+  - [x] parse path-style S3 requests
+  - [x] classify requests; pass through GET subresources and `?versionId`
+  - [x] sign upstream requests
+  - [x] forward all methods to upstream, including streaming/chunked PUT bodies
+  - [x] preserve response status, headers, and bodies
+  - [x] add integration test with local S3-compatible backend
 
-### Milestone 2: Pass-Through Proxy
+- [x] **Milestone 3: Page Cache Core**
+  - [x] add SQLite cache index
+  - [x] add object rows and page files
+  - [x] add page inventory tracking through SQLite
+  - [x] atomically store fetched pages
+  - [x] ignore incomplete or corrupt pages
+  - [x] coalesce concurrent fetches for the same missing page
+  - [x] fetch pages with `If-Match` and fence stores with a per-object epoch
 
-- parse path-style S3 requests
-- classify requests; pass through GET subresources and `?versionId`
-- sign upstream requests
-- forward all methods to upstream, including streaming/chunked PUT bodies
-- preserve response status, headers, and bodies
-- add integration test with local S3-compatible backend
+- [x] **Milestone 4: GET, HEAD, and Single Range Cache**
+  - [x] serve `HEAD` from cached metadata
+  - [x] serve full-object `GET` through the page cache
+  - [x] serve single range requests through the page cache
+  - [x] honor client conditional requests (`304` from cached metadata)
+  - [x] fetch and store missing pages from upstream
+  - [x] pass through multi-range requests
+  - [x] preserve transparent S3 response headers and status codes
 
-### Milestone 3: Page Cache Core
+- [x] **Milestone 5: Invalidation**
+  - [x] invalidate cached object after successful `PUT`
+  - [x] invalidate cached object after successful `DELETE`
+  - [x] invalidate destination object after successful `COPY`
+  - [x] invalidate after successful multipart completion
 
-- add SQLite cache index
-- add object rows and page files
-- add page inventory tracking through SQLite
-- atomically store fetched pages
-- ignore incomplete or corrupt pages
-- coalesce concurrent fetches for the same missing page
-- fetch pages with `If-Match` and fence stores with a per-object epoch
+- [x] **Milestone 6: Size Limit and Eviction**
+  - [x] track cache size
+  - [x] enforce `max_size`
+  - [x] implement background LRU eviction, out of the request hot path
+  - [x] tolerate missing or corrupt cache files
 
-### Milestone 4: GET, HEAD, and Single Range Cache
-
-- serve `HEAD` from cached metadata
-- serve full-object `GET` through the page cache
-- serve single range requests through the page cache
-- honor client conditional requests (`304` from cached metadata)
-- fetch and store missing pages from upstream
-- pass through multi-range requests
-- preserve transparent S3 response headers and status codes
-
-### Milestone 5: Invalidation
-
-- invalidate cached object after successful `PUT`
-- invalidate cached object after successful `DELETE`
-- invalidate destination object after successful `COPY`
-- invalidate after successful multipart completion
-
-### Milestone 6: Size Limit and Eviction
-
-- track cache size
-- enforce `max_size`
-- implement background LRU eviction, out of the request hot path
-- tolerate missing or corrupt cache files
-
-### Milestone 7: Operations Polish
-
-- add metrics endpoint with bucket-labeled counters and read-amplification data
-- add structured logs with bytes requested and bytes fetched upstream
-- add graceful shutdown
-- document deployment assumptions
-- document known limitations and production tuning strategy
+- [x] **Milestone 7: Operations Polish**
+  - [x] add metrics endpoint with bucket-labeled counters and read-amplification data
+  - [x] add structured logs with bytes requested and bytes fetched upstream
+  - [x] add graceful shutdown
+  - [x] document deployment assumptions
+  - [x] document known limitations and production tuning strategy
 
 ## Implementation Boundaries
 

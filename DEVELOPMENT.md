@@ -22,3 +22,19 @@ Keep the project boring, small, and test-driven.
 * Run `gofmt`, `go test ./...`, and relevant integration tests before calling a
   change done.
 
+## Testing
+
+Use two levels of tests:
+
+* Unit tests live with the Go packages and run with `go test ./...`.
+* End-to-end tests live under `e2e/`, use real S3-compatible credentials, and
+  run as a separate command:
+
+```bash
+cd e2e
+uv run pytest
+```
+
+Keep real credentials in local environment variables or `.env`. Do not commit
+real `.env` files.
+

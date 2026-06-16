@@ -181,19 +181,28 @@ test. Until then, treat it as load-bearing.
 
 ### H11. Multi-instance staleness
 
-* **Risk:** Multiple cache instances do not coordinate. A write through one
-  instance leaves others stale.
-* **Why it matters:** Not part of the production scope, but easy to deploy
-  incorrectly.
-* **Mitigation:** Single active instance only. Document the deployment
-  constraint prominently.
-* **Watch:** Any deployment that puts more than one replica behind the LB.
+* **Risk:** Multiple cache instances that do not agree on object ownership can
+  serve stale data. A write through one owner while another instance still
+  believes it owns the same object leaves the second cache stale.
+* **Why it matters:** Peer mode is correct only when all object requests for a
+  given `bucket/key` converge on exactly one owner. Mixed peer lists, ordinary
+  replicas outside peer mode, or forwarding loops can silently break that
+  invariant.
+* **Mitigation:** `single` mode remains the default. In `peer` mode, all object
+  requests route by destination `bucket/key` using the static peer list before
+  any local cache state is touched. Forwarded requests carry peer coordination
+  headers and fail closed with `502` if they land on a non-owner. Tests cover
+  remote-owner forwarding, local-owner handling, forwarded write invalidation,
+  and peer routing mismatch handling.
+* **Watch:** Mixed peer-list rollouts, pods with stale config, peer forwarding
+  failures, or any code path that touches local object cache state before the
+  owner check.
 
 ### H13. Disk-full or cache write failure breaks reads
 
-* **Risk:** Cache page storage fails because the cache directory is full, SQLite
-  is locked, permissions changed, or disk writes fail, and the client request is
-  failed even though upstream object bytes were readable.
+* **Risk:** Cache page storage fails because the cache data path is full,
+  SQLite is locked, permissions changed, or disk writes fail, and the client
+  request is failed even though upstream object bytes were readable.
 * **Why it matters:** The disposable cache becomes a source of user-visible
   read failures.
 * **Mitigation:** Continue serving the upstream response when possible, skip
