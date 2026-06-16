@@ -40,6 +40,13 @@ func TestProxyForwardsPassThroughRequests(t *testing.T) {
 			wantStatus: http.StatusAccepted,
 		},
 		{
+			name:       "escaped path",
+			method:     http.MethodGet,
+			path:       "/bucket/path%20with%20spaces/plus+and%2525.txt",
+			rawQuery:   "tagging=",
+			wantStatus: http.StatusAccepted,
+		},
+		{
 			name:       "versioned get",
 			method:     http.MethodGet,
 			path:       "/bucket/key",
@@ -232,6 +239,7 @@ func TestProxyCachesSinglePageRangeRead(t *testing.T) {
 	var upstreamRequests []string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		upstreamRequests = append(upstreamRequests, r.Method+" "+r.Header.Get("Range"))
+		w.Header().Set("X-Amz-Checksum-Crc32", "full-object-checksum")
 		writeObjectResponse(t, w, r, body, `"etag-range"`)
 	}))
 	defer upstream.Close()
@@ -252,6 +260,9 @@ func TestProxyCachesSinglePageRangeRead(t *testing.T) {
 		}
 		if got := rec.Header().Get("Content-Range"); got != "bytes 1-3/12" {
 			t.Fatalf("GET range %d Content-Range = %q", i+1, got)
+		}
+		if got := rec.Header().Get("X-Amz-Checksum-Crc32"); got != "" {
+			t.Fatalf("GET range %d X-Amz-Checksum-Crc32 = %q, want empty", i+1, got)
 		}
 	}
 

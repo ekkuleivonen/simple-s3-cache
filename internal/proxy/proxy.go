@@ -696,12 +696,14 @@ func (p *Proxy) sign(req *http.Request) error {
 	if err != nil {
 		return err
 	}
-	return p.signer.SignHTTP(req.Context(), credentials, req, unsignedPayload, "s3", p.region, time.Now())
+	return p.signer.SignHTTP(req.Context(), credentials, req, unsignedPayload, "s3", p.region, time.Now(), func(options *v4.SignerOptions) {
+		options.DisableURIPathEscaping = true
+	})
 }
 
 func (p *Proxy) upstreamURL(r *http.Request) url.URL {
 	upstreamURL := *p.upstreamEndpoint
-	upstreamURL.Path = joinURLPath(p.upstreamEndpoint.Path, r.URL.EscapedPath())
+	upstreamURL.Path = joinURLPath(p.upstreamEndpoint.Path, r.URL.Path)
 	upstreamURL.RawPath = ""
 	upstreamURL.RawQuery = r.URL.RawQuery
 	return upstreamURL
@@ -736,6 +738,15 @@ func writeCachedObjectHeaders(dst http.Header, obj cache.Object, rangeResponse b
 	dst.Set("Content-Length", strconv.FormatInt(obj.Size, 10))
 	if rangeResponse {
 		dst.Del("Content-Range")
+		dropRangeResponseHeaders(dst)
+	}
+}
+
+func dropRangeResponseHeaders(header http.Header) {
+	for key := range header {
+		if strings.HasPrefix(strings.ToLower(key), "x-amz-checksum-") {
+			header.Del(key)
+		}
 	}
 }
 

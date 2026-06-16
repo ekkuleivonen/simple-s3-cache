@@ -2,7 +2,9 @@ from __future__ import annotations
 
 # pyright: reportMissingImports=false
 
+import http.client
 import os
+import shutil
 import socket
 import subprocess
 import time
@@ -35,6 +37,60 @@ class E2EConfig:
     access_key_id: str | None = field(repr=False)
     secret_access_key: str | None = field(repr=False)
     session_token: str | None = field(repr=False)
+
+
+@dataclass
+class CacheProxy:
+    endpoint: str
+    config_path: Path
+    cache_path: Path
+    meta_path: Path
+    e2e_config: E2EConfig
+    process: subprocess.Popen[str] | None = field(default=None, init=False, repr=False)
+
+    def start(self) -> None:
+        if self.process is not None and self.process.poll() is None:
+            return
+
+        self.process = subprocess.Popen(
+            [
+                "go",
+                "run",
+                "-ldflags=-linkmode=external",
+                "./cmd/simple-s3-cache",
+                "-config",
+                str(self.config_path),
+            ],
+            cwd=REPO_ROOT,
+            env=_proxy_env(self.e2e_config),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        _wait_for_healthz(self.endpoint, self.process)
+
+    def stop(self) -> None:
+        if self.process is None:
+            return
+
+        self.process.terminate()
+        try:
+            self.process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            self.process.kill()
+            self.process.wait(timeout=10)
+        finally:
+            self.process = None
+
+    def restart(self) -> None:
+        self.stop()
+        self.start()
+
+    def delete_cache_state_and_restart(self) -> None:
+        self.stop()
+        shutil.rmtree(self.cache_path, ignore_errors=True)
+        shutil.rmtree(self.meta_path, ignore_errors=True)
+        self.start()
 
 
 @pytest.fixture(scope="session")
@@ -85,7 +141,7 @@ def s3_client(e2e_config: E2EConfig):
 
 
 @pytest.fixture(scope="session")
-def cache_endpoint(e2e_config: E2EConfig, tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
+def cache_proxy(e2e_config: E2EConfig, tmp_path_factory: pytest.TempPathFactory) -> Iterator[CacheProxy]:
     port = _free_port()
     endpoint = f"http://127.0.0.1:{port}"
     work_dir = tmp_path_factory.mktemp("simple-s3-cache")
@@ -112,32 +168,24 @@ def cache_endpoint(e2e_config: E2EConfig, tmp_path_factory: pytest.TempPathFacto
         encoding="utf-8",
     )
 
-    process = subprocess.Popen(
-        [
-            "go",
-            "run",
-            "-ldflags=-linkmode=external",
-            "./cmd/simple-s3-cache",
-            "-config",
-            str(config_path),
-        ],
-        cwd=REPO_ROOT,
-        env=_proxy_env(e2e_config),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
+    proxy = CacheProxy(
+        endpoint=endpoint,
+        config_path=config_path,
+        cache_path=cache_path,
+        meta_path=meta_path,
+        e2e_config=e2e_config,
     )
 
     try:
-        _wait_for_healthz(endpoint, process)
-        yield endpoint
+        proxy.start()
+        yield proxy
     finally:
-        process.terminate()
-        try:
-            process.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait(timeout=10)
+        proxy.stop()
+
+
+@pytest.fixture(scope="session")
+def cache_endpoint(cache_proxy: CacheProxy) -> str:
+    return cache_proxy.endpoint
 
 
 @pytest.fixture
@@ -213,7 +261,7 @@ def _wait_for_healthz(endpoint: str, process: subprocess.Popen[str]) -> None:
             with urllib.request.urlopen(f"{endpoint}/healthz", timeout=1) as response:
                 if response.status == 200:
                     return
-        except (urllib.error.URLError, TimeoutError) as exc:
+        except (http.client.RemoteDisconnected, urllib.error.URLError, TimeoutError) as exc:
             last_error = exc
 
         time.sleep(0.1)

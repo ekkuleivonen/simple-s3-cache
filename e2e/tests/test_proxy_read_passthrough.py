@@ -24,7 +24,7 @@ def test_proxy_head_full_get_and_range_get(s3_client, cache_s3_client, e2e_confi
     proxy_head = cache_s3_client.head_object(Bucket=e2e_config.bucket, Key=object_key)
     assert proxy_head["ContentLength"] == backend_head["ContentLength"]
     assert proxy_head["ContentType"] == backend_head["ContentType"]
-    assert proxy_head["Metadata"] == backend_head["Metadata"]
+    assert _lower_metadata(proxy_head["Metadata"]) == _lower_metadata(backend_head["Metadata"])
     assert proxy_head["ETag"] == backend_head["ETag"]
 
     backend_full = s3_client.get_object(Bucket=e2e_config.bucket, Key=object_key)
@@ -89,3 +89,7 @@ def test_proxy_forwards_pass_through_requests(s3_client, cache_s3_client, e2e_co
     with pytest.raises(ClientError) as deleted:
         s3_client.head_object(Bucket=e2e_config.bucket, Key=proxy_written_key)
     assert deleted.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+
+
+def _lower_metadata(metadata: dict[str, str]) -> dict[str, str]:
+    return {key.lower(): value for key, value in metadata.items()}
