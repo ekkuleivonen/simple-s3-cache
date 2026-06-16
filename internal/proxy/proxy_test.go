@@ -765,6 +765,11 @@ func TestProxyCachesSinglePageRangeRead(t *testing.T) {
 	defer upstream.Close()
 
 	p := testProxyWithPageSize(t, upstream.URL, 4)
+	var storePageCalls atomic.Int32
+	p.cache = &storePageCountingCache{
+		cacheStore: p.cache,
+		calls:      &storePageCalls,
+	}
 	for i := 0; i < 2; i++ {
 		req := httptest.NewRequest(http.MethodGet, "/bucket/object.bin", nil)
 		req.Header.Set("Range", "bytes=1-3")
@@ -789,6 +794,9 @@ func TestProxyCachesSinglePageRangeRead(t *testing.T) {
 	wantRequests := []string{"HEAD ", "GET bytes=0-3"}
 	if !equalStringSlices(upstreamRequests, wantRequests) {
 		t.Fatalf("upstream requests = %q, want %q", upstreamRequests, wantRequests)
+	}
+	if got := storePageCalls.Load(); got != 0 {
+		t.Fatalf("StorePage() calls = %d, want 0 with direct page writer", got)
 	}
 }
 
@@ -1006,9 +1014,13 @@ func TestProxyStreamsMultiPageFullGetThroughCache(t *testing.T) {
 
 	p := testProxyWithPageSize(t, upstream.URL, 5)
 	var listPagesCalls atomic.Int32
-	p.cache = &listPagesCountingCache{
-		cacheStore: p.cache,
-		calls:      &listPagesCalls,
+	var storePageCalls atomic.Int32
+	p.cache = &storePageCountingCache{
+		cacheStore: &listPagesCountingCache{
+			cacheStore: p.cache,
+			calls:      &listPagesCalls,
+		},
+		calls: &storePageCalls,
 	}
 	for i := 0; i < 2; i++ {
 		req := httptest.NewRequest(http.MethodGet, "/bucket/full.bin", nil)
@@ -1033,6 +1045,9 @@ func TestProxyStreamsMultiPageFullGetThroughCache(t *testing.T) {
 	}
 	if got := listPagesCalls.Load(); got != 0 {
 		t.Fatalf("ListPages() calls = %d, want 0 on full cached path", got)
+	}
+	if got := storePageCalls.Load(); got != 0 {
+		t.Fatalf("StorePage() calls = %d, want 0 with direct page writer", got)
 	}
 	metricsBody := renderProxyMetrics(t, p.metrics)
 	for _, want := range []string{
@@ -2066,6 +2081,16 @@ type listPagesCountingCache struct {
 func (c *listPagesCountingCache) ListPages(ctx context.Context, objectID string) ([]cache.Page, error) {
 	c.calls.Add(1)
 	return c.cacheStore.ListPages(ctx, objectID)
+}
+
+type storePageCountingCache struct {
+	cacheStore
+	calls *atomic.Int32
+}
+
+func (c *storePageCountingCache) StorePage(ctx context.Context, write cache.PageWrite) (cache.Page, error) {
+	c.calls.Add(1)
+	return c.cacheStore.StorePage(ctx, write)
 }
 
 func equalStringSlices(a, b []string) bool {

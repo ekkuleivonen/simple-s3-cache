@@ -108,6 +108,24 @@ type PageWrite struct {
 	Source        io.Reader
 }
 
+type PageWriteOptions struct {
+	ObjectID      string
+	Index         int64
+	ETag          string
+	ExpectedEpoch int64
+}
+
+type PageWriter struct {
+	cache     *Cache
+	options   PageWriteOptions
+	bucket    string
+	tmp       *os.File
+	tmpPath   string
+	finalPath string
+	size      int64
+	done      bool
+}
+
 type pageRef struct {
 	objectID string
 	index    int64
@@ -465,96 +483,145 @@ ORDER BY page_index
 }
 
 func (c *Cache) StorePage(ctx context.Context, write PageWrite) (Page, error) {
-	if write.ObjectID == "" {
-		return Page{}, errors.New("object id is required")
-	}
-	if write.Index < 0 {
-		return Page{}, errors.New("page index must not be negative")
-	}
-	if write.ETag == "" {
-		return Page{}, errors.New("etag is required")
-	}
 	if write.Size < 0 {
 		return Page{}, errors.New("page size must not be negative")
 	}
 	if write.Source == nil {
 		return Page{}, errors.New("page source is required")
 	}
-	if write.Size > c.maxSize {
-		return Page{}, fmt.Errorf("page size %d exceeds cache max size %d", write.Size, c.maxSize)
-	}
-	if err := c.validatePageCommit(ctx, write.ObjectID, write.ETag, write.ExpectedEpoch); err != nil {
-		return Page{}, err
-	}
-	bucket, err := c.pageBucket(ctx, write.ObjectID)
+
+	writer, err := c.BeginPageWrite(ctx, PageWriteOptions{
+		ObjectID:      write.ObjectID,
+		Index:         write.Index,
+		ETag:          write.ETag,
+		ExpectedEpoch: write.ExpectedEpoch,
+	})
 	if err != nil {
 		return Page{}, err
 	}
-	if maxSize := c.maxSizeForBucket(bucket); maxSize > 0 && write.Size > maxSize {
-		return Page{}, fmt.Errorf("page size %d exceeds cache max size %d for bucket %q", write.Size, maxSize, bucket)
+	defer writer.Abort()
+
+	written, err := io.Copy(writer, write.Source)
+	if err != nil {
+		return Page{}, fmt.Errorf("write temp page: %w", err)
+	}
+	if written != write.Size {
+		return Page{}, fmt.Errorf("write temp page: got %d bytes, want %d", written, write.Size)
+	}
+	return writer.Commit(ctx)
+}
+
+func (c *Cache) BeginPageWrite(ctx context.Context, opts PageWriteOptions) (*PageWriter, error) {
+	if opts.ObjectID == "" {
+		return nil, errors.New("object id is required")
+	}
+	if opts.Index < 0 {
+		return nil, errors.New("page index must not be negative")
+	}
+	if opts.ETag == "" {
+		return nil, errors.New("etag is required")
+	}
+	if err := c.validatePageCommit(ctx, opts.ObjectID, opts.ETag, opts.ExpectedEpoch); err != nil {
+		return nil, err
+	}
+	bucket, err := c.pageBucket(ctx, opts.ObjectID)
+	if err != nil {
+		return nil, err
 	}
 	if storePageAfterValidationHook != nil {
 		storePageAfterValidationHook()
 	}
 
-	relPath := c.pagePathForVersion(write.ObjectID, write.Index, write.ETag, write.ExpectedEpoch)
+	relPath := c.pagePathForVersion(opts.ObjectID, opts.Index, opts.ETag, opts.ExpectedEpoch)
 	absPath := filepath.Join(c.cacheRoot, relPath)
 	dir := filepath.Dir(absPath)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return Page{}, fmt.Errorf("create page directory: %w", err)
+		return nil, fmt.Errorf("create page directory: %w", err)
 	}
 
-	tmp, err := os.CreateTemp(dir, fmt.Sprintf(".page-%012d-*.tmp", write.Index))
+	tmp, err := os.CreateTemp(dir, fmt.Sprintf(".page-%012d-*.tmp", opts.Index))
 	if err != nil {
-		return Page{}, fmt.Errorf("create temp page: %w", err)
+		return nil, fmt.Errorf("create temp page: %w", err)
 	}
-	tmpPath := tmp.Name()
-	committed := false
-	defer func() {
-		if !committed {
-			_ = os.Remove(tmpPath)
-		}
-	}()
 
-	written, err := io.Copy(tmp, write.Source)
-	if err != nil {
-		_ = tmp.Close()
-		return Page{}, fmt.Errorf("write temp page: %w", err)
+	return &PageWriter{
+		cache:     c,
+		options:   opts,
+		bucket:    bucket,
+		tmp:       tmp,
+		tmpPath:   tmp.Name(),
+		finalPath: absPath,
+	}, nil
+}
+
+func (w *PageWriter) Write(data []byte) (int, error) {
+	if w.done {
+		return 0, errors.New("page writer is closed")
 	}
-	if written != write.Size {
-		_ = tmp.Close()
-		return Page{}, fmt.Errorf("write temp page: got %d bytes, want %d", written, write.Size)
+	if int64(len(data)) > w.cache.maxSize-w.size {
+		return 0, fmt.Errorf("page size exceeds cache max size %d", w.cache.maxSize)
 	}
-	if err := tmp.Sync(); err != nil {
-		_ = tmp.Close()
+	if maxSize := w.cache.maxSizeForBucket(w.bucket); maxSize > 0 && int64(len(data)) > maxSize-w.size {
+		return 0, fmt.Errorf("page size exceeds cache max size %d for bucket %q", maxSize, w.bucket)
+	}
+	n, err := w.tmp.Write(data)
+	w.size += int64(n)
+	return n, err
+}
+
+func (w *PageWriter) Size() int64 {
+	return w.size
+}
+
+func (w *PageWriter) Commit(ctx context.Context) (Page, error) {
+	if w.done {
+		return Page{}, errors.New("page writer is closed")
+	}
+	if err := w.tmp.Sync(); err != nil {
+		_ = w.Abort()
 		return Page{}, fmt.Errorf("sync temp page: %w", err)
 	}
-	if err := tmp.Close(); err != nil {
+	if err := w.tmp.Close(); err != nil {
+		_ = os.Remove(w.tmpPath)
+		w.done = true
 		return Page{}, fmt.Errorf("close temp page: %w", err)
 	}
-	if err := os.Rename(tmpPath, absPath); err != nil {
+	w.done = true
+	if err := os.Rename(w.tmpPath, w.finalPath); err != nil {
+		_ = os.Remove(w.tmpPath)
 		return Page{}, fmt.Errorf("commit page file: %w", err)
 	}
-	committed = true
 
 	page := Page{
-		ObjectID: write.ObjectID,
-		Index:    write.Index,
-		ETag:     write.ETag,
-		Epoch:    write.ExpectedEpoch,
-		Size:     write.Size,
-		Path:     relPath,
+		ObjectID: w.options.ObjectID,
+		Index:    w.options.Index,
+		ETag:     w.options.ETag,
+		Epoch:    w.options.ExpectedEpoch,
+		Size:     w.size,
+		Path:     w.cache.pagePathForVersion(w.options.ObjectID, w.options.Index, w.options.ETag, w.options.ExpectedEpoch),
 	}
-	bucket, previousSize, err := c.putPageIfCurrent(ctx, page, write.ExpectedEpoch)
+	bucket, previousSize, err := w.cache.putPageIfCurrent(ctx, page, w.options.ExpectedEpoch)
 	if err != nil {
-		_ = os.Remove(absPath)
+		_ = os.Remove(w.finalPath)
 		return Page{}, err
 	}
-	c.adjustCacheSize(bucket, page.Size-previousSize)
-	c.requestMetricsRefresh()
-	c.requestEviction()
+	w.cache.adjustCacheSize(bucket, page.Size-previousSize)
+	w.cache.requestMetricsRefresh()
+	w.cache.requestEviction()
 
 	return page, nil
+}
+
+func (w *PageWriter) Abort() error {
+	if w.done {
+		return nil
+	}
+	w.done = true
+	err := w.tmp.Close()
+	if removeErr := os.Remove(w.tmpPath); err == nil {
+		err = removeErr
+	}
+	return err
 }
 
 func (c *Cache) OpenPage(ctx context.Context, objectID string, index int64, expectedETag string, expectedEpoch int64) (io.ReadCloser, bool, error) {

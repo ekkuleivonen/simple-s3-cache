@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -142,6 +143,130 @@ func TestStorePageWritesFileAtomicallyThenCommitsRow(t *testing.T) {
 	}
 	if len(matches) != 0 {
 		t.Fatalf("temporary files left behind: %v", matches)
+	}
+}
+
+func TestPageWriterCommitsPageFromCacheDirectoryTempFile(t *testing.T) {
+	ctx := context.Background()
+	c := openTestCache(t)
+	obj := putTestObject(t, c, "bucket", "direct-writer.bin")
+
+	writer, err := c.BeginPageWrite(ctx, PageWriteOptions{
+		ObjectID:      obj.ID,
+		Index:         0,
+		ETag:          obj.ETag,
+		ExpectedEpoch: obj.Epoch,
+	})
+	if err != nil {
+		t.Fatalf("BeginPageWrite() error = %v", err)
+	}
+	if !strings.HasPrefix(writer.tmpPath, filepath.Join(c.cacheRoot, "objects")+string(os.PathSeparator)) {
+		t.Fatalf("temp path = %q, want under cache objects root %q", writer.tmpPath, filepath.Join(c.cacheRoot, "objects"))
+	}
+	if _, err := writer.Write([]byte("direct cached page")); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+
+	page, err := writer.Commit(ctx)
+	if err != nil {
+		t.Fatalf("Commit() error = %v", err)
+	}
+	if page.Size != int64(len("direct cached page")) {
+		t.Fatalf("page size = %d, want %d", page.Size, len("direct cached page"))
+	}
+	if _, err := os.Stat(writer.tmpPath); !os.IsNotExist(err) {
+		t.Fatalf("temp file stat error = %v, want not exist", err)
+	}
+
+	body, ok, err := c.OpenPage(ctx, obj.ID, 0, obj.ETag, obj.Epoch)
+	if err != nil {
+		t.Fatalf("OpenPage() error = %v", err)
+	}
+	if !ok {
+		t.Fatal("OpenPage() ok = false, want true")
+	}
+	defer body.Close()
+	got, err := io.ReadAll(body)
+	if err != nil {
+		t.Fatalf("ReadAll(page) error = %v", err)
+	}
+	if !bytes.Equal(got, []byte("direct cached page")) {
+		t.Fatalf("page body = %q, want direct cached page", got)
+	}
+}
+
+func TestPageWriterAbortRemovesTempFileWithoutCommittingRow(t *testing.T) {
+	ctx := context.Background()
+	c := openTestCache(t)
+	obj := putTestObject(t, c, "bucket", "abort-writer.bin")
+
+	writer, err := c.BeginPageWrite(ctx, PageWriteOptions{
+		ObjectID:      obj.ID,
+		Index:         0,
+		ETag:          obj.ETag,
+		ExpectedEpoch: obj.Epoch,
+	})
+	if err != nil {
+		t.Fatalf("BeginPageWrite() error = %v", err)
+	}
+	if _, err := writer.Write([]byte("partial page")); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+	tmpPath := writer.tmpPath
+	if err := writer.Abort(); err != nil {
+		t.Fatalf("Abort() error = %v", err)
+	}
+	if _, err := os.Stat(tmpPath); !os.IsNotExist(err) {
+		t.Fatalf("temp file stat error = %v, want not exist", err)
+	}
+	body, ok, err := c.OpenPage(ctx, obj.ID, 0, obj.ETag, obj.Epoch)
+	if err != nil {
+		t.Fatalf("OpenPage() error = %v", err)
+	}
+	if ok {
+		body.Close()
+		t.Fatal("OpenPage() ok = true, want false")
+	}
+}
+
+func TestPageWriterCommitRejectsStaleObjectAndRemovesFinalFile(t *testing.T) {
+	ctx := context.Background()
+	c := openTestCache(t)
+	oldObj := putTestObject(t, c, "bucket", "stale-writer.bin")
+
+	writer, err := c.BeginPageWrite(ctx, PageWriteOptions{
+		ObjectID:      oldObj.ID,
+		Index:         0,
+		ETag:          oldObj.ETag,
+		ExpectedEpoch: oldObj.Epoch,
+	})
+	if err != nil {
+		t.Fatalf("BeginPageWrite() error = %v", err)
+	}
+	if _, err := writer.Write([]byte("stale page")); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+	finalPath := writer.finalPath
+
+	if err := c.DeleteObject(ctx, "bucket", "stale-writer.bin"); err != nil {
+		t.Fatalf("DeleteObject() error = %v", err)
+	}
+	if _, err := c.PutObject(ctx, ObjectMetadata{
+		Bucket:   "bucket",
+		Key:      "stale-writer.bin",
+		ETag:     `"etag-2"`,
+		Size:     1024,
+		PageSize: 128,
+		Headers:  http.Header{"Content-Type": []string{"application/octet-stream"}},
+	}); err != nil {
+		t.Fatalf("PutObject(new) error = %v", err)
+	}
+
+	if _, err := writer.Commit(ctx); err == nil {
+		t.Fatal("Commit(stale) error = nil, want stale epoch error")
+	}
+	if _, err := os.Stat(finalPath); !os.IsNotExist(err) {
+		t.Fatalf("final file stat error = %v, want not exist", err)
 	}
 }
 

@@ -63,6 +63,7 @@ type cacheStore interface {
 	GetObject(context.Context, string, string) (cache.Object, bool, error)
 	DeleteObject(context.Context, string, string) error
 	StorePage(context.Context, cache.PageWrite) (cache.Page, error)
+	BeginPageWrite(context.Context, cache.PageWriteOptions) (*cache.PageWriter, error)
 	ListPages(context.Context, string) ([]cache.Page, error)
 	OpenPage(context.Context, string, int64, string, int64) (io.ReadCloser, bool, error)
 	Close() error
@@ -1237,11 +1238,12 @@ func (p *Proxy) serveColdFullObject(w http.ResponseWriter, r *http.Request, targ
 func (p *Proxy) streamColdFullObject(w http.ResponseWriter, ctx context.Context, body io.Reader, target s3request.Target, obj cache.Object, stats *requestStats) (int64, error) {
 	var total int64
 	pageIndex := int64(0)
-	pageBuffer, err := newTempPageBuffer()
-	if err != nil {
-		return 0, err
-	}
-	defer pageBuffer.Close()
+	var pageWriter *cache.PageWriter
+	defer func() {
+		if pageWriter != nil {
+			_ = pageWriter.Abort()
+		}
+	}()
 	buf := make([]byte, 32*1024)
 
 	for {
@@ -1258,7 +1260,7 @@ func (p *Proxy) streamColdFullObject(w http.ResponseWriter, ctx context.Context,
 			}
 			stats.bytesFetchedUpstream += int64(n)
 			var err error
-			pageIndex, err = p.bufferColdFullPage(ctx, target, obj, pageIndex, pageBuffer, chunk, stats)
+			pageIndex, pageWriter, err = p.bufferColdFullPage(ctx, target, obj, pageIndex, pageWriter, chunk, stats)
 			if err != nil {
 				return total, err
 			}
@@ -1272,8 +1274,8 @@ func (p *Proxy) streamColdFullObject(w http.ResponseWriter, ctx context.Context,
 		}
 	}
 
-	if pageBuffer.Size() > 0 {
-		p.storeColdFullPage(ctx, target, obj, pageIndex, pageBuffer, stats)
+	if pageWriter != nil && pageWriter.Size() > 0 {
+		p.commitCachePageWriter(ctx, target, pageIndex, pageWriter, stats)
 	}
 	if total != obj.Size {
 		abortCommittedResponse(w, total)
@@ -1282,55 +1284,62 @@ func (p *Proxy) streamColdFullObject(w http.ResponseWriter, ctx context.Context,
 	return total, nil
 }
 
-func (p *Proxy) bufferColdFullPage(ctx context.Context, target s3request.Target, obj cache.Object, pageIndex int64, pageBuffer *tempPageBuffer, chunk []byte, stats *requestStats) (int64, error) {
+func (p *Proxy) bufferColdFullPage(ctx context.Context, target s3request.Target, obj cache.Object, pageIndex int64, pageWriter *cache.PageWriter, chunk []byte, stats *requestStats) (int64, *cache.PageWriter, error) {
 	for len(chunk) > 0 {
-		remaining := int(obj.PageSize - pageBuffer.Size())
+		if pageWriter == nil {
+			var err error
+			pageWriter, err = p.beginCachePageWriter(ctx, target, obj, pageIndex, stats)
+			if err != nil {
+				return pageIndex, pageWriter, err
+			}
+		}
+		remaining := int(obj.PageSize - pageWriter.Size())
 		if remaining > len(chunk) {
 			remaining = len(chunk)
 		}
-		if _, err := pageBuffer.Write(chunk[:remaining]); err != nil {
-			return pageIndex, err
+		if _, err := pageWriter.Write(chunk[:remaining]); err != nil {
+			return pageIndex, pageWriter, err
 		}
 		chunk = chunk[remaining:]
-		if pageBuffer.Size() == obj.PageSize {
-			p.storeColdFullPage(ctx, target, obj, pageIndex, pageBuffer, stats)
+		if pageWriter.Size() == obj.PageSize {
+			p.commitCachePageWriter(ctx, target, pageIndex, pageWriter, stats)
 			pageIndex++
-			if err := pageBuffer.Reset(); err != nil {
-				return pageIndex, err
-			}
+			pageWriter = nil
 		}
 	}
-	return pageIndex, nil
+	return pageIndex, pageWriter, nil
 }
 
-func (p *Proxy) storeColdFullPage(ctx context.Context, target s3request.Target, obj cache.Object, pageIndex int64, pageBuffer *tempPageBuffer, stats *requestStats) {
-	if _, err := pageBuffer.Seek(0, io.SeekStart); err != nil {
-		p.logger.WarnContext(ctx, "cache page store failed",
-			slog.String("bucket", target.Bucket),
-			slog.String("key", target.Key),
-			slog.Int64("page_index", pageIndex),
-			slog.String("error", err.Error()),
-		)
-		return
-	}
-	if _, err := p.cache.StorePage(ctx, cache.PageWrite{
+func (p *Proxy) beginCachePageWriter(ctx context.Context, target s3request.Target, obj cache.Object, pageIndex int64, stats *requestStats) (*cache.PageWriter, error) {
+	writer, err := p.cache.BeginPageWrite(ctx, cache.PageWriteOptions{
 		ObjectID:      obj.ID,
 		Index:         pageIndex,
 		ETag:          obj.ETag,
 		ExpectedEpoch: obj.Epoch,
-		Size:          pageBuffer.Size(),
-		Source:        pageBuffer,
-	}); err != nil {
-		if p.metrics != nil {
-			p.metrics.RecordCacheWriteFailure(target.Bucket)
-		}
-		p.logger.WarnContext(ctx, "cache page store failed",
-			slog.String("bucket", target.Bucket),
-			slog.String("key", target.Key),
-			slog.Int64("page_index", pageIndex),
-			slog.String("error", err.Error()),
-		)
+	})
+	if err != nil {
+		p.recordCacheWriteFailure(ctx, target, pageIndex, err, stats)
+		return nil, err
 	}
+	return writer, nil
+}
+
+func (p *Proxy) commitCachePageWriter(ctx context.Context, target s3request.Target, pageIndex int64, writer *cache.PageWriter, stats *requestStats) {
+	if _, err := writer.Commit(ctx); err != nil {
+		p.recordCacheWriteFailure(ctx, target, pageIndex, err, stats)
+	}
+}
+
+func (p *Proxy) recordCacheWriteFailure(ctx context.Context, target s3request.Target, pageIndex int64, err error, _ *requestStats) {
+	if p.metrics != nil {
+		p.metrics.RecordCacheWriteFailure(target.Bucket)
+	}
+	p.logger.WarnContext(ctx, "cache page store failed",
+		slog.String("bucket", target.Bucket),
+		slog.String("key", target.Key),
+		slog.Int64("page_index", pageIndex),
+		slog.String("error", err.Error()),
+	)
 }
 
 func (p *Proxy) ensureObjectMetadata(ctx context.Context, r *http.Request, target s3request.Target, stats *requestStats) (cache.Object, bool, error) {
@@ -1658,18 +1667,17 @@ func (p *Proxy) fetchAndStorePage(ctx context.Context, r *http.Request, target s
 		p.recordUpstreamFailure(target.Bucket, "fill")
 		return nil, fmt.Errorf("fetch page %d: upstream status %d", index, resp.StatusCode)
 	}
-	tmp, size, err := copyPageResponseToTemp(resp.Body, stream)
+	writer, err := p.beginCachePageWriter(ctx, target, obj, index, stats)
 	if err != nil {
 		stats.upstreamDuration += time.Since(start)
 		return nil, err
 	}
-	cleanupTemp := true
-	defer func() {
-		if cleanupTemp {
-			_ = tmp.Close()
-			_ = os.Remove(tmp.Name())
-		}
-	}()
+	defer writer.Abort()
+	size, err := copyPageResponseToWriter(resp.Body, writer, stream)
+	if err != nil {
+		stats.upstreamDuration += time.Since(start)
+		return nil, err
+	}
 	stats.upstreamDuration += time.Since(start)
 	if size != bounds.End-bounds.Start+1 {
 		return nil, fmt.Errorf("fetch page %d: got %d bytes, want %d", index, size, bounds.End-bounds.Start+1)
@@ -1680,97 +1688,22 @@ func (p *Proxy) fetchAndStorePage(ctx context.Context, r *http.Request, target s
 		p.metrics.ObserveUpstreamDuration(target.Bucket, "fill", time.Since(start))
 	}
 
-	if _, err := tmp.Seek(0, io.SeekStart); err != nil {
+	if _, err := writer.Commit(ctx); err != nil {
+		p.recordCacheWriteFailure(ctx, target, index, err, stats)
 		return nil, err
 	}
-	if _, err := p.cache.StorePage(ctx, cache.PageWrite{
-		ObjectID:      obj.ID,
-		Index:         index,
-		ETag:          obj.ETag,
-		ExpectedEpoch: obj.Epoch,
-		Size:          size,
-		Source:        tmp,
-	}); err != nil {
-		if p.metrics != nil {
-			p.metrics.RecordCacheWriteFailure(target.Bucket)
-		}
-		p.logger.WarnContext(ctx, "cache page store failed",
-			slog.String("bucket", target.Bucket),
-			slog.String("key", target.Key),
-			slog.Int64("page_index", index),
-			slog.String("error", err.Error()),
-		)
+
+	if stream != nil {
+		return nil, nil
 	}
-
-	if _, err := tmp.Seek(0, io.SeekStart); err != nil {
-		return nil, err
-	}
-	cleanupTemp = false
-	return &tempPageReader{File: tmp}, nil
-}
-
-type tempPageReader struct {
-	*os.File
-}
-
-func (r *tempPageReader) Close() error {
-	name := r.Name()
-	err := r.File.Close()
-	if removeErr := os.Remove(name); err == nil {
-		err = removeErr
-	}
-	return err
-}
-
-type tempPageBuffer struct {
-	file *os.File
-	size int64
-}
-
-func newTempPageBuffer() (*tempPageBuffer, error) {
-	file, err := os.CreateTemp("", "simple-s3-cache-page-*")
+	reader, ok, err := p.cache.OpenPage(ctx, obj.ID, index, obj.ETag, obj.Epoch)
 	if err != nil {
 		return nil, err
 	}
-	return &tempPageBuffer{file: file}, nil
-}
-
-func (b *tempPageBuffer) Write(data []byte) (int, error) {
-	n, err := b.file.Write(data)
-	b.size += int64(n)
-	return n, err
-}
-
-func (b *tempPageBuffer) Read(data []byte) (int, error) {
-	return b.file.Read(data)
-}
-
-func (b *tempPageBuffer) Seek(offset int64, whence int) (int64, error) {
-	return b.file.Seek(offset, whence)
-}
-
-func (b *tempPageBuffer) Size() int64 {
-	return b.size
-}
-
-func (b *tempPageBuffer) Reset() error {
-	if err := b.file.Truncate(0); err != nil {
-		return err
+	if !ok {
+		return nil, fmt.Errorf("stored page %d was not readable after commit", index)
 	}
-	if _, err := b.file.Seek(0, io.SeekStart); err != nil {
-		return err
-	}
-	b.size = 0
-	return nil
-}
-
-func (b *tempPageBuffer) Close() error {
-	name := b.file.Name()
-	err := b.file.Close()
-	if removeErr := os.Remove(name); err == nil {
-		err = removeErr
-	}
-	return err
+	return reader, nil
 }
 
 type pageSpanStream struct {
@@ -1813,44 +1746,32 @@ func (s *pageSpanStream) Write(data []byte) (int, error) {
 	return len(data), nil
 }
 
-func copyPageResponseToTemp(src io.Reader, stream *pageSpanStream) (*os.File, int64, error) {
-	tmp, err := os.CreateTemp("", "simple-s3-cache-page-*")
-	if err != nil {
-		return nil, 0, err
-	}
+func copyPageResponseToWriter(src io.Reader, dst io.Writer, stream *pageSpanStream) (int64, error) {
 	buf := make([]byte, 32*1024)
 	var total int64
 	for {
 		n, readErr := src.Read(buf)
 		if n > 0 {
 			chunk := buf[:n]
-			written, writeErr := tmp.Write(chunk)
+			written, writeErr := dst.Write(chunk)
 			total += int64(written)
 			if writeErr != nil {
-				_ = tmp.Close()
-				_ = os.Remove(tmp.Name())
-				return nil, total, writeErr
+				return total, writeErr
 			}
 			if written != n {
-				_ = tmp.Close()
-				_ = os.Remove(tmp.Name())
-				return nil, total, io.ErrShortWrite
+				return total, io.ErrShortWrite
 			}
 			if stream != nil {
 				if _, writeErr := stream.Write(chunk); writeErr != nil {
-					_ = tmp.Close()
-					_ = os.Remove(tmp.Name())
-					return nil, total, writeErr
+					return total, writeErr
 				}
 			}
 		}
 		if errors.Is(readErr, io.EOF) {
-			return tmp, total, nil
+			return total, nil
 		}
 		if readErr != nil {
-			_ = tmp.Close()
-			_ = os.Remove(tmp.Name())
-			return nil, total, readErr
+			return total, readErr
 		}
 	}
 }
