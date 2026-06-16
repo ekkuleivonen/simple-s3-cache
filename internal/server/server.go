@@ -1,8 +1,11 @@
 package server
 
 import (
+	"bufio"
 	"context"
+	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"strconv"
 	"time"
@@ -66,6 +69,9 @@ type loggingResponseWriter struct {
 }
 
 func (w *loggingResponseWriter) WriteHeader(status int) {
+	if w.status != 0 {
+		return
+	}
 	w.status = status
 	w.ResponseWriter.WriteHeader(status)
 }
@@ -78,6 +84,49 @@ func (w *loggingResponseWriter) Write(data []byte) (int, error) {
 	n, err := w.ResponseWriter.Write(data)
 	w.bytes += int64(n)
 	return n, err
+}
+
+func (w *loggingResponseWriter) ReadFrom(r io.Reader) (int64, error) {
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	if readerFrom, ok := w.ResponseWriter.(io.ReaderFrom); ok {
+		n, err := readerFrom.ReadFrom(r)
+		w.bytes += n
+		return n, err
+	}
+	return io.Copy(loggingWriter{ResponseWriter: w}, r)
+}
+
+func (w *loggingResponseWriter) Flush() {
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	_ = http.NewResponseController(w.ResponseWriter).Flush()
+}
+
+func (w *loggingResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	return http.NewResponseController(w.ResponseWriter).Hijack()
+}
+
+func (w *loggingResponseWriter) Push(target string, opts *http.PushOptions) error {
+	pusher, ok := w.ResponseWriter.(http.Pusher)
+	if !ok {
+		return http.ErrNotSupported
+	}
+	return pusher.Push(target, opts)
+}
+
+func (w *loggingResponseWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
+}
+
+type loggingWriter struct {
+	ResponseWriter *loggingResponseWriter
+}
+
+func (w loggingWriter) Write(data []byte) (int, error) {
+	return w.ResponseWriter.Write(data)
 }
 
 func requestLogger(logger *slog.Logger, next http.Handler) http.Handler {

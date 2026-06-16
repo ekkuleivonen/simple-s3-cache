@@ -582,38 +582,6 @@ func (c *Cache) OpenPage(ctx context.Context, objectID string, index int64, expe
 	}
 
 	absPath := filepath.Join(c.cacheRoot, page.Path)
-	info, err := os.Stat(absPath)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			bucket, _ := c.pageBucket(ctx, objectID)
-			deleted, deleteErr := c.deletePage(ctx, objectID, index)
-			if deleteErr != nil {
-				return nil, false, deleteErr
-			}
-			if deleted {
-				c.adjustCacheSize(bucket, -page.Size)
-				c.requestMetricsRefresh()
-			}
-			return nil, false, nil
-		}
-		return nil, false, fmt.Errorf("stat page file: %w", err)
-	}
-	if info.Size() != page.Size {
-		bucket, _ := c.pageBucket(ctx, objectID)
-		deleted, err := c.deletePage(ctx, objectID, index)
-		if err != nil {
-			return nil, false, err
-		}
-		if err := os.Remove(absPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return nil, false, fmt.Errorf("delete corrupt page file: %w", err)
-		}
-		if deleted {
-			c.adjustCacheSize(bucket, -page.Size)
-			c.requestMetricsRefresh()
-		}
-		return nil, false, nil
-	}
-
 	file, err := os.Open(absPath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -629,6 +597,27 @@ func (c *Cache) OpenPage(ctx context.Context, objectID string, index int64, expe
 			return nil, false, nil
 		}
 		return nil, false, fmt.Errorf("open page file: %w", err)
+	}
+	info, err := file.Stat()
+	if err != nil {
+		_ = file.Close()
+		return nil, false, fmt.Errorf("stat page file: %w", err)
+	}
+	if info.Size() != page.Size {
+		_ = file.Close()
+		bucket, _ := c.pageBucket(ctx, objectID)
+		deleted, err := c.deletePage(ctx, objectID, index)
+		if err != nil {
+			return nil, false, err
+		}
+		if err := os.Remove(absPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return nil, false, fmt.Errorf("delete corrupt page file: %w", err)
+		}
+		if deleted {
+			c.adjustCacheSize(bucket, -page.Size)
+			c.requestMetricsRefresh()
+		}
+		return nil, false, nil
 	}
 	c.requestTouch(objectID, index)
 

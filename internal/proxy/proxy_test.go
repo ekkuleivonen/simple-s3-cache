@@ -1005,6 +1005,11 @@ func TestProxyStreamsMultiPageFullGetThroughCache(t *testing.T) {
 	defer upstream.Close()
 
 	p := testProxyWithPageSize(t, upstream.URL, 5)
+	var listPagesCalls atomic.Int32
+	p.cache = &listPagesCountingCache{
+		cacheStore: p.cache,
+		calls:      &listPagesCalls,
+	}
 	for i := 0; i < 2; i++ {
 		req := httptest.NewRequest(http.MethodGet, "/bucket/full.bin", nil)
 		rec := httptest.NewRecorder()
@@ -1025,6 +1030,19 @@ func TestProxyStreamsMultiPageFullGetThroughCache(t *testing.T) {
 	wantRequests := []string{"HEAD ", "GET "}
 	if !equalStringSlices(upstreamRequests, wantRequests) {
 		t.Fatalf("upstream requests = %q, want %q", upstreamRequests, wantRequests)
+	}
+	if got := listPagesCalls.Load(); got != 0 {
+		t.Fatalf("ListPages() calls = %d, want 0 on full cached path", got)
+	}
+	metricsBody := renderProxyMetrics(t, p.metrics)
+	for _, want := range []string{
+		`simple_s3_cache_cache_metadata_duration_seconds_count{bucket="bucket",cache_result="hit"} 1`,
+		`simple_s3_cache_cache_page_open_duration_seconds_count{bucket="bucket",cache_result="hit"} 1`,
+		`simple_s3_cache_cache_response_copy_duration_seconds_count{bucket="bucket",cache_result="hit"} 1`,
+	} {
+		if !strings.Contains(metricsBody, want) {
+			t.Fatalf("metrics missing %q:\n%s", want, metricsBody)
+		}
 	}
 }
 
@@ -1740,6 +1758,8 @@ func TestProxyPeerModeForwardsRemoteOwnerRequest(t *testing.T) {
 		`simple_s3_cache_peer_forwarded_requests_total{bucket="bucket",peer_id="cache-1",method="GET",status_class="2xx"} 1`,
 		`simple_s3_cache_peer_forward_response_bytes_total{bucket="bucket",peer_id="cache-1"} 9`,
 		`simple_s3_cache_peer_forward_duration_seconds_count{bucket="bucket",peer_id="cache-1",status_class="2xx"} 1`,
+		`simple_s3_cache_peer_response_header_duration_seconds_count{bucket="bucket",peer_id="cache-1",status_class="2xx"} 1`,
+		`simple_s3_cache_peer_response_copy_duration_seconds_count{bucket="bucket",peer_id="cache-1",status_class="2xx"} 1`,
 	} {
 		if !strings.Contains(metricsBody, want) {
 			t.Fatalf("metrics missing %q:\n%s", want, metricsBody)
@@ -2034,6 +2054,16 @@ func (c *missingPageSignalCache) OpenPage(ctx context.Context, objectID string, 
 		close(c.secondMissSeen)
 	}
 	return body, ok, err
+}
+
+type listPagesCountingCache struct {
+	cacheStore
+	calls *atomic.Int32
+}
+
+func (c *listPagesCountingCache) ListPages(ctx context.Context, objectID string) ([]cache.Page, error) {
+	c.calls.Add(1)
+	return c.cacheStore.ListPages(ctx, objectID)
 }
 
 func equalStringSlices(a, b []string) bool {

@@ -3,9 +3,11 @@ package server
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -128,4 +130,74 @@ func TestRequestLoggerWritesStructuredLog(t *testing.T) {
 	if entry["status"] != float64(http.StatusOK) {
 		t.Fatalf("status = %v, want %d", entry["status"], http.StatusOK)
 	}
+}
+
+func TestLoggingResponseWriterPreservesReaderFrom(t *testing.T) {
+	base := &readerFromResponseWriter{header: http.Header{}}
+	w := &loggingResponseWriter{ResponseWriter: base}
+
+	n, err := w.ReadFrom(strings.NewReader("from optimized path"))
+	if err != nil {
+		t.Fatalf("ReadFrom() error = %v", err)
+	}
+
+	if n != int64(len("from optimized path")) {
+		t.Fatalf("ReadFrom() bytes = %d, want %d", n, len("from optimized path"))
+	}
+	if base.readFromCalls != 1 {
+		t.Fatalf("underlying ReadFrom calls = %d, want 1", base.readFromCalls)
+	}
+	if w.bytes != n {
+		t.Fatalf("logged bytes = %d, want %d", w.bytes, n)
+	}
+	if w.status != http.StatusOK {
+		t.Fatalf("status = %d, want %d", w.status, http.StatusOK)
+	}
+}
+
+func TestLoggingResponseWriterPreservesFlush(t *testing.T) {
+	base := &flushingResponseWriter{readerFromResponseWriter: readerFromResponseWriter{header: http.Header{}}}
+	w := &loggingResponseWriter{ResponseWriter: base}
+
+	w.Flush()
+
+	if base.flushes != 1 {
+		t.Fatalf("flushes = %d, want 1", base.flushes)
+	}
+	if w.status != http.StatusOK {
+		t.Fatalf("status = %d, want %d", w.status, http.StatusOK)
+	}
+}
+
+type readerFromResponseWriter struct {
+	header        http.Header
+	body          bytes.Buffer
+	status        int
+	readFromCalls int
+}
+
+func (w *readerFromResponseWriter) Header() http.Header {
+	return w.header
+}
+
+func (w *readerFromResponseWriter) WriteHeader(status int) {
+	w.status = status
+}
+
+func (w *readerFromResponseWriter) Write(data []byte) (int, error) {
+	return w.body.Write(data)
+}
+
+func (w *readerFromResponseWriter) ReadFrom(r io.Reader) (int64, error) {
+	w.readFromCalls++
+	return io.Copy(&w.body, r)
+}
+
+type flushingResponseWriter struct {
+	readerFromResponseWriter
+	flushes int
+}
+
+func (w *flushingResponseWriter) Flush() {
+	w.flushes++
 }

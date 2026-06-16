@@ -30,7 +30,12 @@ func TestRecorderRendersGlobalAndBucketMetrics(t *testing.T) {
 	recorder.ObserveReadAmplification("photos", float64(8)/3)
 	recorder.ObserveUpstreamDuration("photos", "fill", 25*time.Millisecond)
 	recorder.ObserveCacheServeDuration("photos", 2*time.Millisecond)
+	recorder.ObserveCacheMetadataDuration("photos", "hit", time.Millisecond)
+	recorder.ObserveCachePageOpenDuration("photos", "hit", 2*time.Millisecond)
+	recorder.ObserveCacheResponseCopyDuration("photos", "hit", 3*time.Millisecond)
 	recorder.ObservePeerForwardDuration("photos", "cache-1", "2xx", time.Millisecond)
+	recorder.ObservePeerResponseHeaderDuration("photos", "cache-1", "2xx", 2*time.Millisecond)
+	recorder.ObservePeerResponseCopyDuration("photos", "cache-1", "2xx", 3*time.Millisecond)
 	recorder.SetCachedBytes(64, map[string]int64{"photos": 64})
 
 	body := renderMetrics(t, recorder)
@@ -56,6 +61,12 @@ func TestRecorderRendersGlobalAndBucketMetrics(t *testing.T) {
 		`simple_s3_cache_requested_bytes_sum{bucket="photos"} 3`,
 		`simple_s3_cache_pages_touched_sum{bucket="photos"} 2`,
 		`simple_s3_cache_read_amplification_sum{bucket="photos"} 2.666`,
+		`simple_s3_cache_cache_metadata_duration_seconds_count{bucket="photos",cache_result="hit"} 1`,
+		`simple_s3_cache_cache_page_open_duration_seconds_count{bucket="photos",cache_result="hit"} 1`,
+		`simple_s3_cache_cache_response_copy_duration_seconds_count{bucket="photos",cache_result="hit"} 1`,
+		`simple_s3_cache_peer_forward_duration_seconds_count{bucket="photos",peer_id="cache-1",status_class="2xx"} 1`,
+		`simple_s3_cache_peer_response_header_duration_seconds_count{bucket="photos",peer_id="cache-1",status_class="2xx"} 1`,
+		`simple_s3_cache_peer_response_copy_duration_seconds_count{bucket="photos",peer_id="cache-1",status_class="2xx"} 1`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("metrics body missing %q:\n%s", want, body)
