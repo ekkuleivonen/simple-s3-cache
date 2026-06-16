@@ -58,6 +58,7 @@ func New(ctx context.Context, cfg appconfig.Config, logger *slog.Logger) (*Proxy
 	cacheStore, err := cache.Open(ctx, cache.Options{
 		CachePath: cfg.Cache.CachePath,
 		MetaPath:  cfg.Cache.MetaPath,
+		MaxSize:   cfg.Cache.MaxSize,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("open cache: %w", err)

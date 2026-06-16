@@ -980,7 +980,7 @@ Cover:
   - [x] add object rows and page files
   - [x] add page inventory tracking through SQLite
   - [x] atomically store fetched pages
-  - [ ] ignore incomplete or corrupt pages
+  - [x] ignore incomplete or corrupt pages
   - [ ] coalesce concurrent fetches for the same missing page
   - [x] fetch pages with `If-Match` and fence stores with a per-object epoch
 
@@ -999,11 +999,11 @@ Cover:
   - [x] invalidate destination object after successful `COPY`
   - [x] invalidate after successful multipart completion
 
-- [ ] **Milestone 6: Size Limit and Eviction**
-  - [ ] track cache size
-  - [ ] enforce `max_size`
-  - [ ] implement background LRU eviction, out of the request hot path
-  - [ ] tolerate missing or corrupt cache files
+- [x] **Milestone 6: Size Limit and Eviction**
+  - [x] track cache size
+  - [x] enforce `max_size`
+  - [x] implement background LRU eviction, out of the request hot path
+  - [x] tolerate missing or corrupt cache files
 
 - [ ] **Milestone 7: Operations Polish**
   - [ ] add metrics endpoint with bucket-labeled counters and read-amplification data

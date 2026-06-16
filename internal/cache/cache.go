@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -20,12 +21,18 @@ import (
 type Options struct {
 	CachePath string
 	MetaPath  string
+	MaxSize   int64
 }
 
 type Cache struct {
-	cacheRoot string
-	metaRoot  string
-	db        *sql.DB
+	cacheRoot    string
+	metaRoot     string
+	maxSize      int64
+	db           *sql.DB
+	evictionCh   chan struct{}
+	touchCh      chan pageRef
+	cancelWorker context.CancelFunc
+	workerWG     sync.WaitGroup
 }
 
 type ObjectMetadata struct {
@@ -64,12 +71,20 @@ type PageWrite struct {
 	Data          []byte
 }
 
+type pageRef struct {
+	objectID string
+	index    int64
+}
+
 func Open(ctx context.Context, opts Options) (*Cache, error) {
 	if opts.CachePath == "" {
 		return nil, errors.New("cache path is required")
 	}
 	if opts.MetaPath == "" {
 		return nil, errors.New("metadata path is required")
+	}
+	if opts.MaxSize <= 0 {
+		opts.MaxSize = 1 << 60
 	}
 	if err := os.MkdirAll(filepath.Join(opts.CachePath, "objects"), 0o755); err != nil {
 		return nil, fmt.Errorf("create cache directories: %w", err)
@@ -84,16 +99,31 @@ func Open(ctx context.Context, opts Options) (*Cache, error) {
 	}
 	db.SetMaxOpenConns(1)
 
-	c := &Cache{cacheRoot: opts.CachePath, metaRoot: opts.MetaPath, db: db}
+	workerCtx, cancelWorker := context.WithCancel(context.Background())
+	c := &Cache{
+		cacheRoot:    opts.CachePath,
+		metaRoot:     opts.MetaPath,
+		maxSize:      opts.MaxSize,
+		db:           db,
+		evictionCh:   make(chan struct{}, 1),
+		touchCh:      make(chan pageRef, 1024),
+		cancelWorker: cancelWorker,
+	}
 	if err := c.init(ctx); err != nil {
+		cancelWorker()
 		_ = db.Close()
 		return nil, err
 	}
+
+	c.workerWG.Add(1)
+	go c.maintenanceLoop(workerCtx)
 
 	return c, nil
 }
 
 func (c *Cache) Close() error {
+	c.cancelWorker()
+	c.workerWG.Wait()
 	return c.db.Close()
 }
 
@@ -288,6 +318,9 @@ func (c *Cache) StorePage(ctx context.Context, write PageWrite) (Page, error) {
 	if write.ETag == "" {
 		return Page{}, errors.New("etag is required")
 	}
+	if int64(len(write.Data)) > c.maxSize {
+		return Page{}, fmt.Errorf("page size %d exceeds cache max size %d", len(write.Data), c.maxSize)
+	}
 	if err := c.validatePageCommit(ctx, write.ObjectID, write.ETag, write.ExpectedEpoch); err != nil {
 		return Page{}, err
 	}
@@ -338,6 +371,7 @@ func (c *Cache) StorePage(ctx context.Context, write PageWrite) (Page, error) {
 		_ = os.Remove(absPath)
 		return Page{}, err
 	}
+	c.requestEviction()
 
 	return page, nil
 }
@@ -351,7 +385,28 @@ func (c *Cache) OpenPage(ctx context.Context, objectID string, index int64) (io.
 		return nil, false, nil
 	}
 
-	file, err := os.Open(filepath.Join(c.cacheRoot, page.Path))
+	absPath := filepath.Join(c.cacheRoot, page.Path)
+	info, err := os.Stat(absPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			if deleteErr := c.deletePage(ctx, objectID, index); deleteErr != nil {
+				return nil, false, deleteErr
+			}
+			return nil, false, nil
+		}
+		return nil, false, fmt.Errorf("stat page file: %w", err)
+	}
+	if info.Size() != page.Size {
+		if err := c.deletePage(ctx, objectID, index); err != nil {
+			return nil, false, err
+		}
+		if err := os.Remove(absPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return nil, false, fmt.Errorf("delete corrupt page file: %w", err)
+		}
+		return nil, false, nil
+	}
+
+	file, err := os.Open(absPath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			if deleteErr := c.deletePage(ctx, objectID, index); deleteErr != nil {
@@ -361,8 +416,41 @@ func (c *Cache) OpenPage(ctx context.Context, objectID string, index int64) (io.
 		}
 		return nil, false, fmt.Errorf("open page file: %w", err)
 	}
+	c.requestTouch(objectID, index)
 
 	return file, true, nil
+}
+
+func (c *Cache) CurrentSize(ctx context.Context) (int64, error) {
+	row := c.db.QueryRowContext(ctx, `SELECT COALESCE(SUM(size), 0) FROM pages`)
+	var size int64
+	if err := row.Scan(&size); err != nil {
+		return 0, fmt.Errorf("read cache size: %w", err)
+	}
+	return size, nil
+}
+
+func (c *Cache) Evict(ctx context.Context) error {
+	for {
+		size, err := c.CurrentSize(ctx)
+		if err != nil {
+			return err
+		}
+		if size <= c.maxSize {
+			return nil
+		}
+
+		page, ok, err := c.oldestPage(ctx)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return nil
+		}
+		if err := c.removePage(ctx, page); err != nil {
+			return err
+		}
+	}
 }
 
 func (c *Cache) pagePath(objectID string, index int64) string {
@@ -531,6 +619,96 @@ func (c *Cache) deletePage(ctx context.Context, objectID string, index int64) er
 	_, err := c.db.ExecContext(ctx, `DELETE FROM pages WHERE object_id = ? AND page_index = ?`, objectID, index)
 	if err != nil {
 		return fmt.Errorf("delete stale page row: %w", err)
+	}
+	return nil
+}
+
+func (c *Cache) touchPage(ctx context.Context, objectID string, index int64, at int64) error {
+	_, err := c.db.ExecContext(ctx, `UPDATE pages SET last_accessed_at = ? WHERE object_id = ? AND page_index = ?`, at, objectID, index)
+	if err != nil {
+		return fmt.Errorf("touch page: %w", err)
+	}
+	return nil
+}
+
+func (c *Cache) oldestPage(ctx context.Context) (Page, bool, error) {
+	row := c.db.QueryRowContext(ctx, `
+SELECT object_id, page_index, etag, size, path
+FROM pages
+ORDER BY last_accessed_at ASC, created_at ASC
+LIMIT 1
+`)
+
+	var page Page
+	if err := row.Scan(&page.ObjectID, &page.Index, &page.ETag, &page.Size, &page.Path); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return Page{}, false, nil
+		}
+		return Page{}, false, fmt.Errorf("select eviction candidate: %w", err)
+	}
+	return page, true, nil
+}
+
+func (c *Cache) removePage(ctx context.Context, page Page) error {
+	if err := c.deletePage(ctx, page.ObjectID, page.Index); err != nil {
+		return err
+	}
+	if err := os.Remove(filepath.Join(c.cacheRoot, page.Path)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("delete evicted page file: %w", err)
+	}
+	return nil
+}
+
+func (c *Cache) requestEviction() {
+	select {
+	case c.evictionCh <- struct{}{}:
+	default:
+	}
+}
+
+func (c *Cache) requestTouch(objectID string, index int64) {
+	select {
+	case c.touchCh <- pageRef{objectID: objectID, index: index}:
+	default:
+	}
+}
+
+func (c *Cache) maintenanceLoop(ctx context.Context) {
+	defer c.workerWG.Done()
+
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	pendingTouches := map[pageRef]struct{}{}
+
+	for {
+		select {
+		case <-ctx.Done():
+			_ = c.flushTouches(context.Background(), pendingTouches)
+			return
+		case <-c.evictionCh:
+			_ = c.Evict(ctx)
+		case ref := <-c.touchCh:
+			pendingTouches[ref] = struct{}{}
+			if len(pendingTouches) >= 256 {
+				_ = c.flushTouches(ctx, pendingTouches)
+			}
+		case <-ticker.C:
+			_ = c.flushTouches(ctx, pendingTouches)
+		}
+	}
+}
+
+func (c *Cache) flushTouches(ctx context.Context, pending map[pageRef]struct{}) error {
+	if len(pending) == 0 {
+		return nil
+	}
+
+	now := time.Now().UnixNano()
+	for ref := range pending {
+		if err := c.touchPage(ctx, ref.objectID, ref.index, now); err != nil {
+			return err
+		}
+		delete(pending, ref)
 	}
 	return nil
 }

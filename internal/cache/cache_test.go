@@ -296,13 +296,148 @@ func TestOpenUsesSeparateCacheAndMetaPaths(t *testing.T) {
 	}
 }
 
+func TestCacheTracksStoredPageSize(t *testing.T) {
+	ctx := context.Background()
+	c := openTestCache(t)
+	obj := putTestObject(t, c, "bucket", "size.bin")
+
+	if got, err := c.CurrentSize(ctx); err != nil {
+		t.Fatalf("CurrentSize() error = %v", err)
+	} else if got != 0 {
+		t.Fatalf("initial CurrentSize() = %d, want 0", got)
+	}
+
+	if _, err := c.StorePage(ctx, PageWrite{
+		ObjectID: obj.ID,
+		Index:    0,
+		ETag:     obj.ETag,
+		Data:     []byte("12345"),
+	}); err != nil {
+		t.Fatalf("StorePage(first) error = %v", err)
+	}
+	if _, err := c.StorePage(ctx, PageWrite{
+		ObjectID: obj.ID,
+		Index:    1,
+		ETag:     obj.ETag,
+		Data:     []byte("abc"),
+	}); err != nil {
+		t.Fatalf("StorePage(second) error = %v", err)
+	}
+
+	if got, err := c.CurrentSize(ctx); err != nil {
+		t.Fatalf("CurrentSize() error = %v", err)
+	} else if got != 8 {
+		t.Fatalf("CurrentSize() = %d, want 8", got)
+	}
+}
+
+func TestStorePageRejectsPageLargerThanMaxSize(t *testing.T) {
+	ctx := context.Background()
+	c := openTestCacheWithMaxSize(t, 4)
+	obj := putTestObject(t, c, "bucket", "too-large.bin")
+
+	if _, err := c.StorePage(ctx, PageWrite{
+		ObjectID: obj.ID,
+		Index:    0,
+		ETag:     obj.ETag,
+		Data:     []byte("12345"),
+	}); err == nil {
+		t.Fatal("StorePage() error = nil, want max-size rejection")
+	}
+
+	if got, err := c.CurrentSize(ctx); err != nil {
+		t.Fatalf("CurrentSize() error = %v", err)
+	} else if got != 0 {
+		t.Fatalf("CurrentSize() = %d, want 0", got)
+	}
+}
+
+func TestEvictLRURemovesOldestPagesUntilUnderMaxSize(t *testing.T) {
+	ctx := context.Background()
+	c := openTestCacheWithMaxSize(t, 7)
+	obj := putTestObject(t, c, "bucket", "evict.bin")
+
+	for i, data := range [][]byte{[]byte("1111"), []byte("2222"), []byte("3333")} {
+		if _, err := c.StorePage(ctx, PageWrite{
+			ObjectID: obj.ID,
+			Index:    int64(i),
+			ETag:     obj.ETag,
+			Data:     data,
+		}); err != nil {
+			t.Fatalf("StorePage(%d) error = %v", i, err)
+		}
+	}
+
+	if err := c.Evict(ctx); err != nil {
+		t.Fatalf("Evict() error = %v", err)
+	}
+
+	if got, err := c.CurrentSize(ctx); err != nil {
+		t.Fatalf("CurrentSize() error = %v", err)
+	} else if got > 7 {
+		t.Fatalf("CurrentSize() = %d, want <= 7", got)
+	}
+	if body, ok, err := c.OpenPage(ctx, obj.ID, 0); err != nil {
+		t.Fatalf("OpenPage(oldest) error = %v", err)
+	} else if ok {
+		body.Close()
+		t.Fatal("oldest page still present after eviction")
+	}
+	if body, ok, err := c.OpenPage(ctx, obj.ID, 2); err != nil {
+		t.Fatalf("OpenPage(newest) error = %v", err)
+	} else if !ok {
+		t.Fatal("newest page was evicted, want it retained")
+	} else {
+		body.Close()
+	}
+}
+
+func TestOpenPageTreatsSizeMismatchAsMissAndRemovesCorruptFile(t *testing.T) {
+	ctx := context.Background()
+	c := openTestCache(t)
+	obj := putTestObject(t, c, "bucket", "corrupt.bin")
+
+	page, err := c.StorePage(ctx, PageWrite{
+		ObjectID: obj.ID,
+		Index:    0,
+		ETag:     obj.ETag,
+		Data:     []byte("valid page"),
+	})
+	if err != nil {
+		t.Fatalf("StorePage() error = %v", err)
+	}
+	pagePath := filepath.Join(c.cacheRoot, page.Path)
+	if err := os.WriteFile(pagePath, []byte("bad"), 0o644); err != nil {
+		t.Fatalf("corrupt page file: %v", err)
+	}
+
+	body, ok, err := c.OpenPage(ctx, obj.ID, 0)
+	if err != nil {
+		t.Fatalf("OpenPage() error = %v", err)
+	}
+	if ok {
+		body.Close()
+		t.Fatal("OpenPage() ok = true, want corrupt file miss")
+	}
+	if _, err := os.Stat(pagePath); !os.IsNotExist(err) {
+		t.Fatalf("corrupt page file stat error = %v, want removed", err)
+	}
+}
+
 func openTestCache(t *testing.T) *Cache {
+	t.Helper()
+
+	return openTestCacheWithMaxSize(t, 1<<30)
+}
+
+func openTestCacheWithMaxSize(t *testing.T, maxSize int64) *Cache {
 	t.Helper()
 
 	root := t.TempDir()
 	c, err := Open(context.Background(), Options{
 		CachePath: filepath.Join(root, "cache-bytes"),
 		MetaPath:  filepath.Join(root, "cache-meta"),
+		MaxSize:   maxSize,
 	})
 	if err != nil {
 		t.Fatalf("Open() error = %v", err)
