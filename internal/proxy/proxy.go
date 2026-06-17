@@ -4,6 +4,9 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -44,11 +47,18 @@ const (
 	peerOwnerHeader     = peerrouter.OwnerHeader
 	peerFromHeader      = peerrouter.FromHeader
 	peerRingHeader      = peerrouter.RingHeader
+	peerTimestampHeader = peerrouter.TimestampHeader
+	peerSignatureHeader = peerrouter.SignatureHeader
 )
 
 const (
 	internalV1Prefix          = "/internal/v1/"
 	internalObjectRoutePrefix = "/internal/v1/objects"
+)
+
+const (
+	internalPeerAuthBodyLimit = 16 << 20
+	internalPeerClockSkew     = 5 * time.Minute
 )
 
 const (
@@ -61,6 +71,8 @@ const (
 	upstreamMaxIdleConnsPerHost   = 100
 	upstreamErrorBodyLogLimit     = 4096
 )
+
+const internalIdentityMetadataHeader = "X-Simple-S3-Cache-Internal-Identity"
 
 var (
 	errObjectChanged             = errors.New("cached object changed upstream")
@@ -103,6 +115,7 @@ type Proxy struct {
 	peerRouter       *peerrouter.Router
 	peerClient       *http.Client
 	peerTimeout      time.Duration
+	peerAuthSecret   string
 	readSharding     string
 	pageShardMin     int64
 	pageFillMu       sync.Mutex
@@ -217,6 +230,11 @@ func New(ctx context.Context, cfg appconfig.Config, logger *slog.Logger) (*Proxy
 	}
 
 	recorder := metrics.NewRecorder(cfg.Cache.MaxSize)
+	if cfg.Peer.Mode == "peer" {
+		if err := cache.WipeLocalState(cfg.Cache.CachePath, cfg.Cache.MetaPath); err != nil {
+			return nil, fmt.Errorf("wipe peer cache state: %w", err)
+		}
+	}
 	cacheStore, err := cache.Open(ctx, cache.Options{
 		CachePath:                cfg.Cache.CachePath,
 		MetaPath:                 cfg.Cache.MetaPath,
@@ -271,6 +289,7 @@ func New(ctx context.Context, cfg appconfig.Config, logger *slog.Logger) (*Proxy
 		peerRouter:      router,
 		peerClient:      newPeerHTTPClient(cfg.Peer.ForwardTimeout),
 		peerTimeout:     cfg.Peer.ForwardTimeout,
+		peerAuthSecret:  strings.TrimSpace(cfg.Peer.AuthSecret),
 		readSharding:    strings.TrimSpace(cfg.Peer.ReadSharding),
 		pageShardMin:    cfg.Peer.PageShardingMinPages,
 		peerFillSem:     make(chan struct{}, cfg.Peer.MaxFillConcurrency),
@@ -513,6 +532,13 @@ func (p *Proxy) serveInternalPageRead(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	for _, pageIndex := range req.Pages {
+		if !p.peerRouter.IsLocalPageOwner(req.Bucket, req.Key, pageIndex) {
+			status = http.StatusConflict
+			http.Error(w, "page is not owned by local peer", http.StatusConflict)
+			return
+		}
+	}
 
 	target := s3request.Target{Bucket: req.Bucket, Key: req.Key}
 	obj, status, err := p.internalPageReadObject(r.Context(), req)
@@ -709,8 +735,9 @@ func (p *Proxy) internalPageReadObject(ctx context.Context, req internalPageRead
 		Size:     req.ObjectSize,
 		PageSize: req.PageSize,
 		Headers: http.Header{
-			"Content-Length": []string{strconv.FormatInt(req.ObjectSize, 10)},
-			"ETag":           []string{req.ETag},
+			"Content-Length":               []string{strconv.FormatInt(req.ObjectSize, 10)},
+			"ETag":                         []string{req.ETag},
+			internalIdentityMetadataHeader: []string{"1"},
 		},
 	})
 	if err != nil {
@@ -772,7 +799,108 @@ func (p *Proxy) validateInternalPeerHeaders(w http.ResponseWriter, r *http.Reque
 		http.Error(w, "peer ring mismatch", http.StatusBadGateway)
 		return false
 	}
+	if !p.validateInternalPeerSignature(w, r) {
+		return false
+	}
 	return true
+}
+
+func (p *Proxy) validateInternalPeerSignature(w http.ResponseWriter, r *http.Request) bool {
+	secret := strings.TrimSpace(p.peerAuthSecret)
+	if secret == "" {
+		http.Error(w, "peer auth is not configured", http.StatusUnauthorized)
+		return false
+	}
+	timestampText := strings.TrimSpace(r.Header.Get(peerTimestampHeader))
+	if timestampText == "" {
+		http.Error(w, "missing peer signature timestamp", http.StatusUnauthorized)
+		return false
+	}
+	timestamp, err := strconv.ParseInt(timestampText, 10, 64)
+	if err != nil {
+		http.Error(w, "invalid peer signature timestamp", http.StatusUnauthorized)
+		return false
+	}
+	signedAt := time.Unix(timestamp, 0)
+	if delta := time.Since(signedAt); delta > internalPeerClockSkew || delta < -internalPeerClockSkew {
+		http.Error(w, "stale peer signature timestamp", http.StatusUnauthorized)
+		return false
+	}
+	signatureText := strings.TrimSpace(r.Header.Get(peerSignatureHeader))
+	if signatureText == "" {
+		http.Error(w, "missing peer signature", http.StatusUnauthorized)
+		return false
+	}
+	got, err := hex.DecodeString(signatureText)
+	if err != nil {
+		http.Error(w, "invalid peer signature", http.StatusUnauthorized)
+		return false
+	}
+	var body []byte
+	if !strings.HasPrefix(r.URL.Path, internalObjectRoutePrefix+"/") {
+		var ok bool
+		body, ok = readAndRestoreInternalPeerBody(w, r)
+		if !ok {
+			return false
+		}
+	}
+	want := internalPeerSignature(secret, r.Method, r.URL.RequestURI(), r.Header.Get(peerFromHeader), r.Header.Get(peerRingHeader), timestampText, body)
+	if !hmac.Equal(got, want) {
+		http.Error(w, "invalid peer signature", http.StatusUnauthorized)
+		return false
+	}
+	return true
+}
+
+func readAndRestoreInternalPeerBody(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
+	if r.Body == nil {
+		return nil, true
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, internalPeerAuthBodyLimit+1))
+	_ = r.Body.Close()
+	if err != nil {
+		http.Error(w, "read peer request body", http.StatusBadRequest)
+		return nil, false
+	}
+	if len(body) > internalPeerAuthBodyLimit {
+		http.Error(w, "peer request body too large", http.StatusRequestEntityTooLarge)
+		return nil, false
+	}
+	r.Body = io.NopCloser(bytes.NewReader(body))
+	return body, true
+}
+
+func (p *Proxy) signInternalPeerRequest(req *http.Request, body []byte) error {
+	secret := strings.TrimSpace(p.peerAuthSecret)
+	if secret == "" {
+		return errors.New("peer auth is not configured")
+	}
+	timestamp := strconv.FormatInt(time.Now().Unix(), 10)
+	req.Header.Set(peerTimestampHeader, timestamp)
+	req.Header.Set(peerSignatureHeader, hex.EncodeToString(internalPeerSignature(
+		secret,
+		req.Method,
+		req.URL.RequestURI(),
+		req.Header.Get(peerFromHeader),
+		req.Header.Get(peerRingHeader),
+		timestamp,
+		body,
+	)))
+	return nil
+}
+
+func internalPeerSignature(secret, method, requestURI, from, ringID, timestamp string, body []byte) []byte {
+	bodyHash := sha256.Sum256(body)
+	mac := hmac.New(sha256.New, []byte(secret))
+	_, _ = fmt.Fprintf(mac, "%s\n%s\n%s\n%s\n%s\n%s",
+		method,
+		requestURI,
+		strings.TrimSpace(from),
+		strings.TrimSpace(ringID),
+		strings.TrimSpace(timestamp),
+		hex.EncodeToString(bodyHash[:]),
+	)
+	return mac.Sum(nil)
 }
 
 func internalObjectRequest(r *http.Request) *http.Request {
@@ -1094,6 +1222,9 @@ func (p *Proxy) sendPeerInvalidation(ctx context.Context, peer peerrouter.Peer, 
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set(peerFromHeader, p.peerRouter.LocalID())
 	req.Header.Set(peerRingHeader, p.peerRouter.RingID())
+	if err := p.signInternalPeerRequest(req, data); err != nil {
+		return err
+	}
 
 	client := p.peerClient
 	if client == nil {
@@ -1213,6 +1344,9 @@ func (p *Proxy) forwardToPeer(w http.ResponseWriter, r *http.Request, owner peer
 	req.Header.Set(peerOwnerHeader, owner.ID)
 	if p.peerRouter != nil {
 		req.Header.Set(peerRingHeader, p.peerRouter.RingID())
+	}
+	if err := p.signInternalPeerRequest(req, nil); err != nil {
+		return 0, 0, err
 	}
 
 	headerStart := time.Now()
@@ -1715,6 +1849,9 @@ func (p *Proxy) serveCachedHead(w http.ResponseWriter, r *http.Request, target s
 		http.Error(w, "read cached metadata", http.StatusInternalServerError)
 		return 0, 0, err
 	}
+	if ok && isInternalIdentityObject(obj) {
+		ok = false
+	}
 	if !ok {
 		stats.cacheResult = "miss"
 		obj, status, headers, ok, err := p.fetchMetadata(r.Context(), r, target, stats)
@@ -2091,8 +2228,11 @@ func (p *Proxy) recordCacheWriteFailure(ctx context.Context, target s3request.Ta
 
 func (p *Proxy) ensureObjectMetadata(ctx context.Context, r *http.Request, target s3request.Target, stats *requestStats) (cache.Object, bool, error) {
 	obj, ok, err := p.cache.GetObject(ctx, target.Bucket, target.Key)
-	if err != nil || ok {
+	if err != nil {
 		return obj, ok, err
+	}
+	if ok && !isInternalIdentityObject(obj) {
+		return obj, true, nil
 	}
 
 	obj, _, _, ok, err = p.fetchMetadata(ctx, r, target, stats)
@@ -2247,6 +2387,11 @@ func (p *Proxy) serveDistributedPageRead(w http.ResponseWriter, r *http.Request,
 		if stats.fallbackReason == "" {
 			stats.fallbackReason = "open_page_batch"
 		}
+		if discardErr := p.discardLocalPlanningState(r.Context(), target); discardErr != nil {
+			stats.cacheResult = "error"
+			http.Error(w, "discard local planning state", http.StatusInternalServerError)
+			return 0, 0, discardErr
+		}
 		return p.forward(w, r, stats)
 	}
 	defer closeCoordinatorPageBatches(batches)
@@ -2298,6 +2443,14 @@ func (p *Proxy) groupCoordinatorPageBatches(target s3request.Target, pages []cac
 	return batches
 }
 
+func (p *Proxy) discardLocalPlanningState(ctx context.Context, target s3request.Target) error {
+	if p.cache == nil {
+		return nil
+	}
+	_, err := p.cache.InvalidateObject(ctx, target.Bucket, target.Key, 0)
+	return err
+}
+
 func (p *Proxy) openRemoteCoordinatorPageBatch(r *http.Request, target s3request.Target, obj cache.Object, batch *coordinatorPageBatch, stats *requestStats) error {
 	body := internalPageReadRequest{
 		Bucket:     target.Bucket,
@@ -2329,6 +2482,12 @@ func (p *Proxy) openRemoteCoordinatorPageBatch(r *http.Request, target s3request
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set(peerFromHeader, p.peerRouter.LocalID())
 	req.Header.Set(peerRingHeader, p.peerRouter.RingID())
+	if err := p.signInternalPeerRequest(req, data); err != nil {
+		if cancel != nil {
+			cancel()
+		}
+		return err
+	}
 
 	headerStart := time.Now()
 	resp, err := p.peerClient.Do(req)
@@ -3154,6 +3313,7 @@ func readCappedBody(body io.Reader, limit int64) (string, error) {
 
 func writeCachedObjectHeaders(dst http.Header, obj cache.Object, rangeResponse bool) {
 	copyResponseHeaders(dst, obj.Headers)
+	dst.Del(internalIdentityMetadataHeader)
 	dst.Set("Content-Length", strconv.FormatInt(obj.Size, 10))
 	if rangeResponse {
 		dst.Del("Content-Range")
@@ -3167,6 +3327,10 @@ func writeCachedConditionalHeaders(dst http.Header, obj cache.Object) {
 			dst.Set(key, value)
 		}
 	}
+}
+
+func isInternalIdentityObject(obj cache.Object) bool {
+	return obj.Headers.Get(internalIdentityMetadataHeader) == "1"
 }
 
 func cachedConditionalStatus(r *http.Request, obj cache.Object) (int, bool, error) {
@@ -3279,7 +3443,9 @@ func isPeerHeader(key string) bool {
 	return strings.EqualFold(key, peerForwardedHeader) ||
 		strings.EqualFold(key, peerOwnerHeader) ||
 		strings.EqualFold(key, peerFromHeader) ||
-		strings.EqualFold(key, peerRingHeader)
+		strings.EqualFold(key, peerRingHeader) ||
+		strings.EqualFold(key, peerTimestampHeader) ||
+		strings.EqualFold(key, peerSignatureHeader)
 }
 
 func stripPeerHeaders(header http.Header) {

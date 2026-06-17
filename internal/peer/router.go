@@ -16,6 +16,8 @@ const (
 	OwnerHeader     = "X-Simple-S3-Cache-Peer-Owner"
 	FromHeader      = "X-Simple-S3-Cache-Peer-From"
 	RingHeader      = "X-Simple-S3-Cache-Peer-Ring"
+	TimestampHeader = "X-Simple-S3-Cache-Peer-Timestamp"
+	SignatureHeader = "X-Simple-S3-Cache-Peer-Signature"
 )
 
 type Peer struct {

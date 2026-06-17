@@ -4,6 +4,9 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1927,6 +1930,7 @@ func TestProxyBroadcastsInvalidationAfterSuccessfulWrite(t *testing.T) {
 		t.Fatalf("NewRouter(owner) error = %v", err)
 	}
 	owner.peerRouter = ownerRouter
+	owner.peerAuthSecret = "test-peer-secret"
 
 	key := "write-broadcast.bin"
 	oldObj, err := owner.cache.PutObject(ctx, cache.ObjectMetadata{
@@ -2026,6 +2030,48 @@ func TestProxyMarksNotReadyWhenPeerInvalidationFails(t *testing.T) {
 	metricsBody := renderProxyMetrics(t, p.metrics)
 	if !strings.Contains(metricsBody, `simple_s3_cache_invalidation_broadcasts_total{bucket="bucket",peer_id="cache-1",status="failure"} 1`) {
 		t.Fatalf("metrics missing failed invalidation broadcast:\n%s", metricsBody)
+	}
+}
+
+func TestProxyInternalRoutesRequirePeerSignature(t *testing.T) {
+	p := testProxy(t, "http://upstream.invalid")
+	router := enablePeerMode(t, p, "cache-0", []peerrouter.Peer{
+		{ID: "cache-0", URL: "http://cache-0.invalid"},
+		{ID: "cache-1", URL: "http://cache-1.invalid"},
+	})
+	body := []byte(`{"bucket":"bucket","key":"object.bin","epoch":1}`)
+
+	unsigned := httptest.NewRequest(http.MethodPost, "/internal/v1/invalidate", bytes.NewReader(body))
+	unsigned.Header.Set(peerFromHeader, "cache-1")
+	unsigned.Header.Set(peerRingHeader, router.RingID())
+	unsigned.Header.Set("Content-Type", "application/json")
+	unsignedRec := httptest.NewRecorder()
+	p.ServeHTTP(unsignedRec, unsigned)
+	if unsignedRec.Code != http.StatusUnauthorized {
+		t.Fatalf("unsigned status = %d, want 401; body=%q", unsignedRec.Code, unsignedRec.Body.String())
+	}
+
+	badSignature := httptest.NewRequest(http.MethodPost, "/internal/v1/invalidate", bytes.NewReader(body))
+	badSignature.Header.Set(peerFromHeader, "cache-1")
+	badSignature.Header.Set(peerRingHeader, router.RingID())
+	badSignature.Header.Set(peerTimestampHeader, "1700000000")
+	badSignature.Header.Set(peerSignatureHeader, "not-a-valid-signature")
+	badSignature.Header.Set("Content-Type", "application/json")
+	badRec := httptest.NewRecorder()
+	p.ServeHTTP(badRec, badSignature)
+	if badRec.Code != http.StatusUnauthorized {
+		t.Fatalf("bad signature status = %d, want 401; body=%q", badRec.Code, badRec.Body.String())
+	}
+
+	signed := httptest.NewRequest(http.MethodPost, "/internal/v1/invalidate", bytes.NewReader(body))
+	signed.Header.Set(peerFromHeader, "cache-1")
+	signed.Header.Set(peerRingHeader, router.RingID())
+	signed.Header.Set("Content-Type", "application/json")
+	signTestInternalPeerRequest(t, signed, body, p.peerAuthSecret)
+	signedRec := httptest.NewRecorder()
+	p.ServeHTTP(signedRec, signed)
+	if signedRec.Code != http.StatusOK {
+		t.Fatalf("signed status = %d, want 200; body=%q", signedRec.Code, signedRec.Body.String())
 	}
 }
 
@@ -2324,6 +2370,7 @@ func TestProxyPeerModeForwardedWriteInvalidatesOnOwner(t *testing.T) {
 		t.Fatalf("PutObject() error = %v", err)
 	}
 	owner.peerRouter = router
+	owner.peerAuthSecret = "test-peer-secret"
 	if owner.metrics != nil {
 		owner.metrics.SetPeerRingInfo("peer", router.LocalID(), router.RingID())
 	}
@@ -2482,9 +2529,10 @@ func TestProxyInternalPageReadServesCachedPages(t *testing.T) {
 		{ID: "cache-0", URL: "http://cache-0.invalid"},
 		{ID: "cache-1", URL: "http://cache-1.invalid"},
 	})
+	key := keyWithPageOwners(t, router, "bucket", []string{"cache-0", "cache-0"})
 	obj, err := p.cache.PutObject(ctx, cache.ObjectMetadata{
 		Bucket:   "bucket",
-		Key:      "cached.bin",
+		Key:      key,
 		ETag:     `"etag-cached"`,
 		Size:     8,
 		PageSize: 4,
@@ -2509,7 +2557,7 @@ func TestProxyInternalPageReadServesCachedPages(t *testing.T) {
 	rec := httptest.NewRecorder()
 	p.ServeHTTP(rec, internalPageReadHTTPRequest(t, router, internalPageReadRequest{
 		Bucket:     "bucket",
-		Key:        "cached.bin",
+		Key:        key,
 		ObjectSize: 8,
 		PageSize:   4,
 		ETag:       `"etag-cached"`,
@@ -2535,10 +2583,38 @@ func TestProxyInternalPageReadServesCachedPages(t *testing.T) {
 	}
 }
 
+func TestProxyInternalPageReadRejectsWrongPageOwner(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Fatal("upstream should not receive wrong-owner internal page read")
+	}))
+	defer upstream.Close()
+
+	p := testProxyWithPageSize(t, upstream.URL, 4)
+	router := enablePeerMode(t, p, "cache-0", []peerrouter.Peer{
+		{ID: "cache-0", URL: "http://cache-0.invalid"},
+		{ID: "cache-1", URL: "http://cache-1.invalid"},
+	})
+	key := keyWithPageOwners(t, router, "bucket", []string{"cache-1"})
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, internalPageReadHTTPRequest(t, router, internalPageReadRequest{
+		Bucket:     "bucket",
+		Key:        key,
+		ObjectSize: 4,
+		PageSize:   4,
+		ETag:       `"etag-wrong-owner"`,
+		Epoch:      1,
+		Pages:      []int64{0},
+	}))
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409; body=%q", rec.Code, rec.Body.String())
+	}
+}
+
 func TestProxyInternalPageReadFillsMissingPage(t *testing.T) {
 	body := []byte("abcdefghijkl")
 	var upstreamRequests []string
-	key := "path with spaces/plus+and%25.bin"
+	key := ""
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		upstreamRequests = append(upstreamRequests, r.Method+" "+r.URL.EscapedPath()+" "+r.Header.Get("Range")+" "+r.Header.Get("If-Match"))
 		if r.Method != http.MethodGet {
@@ -2567,6 +2643,7 @@ func TestProxyInternalPageReadFillsMissingPage(t *testing.T) {
 		{ID: "cache-0", URL: "http://cache-0.invalid"},
 		{ID: "cache-1", URL: "http://cache-1.invalid"},
 	})
+	key = keyWithPageOwnerAt(t, router, "bucket", 1, "cache-0")
 	rec := httptest.NewRecorder()
 	p.ServeHTTP(rec, internalPageReadHTTPRequest(t, router, internalPageReadRequest{
 		Bucket:     "bucket",
@@ -2582,7 +2659,7 @@ func TestProxyInternalPageReadFillsMissingPage(t *testing.T) {
 		t.Fatalf("status = %d, want 200; body=%q", rec.Code, rec.Body.String())
 	}
 	assertPageFrames(t, rec.Body, []int64{1}, [][]byte{body[4:8]}, 4)
-	wantRequests := []string{`GET /bucket/path%20with%20spaces/plus+and%2525.bin bytes=4-7 "etag-fill"`}
+	wantRequests := []string{`GET /bucket/` + escapeS3KeyPath(key) + ` bytes=4-7 "etag-fill"`}
 	if !equalStringSlices(upstreamRequests, wantRequests) {
 		t.Fatalf("upstream requests = %q, want %q", upstreamRequests, wantRequests)
 	}
@@ -2595,6 +2672,117 @@ func TestProxyInternalPageReadFillsMissingPage(t *testing.T) {
 		if !strings.Contains(metricsBody, want) {
 			t.Fatalf("metrics missing %q:\n%s", want, metricsBody)
 		}
+	}
+}
+
+func TestProxyDistributedFallbackClearsLocalPlanningState(t *testing.T) {
+	body := []byte("abcdefghijkl")
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			t.Fatalf("upstream method = %q, want GET fallback", r.Method)
+		}
+		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+		w.Header().Set("ETag", `"etag-fallback"`)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(body)
+	}))
+	defer upstream.Close()
+
+	p := testProxyWithPageSize(t, upstream.URL, 4)
+	router := enablePeerMode(t, p, "cache-0", []peerrouter.Peer{
+		{ID: "cache-0", URL: "http://cache-0.invalid"},
+		{ID: "cache-1", URL: "http://127.0.0.1:1"},
+	})
+	key := keyWithPageOwners(t, router, "bucket", []string{"cache-1", "cache-1"})
+	if _, err := p.cache.PutObject(context.Background(), cache.ObjectMetadata{
+		Bucket:   "bucket",
+		Key:      key,
+		ETag:     `"etag-fallback"`,
+		Size:     int64(len(body)),
+		PageSize: 4,
+		Headers:  http.Header{"ETag": []string{`"etag-fallback"`}, "Content-Length": []string{strconv.Itoa(len(body))}},
+	}); err != nil {
+		t.Fatalf("PutObject() error = %v", err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/bucket/"+key, nil)
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 fallback; body=%q", rec.Code, rec.Body.String())
+	}
+	if !bytes.Equal(rec.Body.Bytes(), body) {
+		t.Fatalf("body = %q, want %q", rec.Body.Bytes(), body)
+	}
+	if _, ok, err := p.cache.GetObject(context.Background(), "bucket", key); err != nil {
+		t.Fatalf("GetObject() error = %v", err)
+	} else if ok {
+		t.Fatal("local planning metadata still cached after distributed fallback")
+	}
+}
+
+func TestNewPeerModeWipesLocalCacheOnStartup(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	cachePath := filepath.Join(root, "cache-bytes")
+	metaPath := filepath.Join(root, "cache-meta")
+	existing, err := cache.Open(ctx, cache.Options{
+		CachePath: cachePath,
+		MetaPath:  metaPath,
+	})
+	if err != nil {
+		t.Fatalf("open existing cache: %v", err)
+	}
+	obj, err := existing.PutObject(ctx, cache.ObjectMetadata{
+		Bucket:   "bucket",
+		Key:      "stale-after-downtime.bin",
+		ETag:     `"old"`,
+		Size:     4,
+		PageSize: 4,
+		Headers:  http.Header{"ETag": []string{`"old"`}},
+	})
+	if err != nil {
+		t.Fatalf("PutObject(existing) error = %v", err)
+	}
+	if _, err := existing.StorePage(ctx, cache.PageWrite{
+		ObjectID:      obj.ID,
+		Index:         0,
+		ETag:          obj.ETag,
+		ExpectedEpoch: obj.Epoch,
+		Size:          4,
+		Source:        strings.NewReader("old!"),
+	}); err != nil {
+		t.Fatalf("StorePage(existing) error = %v", err)
+	}
+	if err := existing.Close(); err != nil {
+		t.Fatalf("close existing cache: %v", err)
+	}
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	cfg := appconfig.Default()
+	cfg.Upstream.Endpoint = upstream.URL
+	cfg.Upstream.AccessKey = "test-access-key"
+	cfg.Upstream.SecretKey = "test-secret-key"
+	cfg.Cache.CachePath = cachePath
+	cfg.Cache.MetaPath = metaPath
+	cfg.Peer.Mode = "peer"
+	cfg.Peer.LocalID = "cache-0"
+	cfg.Peer.AuthSecret = "test-peer-secret"
+	cfg.Peer.Peers = []appconfig.Peer{{ID: "cache-0", URL: "http://cache-0.invalid"}}
+
+	p, err := New(ctx, cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	defer p.Close()
+
+	if _, ok, err := p.cache.GetObject(ctx, "bucket", "stale-after-downtime.bin"); err != nil {
+		t.Fatalf("GetObject() error = %v", err)
+	} else if ok {
+		t.Fatal("peer-mode startup preserved stale local cache metadata")
 	}
 }
 
@@ -2621,11 +2809,12 @@ func TestProxyInternalPageReadEstablishesMissingMetadataForNonZeroEpoch(t *testi
 		{ID: "cache-0", URL: "http://cache-0.invalid"},
 		{ID: "cache-1", URL: "http://cache-1.invalid"},
 	})
+	key := keyWithPageOwnerAt(t, router, "bucket", 2, "cache-0")
 
 	rec := httptest.NewRecorder()
 	p.ServeHTTP(rec, internalPageReadHTTPRequest(t, router, internalPageReadRequest{
 		Bucket:     "bucket",
-		Key:        "remote-first-contact.bin",
+		Key:        key,
 		ObjectSize: 12,
 		PageSize:   4,
 		ETag:       `"etag-epoch"`,
@@ -2637,7 +2826,7 @@ func TestProxyInternalPageReadEstablishesMissingMetadataForNonZeroEpoch(t *testi
 		t.Fatalf("status = %d, want 200; body=%q", rec.Code, rec.Body.String())
 	}
 	assertPageFrames(t, rec.Body, []int64{2}, [][]byte{body[8:12]}, 4)
-	obj, ok, err := p.cache.GetObject(ctx, "bucket", "remote-first-contact.bin")
+	obj, ok, err := p.cache.GetObject(ctx, "bucket", key)
 	if err != nil {
 		t.Fatalf("GetObject() error = %v", err)
 	}
@@ -2657,6 +2846,69 @@ func TestProxyInternalPageReadEstablishesMissingMetadataForNonZeroEpoch(t *testi
 	_ = page.Close()
 }
 
+func TestProxyClientHeadRefreshesInternalPageReadIdentityMetadata(t *testing.T) {
+	body := []byte("abcdefghijkl")
+	var headRequests int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			w.Header().Set("Content-Length", "4")
+			w.Header().Set("Content-Range", "bytes 0-3/12")
+			w.Header().Set("ETag", `"etag-internal-identity"`)
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(body[:4])
+		case http.MethodHead:
+			headRequests++
+			w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+			w.Header().Set("Content-Type", "application/octet-stream")
+			w.Header().Set("Cache-Control", "max-age=60")
+			w.Header().Set("X-Amz-Meta-Test", "metadata")
+			w.Header().Set("ETag", `"etag-internal-identity"`)
+			w.WriteHeader(http.StatusOK)
+		default:
+			t.Fatalf("upstream method = %q", r.Method)
+		}
+	}))
+	defer upstream.Close()
+
+	p := testProxyWithPageSize(t, upstream.URL, 4)
+	router := enablePeerMode(t, p, "cache-0", []peerrouter.Peer{
+		{ID: "cache-0", URL: "http://cache-0.invalid"},
+		{ID: "cache-1", URL: "http://cache-1.invalid"},
+	})
+	key := keyWithPageOwnerAt(t, router, "bucket", 0, "cache-0")
+	internalRec := httptest.NewRecorder()
+	p.ServeHTTP(internalRec, internalPageReadHTTPRequest(t, router, internalPageReadRequest{
+		Bucket:     "bucket",
+		Key:        key,
+		ObjectSize: int64(len(body)),
+		PageSize:   4,
+		ETag:       `"etag-internal-identity"`,
+		Epoch:      3,
+		Pages:      []int64{0},
+	}))
+	if internalRec.Code != http.StatusOK {
+		t.Fatalf("internal status = %d, want 200; body=%q", internalRec.Code, internalRec.Body.String())
+	}
+
+	headReq := httptest.NewRequest(http.MethodHead, "/bucket/"+key, nil)
+	headRec := httptest.NewRecorder()
+	p.ServeHTTP(headRec, headReq)
+
+	if headRec.Code != http.StatusOK {
+		t.Fatalf("HEAD status = %d, want 200; body=%q", headRec.Code, headRec.Body.String())
+	}
+	if headRequests != 1 {
+		t.Fatalf("upstream HEAD requests = %d, want 1", headRequests)
+	}
+	if got := headRec.Header().Get("Content-Type"); got != "application/octet-stream" {
+		t.Fatalf("Content-Type = %q, want upstream metadata", got)
+	}
+	if got := headRec.Header().Get("X-Amz-Meta-Test"); got != "metadata" {
+		t.Fatalf("X-Amz-Meta-Test = %q, want upstream metadata", got)
+	}
+}
+
 func TestProxyInternalPageReadServesBytesWhenCacheWriteFails(t *testing.T) {
 	body := []byte("abcdefghijkl")
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -2674,10 +2926,11 @@ func TestProxyInternalPageReadServesBytesWhenCacheWriteFails(t *testing.T) {
 		{ID: "cache-0", URL: "http://cache-0.invalid"},
 		{ID: "cache-1", URL: "http://cache-1.invalid"},
 	})
+	key := keyWithPageOwnerAt(t, router, "bucket", 0, "cache-0")
 	rec := httptest.NewRecorder()
 	p.ServeHTTP(rec, internalPageReadHTTPRequest(t, router, internalPageReadRequest{
 		Bucket:     "bucket",
-		Key:        "write-fail.bin",
+		Key:        key,
 		ObjectSize: 12,
 		PageSize:   4,
 		ETag:       `"etag-write-fail"`,
@@ -2703,10 +2956,11 @@ func TestProxyInternalPageReadInvalidatesOnUpstreamPreconditionFailure(t *testin
 		{ID: "cache-0", URL: "http://cache-0.invalid"},
 		{ID: "cache-1", URL: "http://cache-1.invalid"},
 	})
+	key := keyWithPageOwnerAt(t, router, "bucket", 0, "cache-0")
 	rec := httptest.NewRecorder()
 	p.ServeHTTP(rec, internalPageReadHTTPRequest(t, router, internalPageReadRequest{
 		Bucket:     "bucket",
-		Key:        "changed-upstream.bin",
+		Key:        key,
 		ObjectSize: 12,
 		PageSize:   4,
 		ETag:       `"stale-etag"`,
@@ -2717,7 +2971,7 @@ func TestProxyInternalPageReadInvalidatesOnUpstreamPreconditionFailure(t *testin
 	if rec.Code != http.StatusPreconditionFailed {
 		t.Fatalf("status = %d, want 412; body=%q", rec.Code, rec.Body.String())
 	}
-	if _, ok, err := p.cache.GetObject(ctx, "bucket", "changed-upstream.bin"); err != nil {
+	if _, ok, err := p.cache.GetObject(ctx, "bucket", key); err != nil {
 		t.Fatalf("GetObject() error = %v", err)
 	} else if ok {
 		t.Fatal("object metadata remains cached after upstream precondition failure")
@@ -2748,9 +3002,10 @@ func TestProxyInternalPageReadTreatsStaleLocalPageAsMiss(t *testing.T) {
 		{ID: "cache-0", URL: "http://cache-0.invalid"},
 		{ID: "cache-1", URL: "http://cache-1.invalid"},
 	})
+	key := keyWithPageOwnerAt(t, router, "bucket", 0, "cache-0")
 	oldObj, err := p.cache.PutObject(ctx, cache.ObjectMetadata{
 		Bucket:   "bucket",
-		Key:      "stale.bin",
+		Key:      key,
 		ETag:     `"old-etag"`,
 		Size:     int64(len(oldBody)),
 		PageSize: 4,
@@ -2773,7 +3028,7 @@ func TestProxyInternalPageReadTreatsStaleLocalPageAsMiss(t *testing.T) {
 	rec := httptest.NewRecorder()
 	p.ServeHTTP(rec, internalPageReadHTTPRequest(t, router, internalPageReadRequest{
 		Bucket:     "bucket",
-		Key:        "stale.bin",
+		Key:        key,
 		ObjectSize: int64(len(newBody)),
 		PageSize:   4,
 		ETag:       `"new-etag"`,
@@ -2824,9 +3079,10 @@ func TestProxyInternalPageReadCoalescesConcurrentMisses(t *testing.T) {
 		{ID: "cache-0", URL: "http://cache-0.invalid"},
 		{ID: "cache-1", URL: "http://cache-1.invalid"},
 	})
+	key := keyWithPageOwnerAt(t, router, "bucket", 0, "cache-0")
 	requestBody := internalPageReadRequest{
 		Bucket:     "bucket",
-		Key:        "coalesce-internal.bin",
+		Key:        key,
 		ObjectSize: 12,
 		PageSize:   4,
 		ETag:       `"etag-coalesce-peer"`,
@@ -2885,10 +3141,11 @@ func TestProxyInternalPageReadReturnsBadGatewayOnUpstreamFailure(t *testing.T) {
 		{ID: "cache-0", URL: "http://cache-0.invalid"},
 		{ID: "cache-1", URL: "http://cache-1.invalid"},
 	})
+	key := keyWithPageOwnerAt(t, router, "bucket", 0, "cache-0")
 	rec := httptest.NewRecorder()
 	p.ServeHTTP(rec, internalPageReadHTTPRequest(t, router, internalPageReadRequest{
 		Bucket:     "bucket",
-		Key:        "failure.bin",
+		Key:        key,
 		ObjectSize: 12,
 		PageSize:   4,
 		ETag:       `"etag-failure"`,
@@ -3195,16 +3452,10 @@ func TestProxyCoordinatorPageReadFallsBackBeforeCommitWithoutStoringPages(t *tes
 	if err != nil {
 		t.Fatalf("GetObject() error = %v", err)
 	}
-	if !ok {
-		t.Fatal("metadata missing after HEAD")
+	if ok {
+		t.Fatal("metadata still cached after peer-read fallback planning-state discard")
 	}
-	pages, err := p.cache.ListPages(ctx, obj.ID)
-	if err != nil {
-		t.Fatalf("ListPages() error = %v", err)
-	}
-	if len(pages) != 0 {
-		t.Fatalf("distributed pages stored during fallback = %d, want 0", len(pages))
-	}
+	_ = obj
 	metricsBody := renderProxyMetrics(t, p.metrics)
 	if !strings.Contains(metricsBody, `simple_s3_cache_peer_read_fallbacks_total{bucket="bucket",peer_id="cache-1",reason="status"} 1`) {
 		t.Fatalf("metrics missing peer read fallback:\n%s", metricsBody)
@@ -3276,6 +3527,7 @@ func TestProxyPeerModeRejectsForwardingLoop(t *testing.T) {
 	req.Header.Set(peerOwnerHeader, "cache-1")
 	req.Header.Set(peerFromHeader, "cache-1")
 	req.Header.Set(peerRingHeader, router.RingID())
+	signTestInternalPeerRequest(t, req, nil, p.peerAuthSecret)
 	rec := httptest.NewRecorder()
 
 	p.ServeHTTP(rec, req)
@@ -3399,6 +3651,7 @@ func TestProxyPeerModeRejectsForwardedOwnerMismatch(t *testing.T) {
 	req.Header.Set(peerOwnerHeader, "cache-1")
 	req.Header.Set(peerFromHeader, "cache-1")
 	req.Header.Set(peerRingHeader, router.RingID())
+	signTestInternalPeerRequest(t, req, nil, p.peerAuthSecret)
 	rec := httptest.NewRecorder()
 
 	p.ServeHTTP(rec, req)
@@ -3422,6 +3675,7 @@ func enablePeerMode(t *testing.T, p *Proxy, localID string, peers []peerrouter.P
 	p.peerRouter = router
 	p.peerClient = http.DefaultClient
 	p.peerTimeout = time.Minute
+	p.peerAuthSecret = "test-peer-secret"
 	if p.metrics != nil {
 		p.metrics.SetPeerRingInfo("peer", router.LocalID(), router.RingID())
 	}
@@ -3458,6 +3712,19 @@ func keyWithPageOwners(t *testing.T, router *peerrouter.Router, bucket string, o
 		}
 	}
 	t.Fatalf("could not find key with page owners %v", ownerIDs)
+	return ""
+}
+
+func keyWithPageOwnerAt(t *testing.T, router *peerrouter.Router, bucket string, pageIndex int64, ownerID string) string {
+	t.Helper()
+
+	for i := 0; i < 100_000; i++ {
+		key := fmt.Sprintf("paged-object-%d.bin", i)
+		if router.PageOwner(bucket, key, pageIndex).ID == ownerID {
+			return key
+		}
+	}
+	t.Fatalf("could not find key with page %d owned by %s", pageIndex, ownerID)
 	return ""
 }
 
@@ -3552,7 +3819,24 @@ func internalPageReadHTTPRequest(t *testing.T, router *peerrouter.Router, body i
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set(peerFromHeader, "cache-1")
 	req.Header.Set(peerRingHeader, router.RingID())
+	signTestInternalPeerRequest(t, req, data, "test-peer-secret")
 	return req
+}
+
+func signTestInternalPeerRequest(t *testing.T, req *http.Request, body []byte, secret string) {
+	t.Helper()
+	req.Header.Set(peerTimestampHeader, strconv.FormatInt(time.Now().Unix(), 10))
+	bodyHash := sha256.Sum256(body)
+	mac := hmac.New(sha256.New, []byte(secret))
+	_, _ = fmt.Fprintf(mac, "%s\n%s\n%s\n%s\n%s\n%s",
+		req.Method,
+		req.URL.RequestURI(),
+		req.Header.Get(peerFromHeader),
+		req.Header.Get(peerRingHeader),
+		req.Header.Get(peerTimestampHeader),
+		hex.EncodeToString(bodyHash[:]),
+	)
+	req.Header.Set(peerSignatureHeader, hex.EncodeToString(mac.Sum(nil)))
 }
 
 func assertInternalPageReadResponse(rec *httptest.ResponseRecorder, pages []int64, bodies [][]byte, maxPageBytes int64) error {

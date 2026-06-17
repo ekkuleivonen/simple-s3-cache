@@ -148,6 +148,7 @@ upload:
 peer:
   mode: peer
   local_id: cache-0
+  auth_secret: configured-peer-secret
   read_sharding: page
   page_sharding_min_pages: 4
   max_peer_fill_concurrency: 16
@@ -237,6 +238,9 @@ peer:
 	if cfg.Peer.LocalID != "cache-0" {
 		t.Fatalf("Peer.LocalID = %q", cfg.Peer.LocalID)
 	}
+	if cfg.Peer.AuthSecret != "configured-peer-secret" {
+		t.Fatalf("Peer.AuthSecret = %q", cfg.Peer.AuthSecret)
+	}
 	if cfg.Peer.ForwardTimeout != 2*time.Minute {
 		t.Fatalf("Peer.ForwardTimeout = %s", cfg.Peer.ForwardTimeout)
 	}
@@ -264,6 +268,7 @@ http:
   read_header_timeout: 2s
 peer:
   mode: peer
+  auth_secret: gateway-peer-secret
   peers:
     - id: cache-1
       url: http://cache-1.cache-peers:8080
@@ -286,6 +291,9 @@ peer:
 	}
 	if cfg.Peer.LocalID != "" {
 		t.Fatalf("Peer.LocalID = %q, want empty for gateway", cfg.Peer.LocalID)
+	}
+	if cfg.Peer.AuthSecret != "gateway-peer-secret" {
+		t.Fatalf("Peer.AuthSecret = %q", cfg.Peer.AuthSecret)
 	}
 	if len(cfg.Peer.Peers) != 2 {
 		t.Fatalf("Peer.Peers len = %d, want 2", len(cfg.Peer.Peers))
@@ -554,6 +562,22 @@ peer:
       url: http://cache-1:8080
 `,
 			wantError: "peer.peers must include peer.local_id",
+		},
+		{
+			name: "peer mode missing auth secret",
+			config: `
+upstream:
+  endpoint: http://rustfs:9000
+  access_key: test-access
+  secret_key: test-secret
+peer:
+  mode: peer
+  local_id: cache-0
+  peers:
+    - id: cache-0
+      url: http://cache-0:8080
+`,
+			wantError: "peer.auth_secret",
 		},
 		{
 			name: "duplicate peer id",

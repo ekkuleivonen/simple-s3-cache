@@ -52,6 +52,7 @@ upload:
   maxSpoolSize: 10GiB
 
 peer:
+  authSecret: change-me
   readSharding: auto
   pageShardingMinPages: 2
   forwardTimeout: 10m

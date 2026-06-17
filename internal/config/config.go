@@ -104,6 +104,7 @@ type UploadConfig struct {
 type PeerConfig struct {
 	Mode                     string        `yaml:"mode"`
 	LocalID                  string        `yaml:"local_id"`
+	AuthSecret               string        `yaml:"auth_secret"`
 	Peers                    []Peer        `yaml:"peers"`
 	ReadSharding             string        `yaml:"read_sharding"`
 	PageShardingMinPages     int64         `yaml:"page_sharding_min_pages"`
@@ -419,6 +420,9 @@ func (cfg Config) validatePeer(requireLocal bool) []error {
 
 	if requireLocal && strings.TrimSpace(cfg.Peer.LocalID) == "" {
 		errs = append(errs, errors.New("peer.local_id is required in peer mode"))
+	}
+	if strings.TrimSpace(cfg.Peer.AuthSecret) == "" {
+		errs = append(errs, errors.New("peer.auth_secret is required in peer mode"))
 	}
 	if cfg.Peer.ForwardTimeout <= 0 {
 		errs = append(errs, errors.New("peer.forward_timeout must be greater than zero"))

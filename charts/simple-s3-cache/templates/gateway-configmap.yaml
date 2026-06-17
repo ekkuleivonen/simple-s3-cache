@@ -18,6 +18,7 @@ data:
 
     peer:
       mode: peer
+      auth_secret: {{ .Values.peer.authSecret | quote }}
       forward_timeout: {{ .Values.peer.forwardTimeout }}
       peers:
 {{ include "simple-s3-cache.gatewayPeerList" . }}
