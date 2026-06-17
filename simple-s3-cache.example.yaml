@@ -36,6 +36,8 @@ peer:
   # provide the same static peer list on every pod.
   # read_sharding: auto
   # page_sharding_min_pages: 2
+  # max_peer_fill_concurrency: 32
+  # max_peer_object_fill_concurrency: 4
   # local_id: simple-s3-cache-0
   # peers:
   #   - id: simple-s3-cache-0

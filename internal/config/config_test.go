@@ -84,6 +84,12 @@ upstream:
 	if cfg.Peer.PageShardingMinPages != 2 {
 		t.Fatalf("Peer.PageShardingMinPages = %d, want 2", cfg.Peer.PageShardingMinPages)
 	}
+	if cfg.Peer.MaxFillConcurrency != 32 {
+		t.Fatalf("Peer.MaxFillConcurrency = %d, want 32", cfg.Peer.MaxFillConcurrency)
+	}
+	if cfg.Peer.MaxObjectFillConcurrency != 4 {
+		t.Fatalf("Peer.MaxObjectFillConcurrency = %d, want 4", cfg.Peer.MaxObjectFillConcurrency)
+	}
 }
 
 func TestLoadSingleModeDoesNotRequirePeerConfig(t *testing.T) {
@@ -144,6 +150,8 @@ peer:
   local_id: cache-0
   read_sharding: page
   page_sharding_min_pages: 4
+  max_peer_fill_concurrency: 16
+  max_peer_object_fill_concurrency: 3
   forward_timeout: 2m
   peers:
     - id: cache-0
@@ -237,6 +245,12 @@ peer:
 	}
 	if cfg.Peer.PageShardingMinPages != 4 {
 		t.Fatalf("Peer.PageShardingMinPages = %d, want 4", cfg.Peer.PageShardingMinPages)
+	}
+	if cfg.Peer.MaxFillConcurrency != 16 {
+		t.Fatalf("Peer.MaxFillConcurrency = %d, want 16", cfg.Peer.MaxFillConcurrency)
+	}
+	if cfg.Peer.MaxObjectFillConcurrency != 3 {
+		t.Fatalf("Peer.MaxObjectFillConcurrency = %d, want 3", cfg.Peer.MaxObjectFillConcurrency)
 	}
 	if len(cfg.Peer.Peers) != 2 {
 		t.Fatalf("len(Peer.Peers) = %d, want 2", len(cfg.Peer.Peers))

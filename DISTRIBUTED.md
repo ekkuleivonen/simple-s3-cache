@@ -607,23 +607,23 @@ Defaults should be boring:
 
 ### Milestone 6: Page Owner Read Endpoint
 
-- [ ] Add internal page read request schema with object identity:
-  - [ ] bucket;
-  - [ ] key;
-  - [ ] object size;
-  - [ ] page size;
-  - [ ] ETag;
-  - [ ] epoch;
-  - [ ] page list.
-- [ ] Serve local pages only when ETag and epoch match.
-- [ ] Treat non-matching local pages as misses.
-- [ ] Fill missing pages from upstream with page-aligned `Range`.
-- [ ] Send `If-Match: <etag>` on upstream fills.
-- [ ] Sign upstream fill requests after final headers are set.
-- [ ] Coalesce concurrent fills by `bucket/key/pageIndex/etag/epoch`.
-- [ ] Bound per-peer and per-object fill concurrency.
-- [ ] Return framed page bytes in increasing page index order.
-- [ ] Add tests for hit, miss, coalesced miss, upstream failure, and stale
+- [x] Add internal page read request schema with object identity:
+  - [x] bucket;
+  - [x] key;
+  - [x] object size;
+  - [x] page size;
+  - [x] ETag;
+  - [x] epoch;
+  - [x] page list.
+- [x] Serve local pages only when ETag and epoch match.
+- [x] Treat non-matching local pages as misses.
+- [x] Fill missing pages from upstream with page-aligned `Range`.
+- [x] Send `If-Match: <etag>` on upstream fills.
+- [x] Sign upstream fill requests after final headers are set.
+- [x] Coalesce concurrent fills by `bucket/key/pageIndex/etag/epoch`.
+- [x] Bound per-peer and per-object fill concurrency.
+- [x] Return framed page bytes in increasing page index order.
+- [x] Add tests for hit, miss, coalesced miss, upstream failure, and stale
   identity.
 
 ### Milestone 7: Coordinator Read Path
