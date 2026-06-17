@@ -152,6 +152,26 @@ least these signals:
 - `simple_s3_cache_peer_owner_decisions_total`
 - per-peer hit rate, upstream fill bytes, cached bytes, and evictions
 
+## Performance Validation
+
+After deploying a topology, use the e2e performance runner to compare it with the
+other supported modes from the same client network:
+
+```bash
+cd e2e
+uv run python perf/s3_read_bench.py \
+  --target single=http://single-cache.example.internal:8080 \
+  --target peer=http://peer-cache.example.internal:8080 \
+  --target gateway=http://gateway.example.internal:8080 \
+  --bucket "$S3CACHE_S3_BUCKET" \
+  --output perf-results.json
+```
+
+The runner covers cold and warm full-object reads plus cold and warm sparse range
+reads. Use it to decide whether single mode is sufficient, direct peer mode is a
+good enough capacity/bandwidth step, or gateway mode is worth the extra stateless
+component for owner-direct routing.
+
 ## Network Policy
 
 `networkPolicy.enabled` installs component-specific policies. In same-cluster

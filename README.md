@@ -569,6 +569,25 @@ A mismatch means the static peer list differs and object ownership may not be
 consistent. Forwarded object requests with a missing or mismatched ring
 fingerprint, or a mismatched owner header, fail closed with `502`.
 
+## Performance Validation
+
+Use the e2e performance runner to compare single, direct peer, and gateway
+deployments from the client network:
+
+```bash
+cd e2e
+uv run python perf/s3_read_bench.py \
+  --target single=http://single-cache.example.internal:8080 \
+  --target peer=http://peer-cache.example.internal:8080 \
+  --target gateway=http://gateway.example.internal:8080 \
+  --bucket "$S3CACHE_S3_BUCKET" \
+  --output perf-results.json
+```
+
+The runner exercises cold and warm full-object reads plus cold and warm sparse
+range reads. See `e2e/perf/README.md` for methodology notes and guidance on when
+single mode, direct peer mode, or gateway mode is the better operational choice.
+
 ## Why?
 
 Because sometimes you just want:
