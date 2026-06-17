@@ -47,6 +47,7 @@ func TestRecorderRendersGlobalAndBucketMetrics(t *testing.T) {
 	recorder.ObserveGatewayResponseBodyReadDuration("photos", "owner", "cache-1", "2xx", time.Millisecond)
 	recorder.ObserveGatewayDownstreamWriteDuration("photos", "owner", "cache-1", "2xx", 2*time.Millisecond)
 	recorder.SetCachedBytes(64, map[string]int64{"photos": 64})
+	recorder.SetPeerRingInfo("peer", "cache-0", "ring-123")
 
 	body := renderMetrics(t, recorder)
 	for _, want := range []string{
@@ -71,6 +72,7 @@ func TestRecorderRendersGlobalAndBucketMetrics(t *testing.T) {
 		`simple_s3_cache_cached_bytes 64`,
 		`simple_s3_cache_cached_bytes{bucket="photos"} 64`,
 		`simple_s3_cache_cache_max_bytes 1024`,
+		`simple_s3_cache_peer_ring_info{mode="peer",local_id="cache-0",ring_id="ring-123"} 1`,
 		`simple_s3_cache_requested_bytes_sum{bucket="photos"} 3`,
 		`simple_s3_cache_pages_touched_sum{bucket="photos"} 2`,
 		`simple_s3_cache_read_amplification_sum{bucket="photos"} 2.666`,

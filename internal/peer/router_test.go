@@ -45,6 +45,23 @@ func TestRouterIsIndependentOfPeerOrder(t *testing.T) {
 			t.Fatalf("Owner(%q) differs: %+v != %+v", key, got, want)
 		}
 	}
+	if a.RingID() == "" {
+		t.Fatal("RingID() is empty")
+	}
+	if got, want := a.RingID(), b.RingID(); got != want {
+		t.Fatalf("RingID() differs for same peers in different order: %q != %q", got, want)
+	}
+	changed, err := NewRouter("cache-0", []Peer{
+		{ID: "cache-0", URL: "http://cache-0"},
+		{ID: "cache-1", URL: "http://cache-1.changed"},
+		{ID: "cache-2", URL: "http://cache-2"},
+	})
+	if err != nil {
+		t.Fatalf("NewRouter(changed) error = %v", err)
+	}
+	if changed.RingID() == a.RingID() {
+		t.Fatalf("RingID() did not change after peer URL changed: %q", changed.RingID())
+	}
 }
 
 func TestRouterDistributesObjectsAcrossPeers(t *testing.T) {

@@ -188,16 +188,18 @@ test. Until then, treat it as load-bearing.
   given `bucket/key` converge on exactly one owner. Mixed peer lists, ordinary
   replicas outside peer mode, or forwarding loops can silently break that
   invariant.
-* **Mitigation:** `single` mode remains the default. In `peer` mode, all object
-  requests route by destination `bucket/key` using the static peer list before
-  any local cache state is touched. Peer-forwarded and gateway-forwarded object
-  requests carry peer coordination headers and fail closed with `502` if they
-  land on a non-owner. Tests cover remote-owner forwarding, local-owner
-  handling, forwarded write invalidation, peer routing mismatch handling, and
-  gateway owner routing headers.
+* **Mitigation:** `single` mode remains the default and simplest production
+  topology. In `peer` mode, all object requests route by destination
+  `bucket/key` using the static peer list before any local cache state is
+  touched. Peer-forwarded and gateway-forwarded object requests carry peer
+  coordination headers plus a deterministic peer-ring fingerprint, and fail
+  closed with `502` if they land on a non-owner or report a missing/mismatched
+  ring or owner header. Tests cover remote-owner forwarding, local-owner
+  handling, forwarded write invalidation, peer routing mismatch handling, ring
+  mismatch handling, owner mismatch handling, and gateway owner routing headers.
 * **Watch:** Mixed peer-list rollouts, pods with stale config, peer forwarding
-  failures, or any code path that touches local object cache state before the
-  owner check.
+  failures, ring IDs that differ across gateways and peers, or any code path
+  that touches local object cache state before the owner/ring check.
 
 ### H13. Disk-full or cache write failure breaks reads
 

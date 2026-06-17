@@ -17,6 +17,7 @@ type Recorder struct {
 	cacheMaxBytes  int64
 	cachedBytes    int64
 	cachedByBucket map[string]int64
+	peerRingInfo   string
 
 	counters   map[string]map[string]float64
 	histograms map[string]*histogram
@@ -122,6 +123,13 @@ func (r *Recorder) RecordGatewayForwardFailure(bucket, peerID, reason string) {
 
 func (r *Recorder) RecordGatewayResponseBytes(bucket, peerID string, bytes int64) {
 	r.inc("simple_s3_cache_gateway_response_bytes_total", labels(label{"bucket", bucket}, label{"peer_id", peerID}), float64(bytes))
+}
+
+func (r *Recorder) SetPeerRingInfo(mode, localID, ringID string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.peerRingInfo = labels(label{"mode", mode}, label{"local_id", localID}, label{"ring_id", ringID})
 }
 
 func (r *Recorder) RecordBytesServedFromCache(bucket string, bytes int64) {
@@ -300,6 +308,10 @@ func (r *Recorder) renderGauges(b *strings.Builder) {
 	}
 	b.WriteString("# TYPE simple_s3_cache_cache_max_bytes gauge\n")
 	writeMetricLine(b, "simple_s3_cache_cache_max_bytes", "", float64(r.cacheMaxBytes))
+	if r.peerRingInfo != "" {
+		b.WriteString("# TYPE simple_s3_cache_peer_ring_info gauge\n")
+		writeMetricLine(b, "simple_s3_cache_peer_ring_info", r.peerRingInfo, 1)
+	}
 }
 
 func (r *Recorder) renderHistograms(b *strings.Builder) {

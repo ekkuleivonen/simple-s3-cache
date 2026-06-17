@@ -42,7 +42,7 @@ purpose.
 The production contract is intentionally narrow:
 
 * Path-style S3 requests only (`/bucket/key`).
-* One active cache instance.
+* `peer.mode: single` by default, with one active cache instance.
 * One configured upstream credential shared by all clients.
 * Trusted network or external authentication layer.
 * Writes must pass through simple-s3-cache for fresh cached reads.
@@ -60,7 +60,7 @@ state development and performance tuning, not a change to the product contract.
 
 ## Non-Goals
 
-* Distributed cache.
+* Distributed metadata or coherent replicated cache pages.
 * High availability.
 * Write-back caching.
 * External metadata databases.
@@ -105,14 +105,16 @@ pass-through (uncached); the embedded client signature is not used.
 simple-s3-cache is a good fit when:
 
 * Clients can reach it through a trusted network or existing auth layer.
-* A single cache instance is acceptable.
+* A single cache instance is acceptable, or static owner-sharded peer mode is
+  acceptable.
 * Stale reads are unacceptable only for writes that pass through the cache.
 * Clients use path-style S3 requests for object reads and writes.
 * All clients may share the same upstream permissions.
 
 Do not use simple-s3-cache as-is when:
 
-* Multiple active cache replicas must stay coherent.
+* Multiple active cache replicas must stay coherent without static object
+  ownership.
 * Clients rely on per-user IAM authorization at the proxy.
 * Objects may be modified directly in upstream storage and stale reads are not
   acceptable.
@@ -178,7 +180,10 @@ cached pages for the affected object on success.
 
 ## Deployment Model
 
-simple-s3-cache defaults to a single active cache instance.
+simple-s3-cache supports three deployment topologies.
+
+Single mode is the default and the recommended starting point when one cache
+instance has enough capacity and bandwidth:
 
 ```text
 Client
@@ -192,17 +197,15 @@ S3-compatible storage
 
 This keeps cache invalidation local and avoids distributed coordination.
 
-Multiple independent cache instances outside peer mode do not coordinate
-invalidation. If a write is routed through one cache instance, other instances
-may continue serving stale cached metadata or pages for the same object.
+Direct peer mode is available when more local cache capacity or disk bandwidth is
+needed without adding a separate gateway process:
 
-Peer mode is available when more local cache capacity or disk bandwidth is
-needed. In peer mode, every instance has the same static peer list and uses
-rendezvous hashing over `bucket/key` to choose exactly one owner for each object.
-Any instance may receive a request, but all object requests — reads, writes,
-deletes, COPY destinations, and multipart completion or abort requests — are
-owned by the destination `bucket/key`. Non-owners stream the request to the owner
-before any local cache handling begins.
+In peer mode, every instance has the same static peer list and uses rendezvous
+hashing over `bucket/key` to choose exactly one owner for each object. Any
+instance may receive a request, but all object requests — reads, writes, deletes,
+COPY destinations, and multipart completion or abort requests — are owned by the
+destination `bucket/key`. Non-owners stream the request to the owner before any
+local cache handling begins.
 
 ```text
 Client
@@ -227,11 +230,16 @@ Peer forwarding uses internal coordination headers:
 X-Simple-S3-Cache-Peer-Forwarded: 1
 X-Simple-S3-Cache-Peer-Owner: <owner-id>
 X-Simple-S3-Cache-Peer-From: <sender-id>
+X-Simple-S3-Cache-Peer-Ring: <ring-id>
 ```
 
 If a peer receives `X-Simple-S3-Cache-Peer-Forwarded: 1` but the request does
 not belong to that peer, it returns `502` instead of forwarding again. This makes
-peer-list disagreement fail closed.
+peer-list disagreement fail closed. If the forwarded request's ring fingerprint
+is missing or does not match the receiver's configured peer list, the receiver
+also returns `502` before touching local cache state. If the receiver is the
+computed owner but the forwarded owner header names a different peer, the
+receiver returns `502` as well.
 
 Peer mode is intentionally static in this version. It is a good fit for a
 Kubernetes StatefulSet with stable peer IDs and a headless Service, for example
@@ -243,6 +251,10 @@ peers may temporarily believe they own the same object; avoid them.
 If the owner peer is unavailable, remote-owner object requests fail closed
 instead of being served by the wrong local cache. Restarting the owner with an
 empty cache is safe because upstream storage remains the source of truth.
+
+Multiple independent cache instances outside peer mode do not coordinate
+invalidation. If a write is routed through one cache instance, other instances
+may continue serving stale cached metadata or pages for the same object.
 
 ### Owner-Aware Gateway
 
@@ -290,6 +302,10 @@ object-scoped routes it stamps the same internal peer coordination headers used
 by peer forwarding, so a peer-list mismatch fails closed before local cache state
 is touched. Client-supplied peer coordination headers are stripped at the gateway
 boundary.
+
+The gateway is optional. Use direct peer mode when avoiding another component is
+more important than avoiding the extra internal hop. Use gateway mode when cache
+throughput or large response proxying makes direct owner routing worthwhile.
 
 If the cache instance fails, it can be restarted with an empty cache. No object
 data is lost because upstream S3-compatible storage remains the source of truth.
@@ -368,9 +384,11 @@ cached entries are invalidated or evicted.
 HEAD responses may become stale if objects are modified directly in upstream
 storage outside of simple-s3-cache.
 
-Multiple active cache instances require distributed invalidation, cache
-ownership, shared cache storage, or upstream validation checks. Those are not
-part of this production scope.
+Multiple active cache instances are safe only when they run in peer mode with
+the same static peer list, or when all writes and reads for an object are
+otherwise forced to the same cache instance. simple-s3-cache does not implement
+distributed metadata, replicated cache pages, consensus membership, or shared
+cache storage.
 
 The production scope supports path-style addressing only.
 
@@ -519,11 +537,17 @@ Full counter, gauge, histogram, and log-field requirements are in
 [PLAN.md](PLAN.md#observability).
 
 Peer mode also emits structured log fields for `peer_mode`, `peer_local_id`,
-`peer_owner_id`, `peer_forwarded`, and `peer_forward_duration_ms`. Metrics expose
+`peer_owner_id`, `peer_ring_id`, `peer_forward_ring_id`, `peer_forwarded`, and
+`peer_forward_duration_ms`. Metrics expose the active peer ring fingerprint,
 owner decisions by `bucket`, `decision`, and `owner_id`; forwarded requests by
 `bucket`, `peer_id`, `method`, and `status_class`; forwarding failures by
 `bucket`, `peer_id`, and bounded `reason`; peer response bytes; and peer
 forwarding duration.
+
+All peers and gateways in one deployment should report the same `peer_ring_id`.
+A mismatch means the static peer list differs and object ownership may not be
+consistent. Forwarded object requests with a missing or mismatched ring
+fingerprint, or a mismatched owner header, fail closed with `502`.
 
 ## Why?
 

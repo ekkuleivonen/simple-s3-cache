@@ -3,6 +3,7 @@ package peer
 import (
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"sort"
@@ -13,6 +14,7 @@ const (
 	ForwardedHeader = "X-Simple-S3-Cache-Peer-Forwarded"
 	OwnerHeader     = "X-Simple-S3-Cache-Peer-Owner"
 	FromHeader      = "X-Simple-S3-Cache-Peer-From"
+	RingHeader      = "X-Simple-S3-Cache-Peer-Ring"
 )
 
 type Peer struct {
@@ -24,6 +26,7 @@ type Router struct {
 	localID string
 	peers   []Peer
 	byID    map[string]Peer
+	ringID  string
 }
 
 func NewRouter(localID string, peers []Peer) (*Router, error) {
@@ -77,6 +80,7 @@ func newRouter(localID string, peers []Peer, requireLocal bool) (*Router, error)
 		localID: localID,
 		peers:   copied,
 		byID:    byID,
+		ringID:  ringFingerprint(copied),
 	}, nil
 }
 
@@ -88,6 +92,10 @@ func (r *Router) Peers() []Peer {
 	peers := make([]Peer, len(r.peers))
 	copy(peers, r.peers)
 	return peers
+}
+
+func (r *Router) RingID() string {
+	return r.ringID
 }
 
 func (r *Router) Owner(bucket, key string) Peer {
@@ -116,4 +124,15 @@ func (r *Router) PeerByID(id string) (Peer, bool) {
 func rendezvousScore(key, peerID string) uint64 {
 	sum := sha256.Sum256([]byte(key + "\x00" + peerID))
 	return binary.BigEndian.Uint64(sum[:8])
+}
+
+func ringFingerprint(peers []Peer) string {
+	hash := sha256.New()
+	for _, p := range peers {
+		_, _ = hash.Write([]byte(p.ID))
+		_, _ = hash.Write([]byte{0})
+		_, _ = hash.Write([]byte(p.URL))
+		_, _ = hash.Write([]byte{0})
+	}
+	return hex.EncodeToString(hash.Sum(nil))
 }

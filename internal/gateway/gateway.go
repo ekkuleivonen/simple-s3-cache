@@ -65,6 +65,9 @@ func New(opts Options) *Gateway {
 		metrics: opts.Metrics,
 	}
 	if opts.Router != nil {
+		if opts.Metrics != nil {
+			opts.Metrics.SetPeerRingInfo("gateway", "", opts.Router.RingID())
+		}
 		peers := opts.Router.Peers()
 		if len(peers) > 0 {
 			g.defaultPeer = peers[0]
@@ -109,6 +112,9 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, stats *gatewaySt
 	}
 	stats.route = route
 	stats.peerID = owner.ID
+	if g.router != nil {
+		stats.ringID = g.router.RingID()
+	}
 
 	peerURL, err := peerRequestURL(owner, r.URL)
 	if err != nil {
@@ -127,6 +133,7 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, stats *gatewaySt
 		req.Header.Set(peer.ForwardedHeader, "1")
 		req.Header.Set(peer.OwnerHeader, owner.ID)
 		req.Header.Set(peer.FromHeader, "gateway")
+		req.Header.Set(peer.RingHeader, g.router.RingID())
 	}
 
 	headerStart := time.Now()
@@ -260,7 +267,8 @@ func copyResponseHeaders(dst, src http.Header) {
 func isPeerHeader(key string) bool {
 	return strings.EqualFold(key, peer.ForwardedHeader) ||
 		strings.EqualFold(key, peer.OwnerHeader) ||
-		strings.EqualFold(key, peer.FromHeader)
+		strings.EqualFold(key, peer.FromHeader) ||
+		strings.EqualFold(key, peer.RingHeader)
 }
 
 func isHopByHopHeader(key string) bool {
@@ -278,6 +286,7 @@ type gatewayStats struct {
 	method                  string
 	route                   string
 	peerID                  string
+	ringID                  string
 	status                  int
 	bytesSent               int64
 	duration                time.Duration
@@ -325,6 +334,7 @@ func (g *Gateway) logRequest(r *http.Request, stats *gatewayStats, err error) {
 		slog.String("bucket", stats.bucket),
 		slog.String("route", stats.route),
 		slog.String("peer_id", stats.peerID),
+		slog.String("peer_ring_id", stats.ringID),
 		slog.Int("status", stats.status),
 		slog.Int64("bytes", stats.bytesSent),
 		slog.Int64("duration_ms", stats.duration.Milliseconds()),

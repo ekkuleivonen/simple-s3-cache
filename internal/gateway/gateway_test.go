@@ -28,6 +28,9 @@ func TestGatewayRoutesObjectRequestToOwner(t *testing.T) {
 		if got := r.Header.Get(peer.FromHeader); got != "gateway" {
 			t.Fatalf("from header = %q, want gateway", got)
 		}
+		if got := r.Header.Get(peer.RingHeader); got == "" {
+			t.Fatal("ring header is empty")
+		}
 		w.Header().Set("X-Cache-Peer", "cache-0")
 		w.WriteHeader(http.StatusAccepted)
 		_, _ = w.Write([]byte("from cache-0"))
@@ -45,6 +48,9 @@ func TestGatewayRoutesObjectRequestToOwner(t *testing.T) {
 		}
 		if got := r.Header.Get(peer.FromHeader); got != "gateway" {
 			t.Fatalf("from header = %q, want gateway", got)
+		}
+		if got := r.Header.Get(peer.RingHeader); got == "" {
+			t.Fatal("ring header is empty")
 		}
 		w.Header().Set("X-Cache-Peer", "cache-1")
 		w.WriteHeader(http.StatusAccepted)
@@ -107,6 +113,9 @@ func TestGatewayPreservesHostSigningHeadersAndBody(t *testing.T) {
 		if got := r.Header.Get(peer.FromHeader); got != "gateway" {
 			t.Fatalf("from header = %q, want gateway value", got)
 		}
+		if got := r.Header.Get(peer.RingHeader); got == "" || got == "client-spoof" {
+			t.Fatalf("ring header = %q, want gateway value", got)
+		}
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
 			t.Fatalf("ReadAll(body) error = %v", err)
@@ -134,6 +143,7 @@ func TestGatewayPreservesHostSigningHeadersAndBody(t *testing.T) {
 	req.Header.Set(peer.ForwardedHeader, "client-spoof")
 	req.Header.Set(peer.OwnerHeader, "client-spoof")
 	req.Header.Set(peer.FromHeader, "client-spoof")
+	req.Header.Set(peer.RingHeader, "client-spoof")
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
 

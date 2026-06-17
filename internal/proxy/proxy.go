@@ -34,6 +34,7 @@ const (
 	peerForwardedHeader = peerrouter.ForwardedHeader
 	peerOwnerHeader     = peerrouter.OwnerHeader
 	peerFromHeader      = peerrouter.FromHeader
+	peerRingHeader      = peerrouter.RingHeader
 )
 
 const (
@@ -123,6 +124,8 @@ type requestStats struct {
 	peerMode                     string
 	peerLocalID                  string
 	peerOwnerID                  string
+	peerRingID                   string
+	peerForwardRingID            string
 	peerDecision                 string
 	peerForwarded                bool
 	peerForwardFailure           string
@@ -174,6 +177,7 @@ func New(ctx context.Context, cfg appconfig.Config, logger *slog.Logger) (*Proxy
 			_ = cacheStore.Close()
 			return nil, fmt.Errorf("create peer router: %w", err)
 		}
+		recorder.SetPeerRingInfo("peer", router.LocalID(), router.RingID())
 	}
 
 	return &Proxy{
@@ -333,6 +337,8 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			slog.String("peer_mode", stats.peerMode),
 			slog.String("peer_local_id", stats.peerLocalID),
 			slog.String("peer_owner_id", stats.peerOwnerID),
+			slog.String("peer_ring_id", stats.peerRingID),
+			slog.String("peer_forward_ring_id", stats.peerForwardRingID),
 			slog.Bool("peer_forwarded", stats.peerForwarded),
 			slog.Int64("peer_forward_duration_ms", stats.peerForwardDuration.Milliseconds()),
 		)
@@ -355,16 +361,40 @@ func (p *Proxy) shouldForwardToPeer(w http.ResponseWriter, r *http.Request, targ
 	stats.peerMode = "peer"
 	stats.peerLocalID = p.peerRouter.LocalID()
 	stats.peerOwnerID = owner.ID
+	stats.peerRingID = p.peerRouter.RingID()
+	forwardedRequest := r.Header.Get(peerForwardedHeader) != ""
+	if forwardedRequest {
+		stats.peerForwardRingID = r.Header.Get(peerRingHeader)
+		if stats.peerForwardRingID != stats.peerRingID {
+			stats.peerForwarded = true
+			stats.cacheResult = "peer_ring_mismatch"
+			stats.peerForwardFailure = "ring_mismatch"
+			stats.status = http.StatusBadGateway
+			p.recordPeerMetrics(stats)
+			http.Error(w, "peer ring mismatch", http.StatusBadGateway)
+			return true
+		}
+	}
 	if owner.ID == p.peerRouter.LocalID() {
+		if forwardedRequest && r.Header.Get(peerOwnerHeader) != owner.ID {
+			stats.peerForwarded = true
+			stats.cacheResult = "peer_owner_mismatch"
+			stats.peerForwardFailure = "owner_mismatch"
+			stats.status = http.StatusBadGateway
+			p.recordPeerMetrics(stats)
+			http.Error(w, "peer owner mismatch", http.StatusBadGateway)
+			return true
+		}
 		stats.peerDecision = "local"
 		p.recordPeerMetrics(stats)
 		return false
 	}
 
-	if r.Header.Get(peerForwardedHeader) != "" {
+	if forwardedRequest {
 		stats.peerForwarded = true
 		stats.cacheResult = "peer_routing_mismatch"
 		stats.peerForwardFailure = "routing_mismatch"
+		stats.status = http.StatusBadGateway
 		p.recordPeerMetrics(stats)
 		http.Error(w, "peer routing mismatch", http.StatusBadGateway)
 		return true
@@ -541,6 +571,9 @@ func (p *Proxy) forwardToPeer(w http.ResponseWriter, r *http.Request, owner peer
 	}
 	req.Header.Set(peerForwardedHeader, "1")
 	req.Header.Set(peerOwnerHeader, owner.ID)
+	if p.peerRouter != nil {
+		req.Header.Set(peerRingHeader, p.peerRouter.RingID())
+	}
 
 	headerStart := time.Now()
 	resp, err := p.peerClient.Do(req)
@@ -2001,7 +2034,8 @@ func copyPeerRequestHeaders(dst, src http.Header) {
 func isPeerHeader(key string) bool {
 	return strings.EqualFold(key, peerForwardedHeader) ||
 		strings.EqualFold(key, peerOwnerHeader) ||
-		strings.EqualFold(key, peerFromHeader)
+		strings.EqualFold(key, peerFromHeader) ||
+		strings.EqualFold(key, peerRingHeader)
 }
 
 func isClientSigningHeader(key string) bool {

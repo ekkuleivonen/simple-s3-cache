@@ -1732,6 +1732,9 @@ func TestProxyPeerModeForwardsRemoteOwnerRequest(t *testing.T) {
 		if got := r.Header.Get(peerFromHeader); got != "cache-0" {
 			t.Fatalf("peer from header = %q, want cache-0", got)
 		}
+		if got := r.Header.Get(peerRingHeader); got == "" {
+			t.Fatal("peer ring header is empty")
+		}
 		if got := r.Header.Get("Authorization"); got != "client-signature" {
 			t.Fatalf("Authorization = %q, want client-signature", got)
 		}
@@ -1821,6 +1824,9 @@ func TestProxyPeerModeHandlesLocalOwnerRequestLocally(t *testing.T) {
 	if !strings.Contains(metricsBody, `simple_s3_cache_peer_owner_decisions_total{bucket="bucket",decision="local",owner_id="cache-0"} 1`) {
 		t.Fatalf("metrics missing local owner decision:\n%s", metricsBody)
 	}
+	if !strings.Contains(metricsBody, `simple_s3_cache_peer_ring_info{mode="peer",local_id="cache-0",ring_id="`) {
+		t.Fatalf("metrics missing peer ring info:\n%s", metricsBody)
+	}
 }
 
 func TestProxyPeerModeForwardedWriteInvalidatesOnOwner(t *testing.T) {
@@ -1844,9 +1850,12 @@ func TestProxyPeerModeForwardedWriteInvalidatesOnOwner(t *testing.T) {
 	defer upstream.Close()
 
 	owner := testProxy(t, upstream.URL)
+	ownerServer := httptest.NewServer(owner)
+	defer ownerServer.Close()
+
 	router, err := peerrouter.NewRouter("cache-1", []peerrouter.Peer{
 		{ID: "cache-0", URL: "http://cache-0.invalid"},
-		{ID: "cache-1", URL: "http://cache-1.invalid"},
+		{ID: "cache-1", URL: ownerServer.URL},
 	})
 	if err != nil {
 		t.Fatalf("NewRouter(owner) error = %v", err)
@@ -1863,9 +1872,9 @@ func TestProxyPeerModeForwardedWriteInvalidatesOnOwner(t *testing.T) {
 		t.Fatalf("PutObject() error = %v", err)
 	}
 	owner.peerRouter = router
-
-	ownerServer := httptest.NewServer(owner)
-	defer ownerServer.Close()
+	if owner.metrics != nil {
+		owner.metrics.SetPeerRingInfo("peer", router.LocalID(), router.RingID())
+	}
 
 	receiver := testProxy(t, upstream.URL)
 	enablePeerMode(t, receiver, "cache-0", []peerrouter.Peer{
@@ -1905,6 +1914,7 @@ func TestProxyPeerModeRejectsForwardingLoop(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/bucket/"+key, nil)
 	req.Header.Set(peerForwardedHeader, "1")
 	req.Header.Set(peerFromHeader, "cache-1")
+	req.Header.Set(peerRingHeader, router.RingID())
 	rec := httptest.NewRecorder()
 
 	p.ServeHTTP(rec, req)
@@ -1918,6 +1928,66 @@ func TestProxyPeerModeRejectsForwardingLoop(t *testing.T) {
 	}
 }
 
+func TestProxyPeerModeRejectsForwardedRingMismatch(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Fatal("upstream should not receive request with peer ring mismatch")
+	}))
+	defer upstream.Close()
+
+	p := testProxy(t, upstream.URL)
+	router := enablePeerMode(t, p, "cache-0", []peerrouter.Peer{
+		{ID: "cache-0", URL: "http://cache-0.invalid"},
+		{ID: "cache-1", URL: "http://cache-1.invalid"},
+	})
+	key := keyOwnedBy(t, router, "bucket", "cache-0")
+	req := httptest.NewRequest(http.MethodGet, "/bucket/"+key, nil)
+	req.Header.Set(peerForwardedHeader, "1")
+	req.Header.Set(peerOwnerHeader, "cache-0")
+	req.Header.Set(peerFromHeader, "gateway")
+	req.Header.Set(peerRingHeader, "different-ring")
+	rec := httptest.NewRecorder()
+
+	p.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502; body=%q", rec.Code, rec.Body.String())
+	}
+	metricsBody := renderProxyMetrics(t, p.metrics)
+	if !strings.Contains(metricsBody, `simple_s3_cache_peer_forward_failures_total{bucket="bucket",peer_id="cache-0",reason="ring_mismatch"} 1`) {
+		t.Fatalf("metrics missing ring mismatch failure:\n%s", metricsBody)
+	}
+}
+
+func TestProxyPeerModeRejectsForwardedOwnerMismatch(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Fatal("upstream should not receive request with peer owner mismatch")
+	}))
+	defer upstream.Close()
+
+	p := testProxy(t, upstream.URL)
+	router := enablePeerMode(t, p, "cache-0", []peerrouter.Peer{
+		{ID: "cache-0", URL: "http://cache-0.invalid"},
+		{ID: "cache-1", URL: "http://cache-1.invalid"},
+	})
+	key := keyOwnedBy(t, router, "bucket", "cache-0")
+	req := httptest.NewRequest(http.MethodGet, "/bucket/"+key, nil)
+	req.Header.Set(peerForwardedHeader, "1")
+	req.Header.Set(peerOwnerHeader, "cache-1")
+	req.Header.Set(peerFromHeader, "gateway")
+	req.Header.Set(peerRingHeader, router.RingID())
+	rec := httptest.NewRecorder()
+
+	p.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502; body=%q", rec.Code, rec.Body.String())
+	}
+	metricsBody := renderProxyMetrics(t, p.metrics)
+	if !strings.Contains(metricsBody, `simple_s3_cache_peer_forward_failures_total{bucket="bucket",peer_id="cache-0",reason="owner_mismatch"} 1`) {
+		t.Fatalf("metrics missing owner mismatch failure:\n%s", metricsBody)
+	}
+}
+
 func enablePeerMode(t *testing.T, p *Proxy, localID string, peers []peerrouter.Peer) *peerrouter.Router {
 	t.Helper()
 
@@ -1928,6 +1998,9 @@ func enablePeerMode(t *testing.T, p *Proxy, localID string, peers []peerrouter.P
 	p.peerRouter = router
 	p.peerClient = http.DefaultClient
 	p.peerTimeout = time.Minute
+	if p.metrics != nil {
+		p.metrics.SetPeerRingInfo("peer", router.LocalID(), router.RingID())
+	}
 	return router
 }
 
