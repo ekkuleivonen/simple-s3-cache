@@ -666,15 +666,15 @@ Defaults should be boring:
 
 ### Milestone 9: Readiness, Health, And Self-Quarantine
 
-- [ ] Separate liveness from readiness.
-- [ ] Add degraded state for consistency uncertainty.
-- [ ] Fail readiness on:
-  - [ ] failed invalidation/epoch application;
-  - [ ] persistent ring mismatch;
-  - [ ] detected local cache corruption that cannot be repaired safely.
-- [ ] Keep liveness up for diagnostics when possible.
-- [ ] Expose degraded reason in health output, logs, and metrics.
-- [ ] Add tests that degraded peers stop reporting ready.
+- [x] Separate liveness from readiness.
+- [x] Add degraded state for consistency uncertainty.
+- [x] Fail readiness on:
+  - [x] failed invalidation/epoch application;
+  - [x] persistent ring mismatch;
+  - [x] detected local cache corruption that cannot be repaired safely.
+- [x] Keep liveness up for diagnostics when possible.
+- [x] Expose degraded reason in health output, logs, and metrics.
+- [x] Add tests that degraded peers stop reporting ready.
 
 ### Milestone 10: Observability
 

@@ -18,6 +18,7 @@ type Recorder struct {
 	cachedBytes    int64
 	cachedByBucket map[string]int64
 	peerRingInfo   string
+	degradedReason string
 
 	counters   map[string]map[string]float64
 	histograms map[string]*histogram
@@ -138,6 +139,13 @@ func (r *Recorder) SetPeerRingInfo(mode, localID, ringID string) {
 	defer r.mu.Unlock()
 
 	r.peerRingInfo = labels(label{"mode", mode}, label{"local_id", localID}, label{"ring_id", ringID})
+}
+
+func (r *Recorder) SetDegraded(reason string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.degradedReason = strings.TrimSpace(reason)
 }
 
 func (r *Recorder) RecordBytesServedFromCache(bucket string, bytes int64) {
@@ -319,6 +327,12 @@ func (r *Recorder) renderGauges(b *strings.Builder) {
 	if r.peerRingInfo != "" {
 		b.WriteString("# TYPE simple_s3_cache_peer_ring_info gauge\n")
 		writeMetricLine(b, "simple_s3_cache_peer_ring_info", r.peerRingInfo, 1)
+	}
+	b.WriteString("# TYPE simple_s3_cache_degraded gauge\n")
+	if r.degradedReason == "" {
+		writeMetricLine(b, "simple_s3_cache_degraded", "", 0)
+	} else {
+		writeMetricLine(b, "simple_s3_cache_degraded", labels(label{"reason", r.degradedReason}), 1)
 	}
 }
 

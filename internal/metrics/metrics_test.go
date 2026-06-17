@@ -49,6 +49,7 @@ func TestRecorderRendersGlobalAndBucketMetrics(t *testing.T) {
 	recorder.ObserveGatewayDownstreamWriteDuration("photos", "owner", "cache-1", "2xx", 2*time.Millisecond)
 	recorder.SetCachedBytes(64, map[string]int64{"photos": 64})
 	recorder.SetPeerRingInfo("peer", "cache-0", "ring-123")
+	recorder.SetDegraded("peer ring mismatch")
 
 	body := renderMetrics(t, recorder)
 	for _, want := range []string{
@@ -75,6 +76,7 @@ func TestRecorderRendersGlobalAndBucketMetrics(t *testing.T) {
 		`simple_s3_cache_cached_bytes{bucket="photos"} 64`,
 		`simple_s3_cache_cache_max_bytes 1024`,
 		`simple_s3_cache_peer_ring_info{mode="peer",local_id="cache-0",ring_id="ring-123"} 1`,
+		`simple_s3_cache_degraded{reason="peer ring mismatch"} 1`,
 		`simple_s3_cache_requested_bytes_sum{bucket="photos"} 3`,
 		`simple_s3_cache_pages_touched_sum{bucket="photos"} 2`,
 		`simple_s3_cache_read_amplification_sum{bucket="photos"} 2.666`,
@@ -95,6 +97,16 @@ func TestRecorderRendersGlobalAndBucketMetrics(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Fatalf("metrics body missing %q:\n%s", want, body)
 		}
+	}
+}
+
+func TestRecorderRendersHealthyDegradedGauge(t *testing.T) {
+	recorder := NewRecorder(1024)
+
+	body := renderMetrics(t, recorder)
+
+	if !strings.Contains(body, `simple_s3_cache_degraded 0`) {
+		t.Fatalf("metrics body missing healthy degraded gauge:\n%s", body)
 	}
 }
 

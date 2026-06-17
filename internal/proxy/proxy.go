@@ -365,10 +365,20 @@ func (p *Proxy) markDegraded(reason string) {
 		reason = "degraded"
 	}
 	p.degradedMu.Lock()
-	if p.degradedReason == "" {
+	first := p.degradedReason == ""
+	if first {
 		p.degradedReason = reason
 	}
 	p.degradedMu.Unlock()
+	if !first {
+		return
+	}
+	if p.metrics != nil {
+		p.metrics.SetDegraded(reason)
+	}
+	if p.logger != nil {
+		p.logger.Error("proxy marked degraded", slog.String("reason", reason))
+	}
 }
 
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -675,6 +685,9 @@ func (p *Proxy) validateInternalPeerHeaders(w http.ResponseWriter, r *http.Reque
 
 	ringID := strings.TrimSpace(r.Header.Get(peerRingHeader))
 	if ringID == "" || ringID != p.peerRouter.RingID() {
+		if ringID != "" {
+			p.markDegraded("peer ring mismatch")
+		}
 		http.Error(w, "peer ring mismatch", http.StatusBadGateway)
 		return false
 	}
@@ -794,6 +807,7 @@ func (p *Proxy) shouldForwardToPeer(w http.ResponseWriter, r *http.Request, targ
 	if forwardedRequest {
 		stats.peerForwardRingID = r.Header.Get(peerRingHeader)
 		if stats.peerForwardRingID != stats.peerRingID {
+			p.markDegraded("peer ring mismatch")
 			stats.peerForwarded = true
 			stats.cacheResult = "peer_ring_mismatch"
 			stats.peerForwardFailure = "ring_mismatch"
@@ -2355,6 +2369,9 @@ func (p *Proxy) openCachedPage(ctx context.Context, target s3request.Target, obj
 	body, ok, err := p.cache.OpenPage(ctx, obj.ID, index, obj.ETag, obj.Epoch)
 	stats.cachePageOpenDuration += time.Since(start)
 	if err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "corrupt") {
+			p.markDegraded("local cache corruption")
+		}
 		return nil, false, err
 	}
 	if ok {

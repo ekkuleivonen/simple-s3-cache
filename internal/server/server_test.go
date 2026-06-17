@@ -31,7 +31,25 @@ func TestHealthz(t *testing.T) {
 	if got := rec.Header().Get("Content-Type"); got != "application/json" {
 		t.Fatalf("Content-Type = %q, want application/json", got)
 	}
-	if got := rec.Body.String(); got != "{\"status\":\"ok\"}\n" {
+	if got := rec.Body.String(); got != "{\"status\":\"ok\",\"ready\":true}\n" {
+		t.Fatalf("body = %q", got)
+	}
+}
+
+func TestHealthzStaysLiveWhenReadinessFails(t *testing.T) {
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logs, nil))
+	srv := New(config.Config{Listen: ":0"}, logger, failingReadiness{reason: "peer ring mismatch"})
+
+	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	rec := httptest.NewRecorder()
+
+	srv.httpServer.Handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	if got := rec.Body.String(); got != "{\"status\":\"ok\",\"ready\":false,\"reason\":\"peer ring mismatch\"}\n" {
 		t.Fatalf("body = %q", got)
 	}
 }
@@ -53,6 +71,24 @@ func TestReadyz(t *testing.T) {
 		t.Fatalf("Content-Type = %q, want application/json", got)
 	}
 	if got := rec.Body.String(); got != "{\"status\":\"ready\"}\n" {
+		t.Fatalf("body = %q", got)
+	}
+}
+
+func TestReadyzFailsWhenCheckerIsNotReady(t *testing.T) {
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logs, nil))
+	srv := New(config.Config{Listen: ":0"}, logger, failingReadiness{reason: "local invalidation failed"})
+
+	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+	rec := httptest.NewRecorder()
+
+	srv.httpServer.Handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusServiceUnavailable)
+	}
+	if got := rec.Body.String(); got != "{\"status\":\"not_ready\",\"reason\":\"local invalidation failed\"}\n" {
 		t.Fatalf("body = %q", got)
 	}
 }
@@ -200,4 +236,16 @@ type flushingResponseWriter struct {
 
 func (w *flushingResponseWriter) Flush() {
 	w.flushes++
+}
+
+type failingReadiness struct {
+	reason string
+}
+
+func (r failingReadiness) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (r failingReadiness) Readiness() (bool, string) {
+	return false, r.reason
 }

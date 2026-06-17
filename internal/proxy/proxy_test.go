@@ -1878,6 +1878,10 @@ func TestProxyDoesNotFailSuccessfulWriteWhenInvalidationFails(t *testing.T) {
 	if ready, reason := p.Readiness(); ready || reason == "" {
 		t.Fatalf("Readiness() = (%v, %q), want degraded reason", ready, reason)
 	}
+	metricsBody := renderProxyMetrics(t, p.metrics)
+	if !strings.Contains(metricsBody, `simple_s3_cache_degraded{reason="write invalidation failed"} 1`) {
+		t.Fatalf("metrics missing degraded reason:\n%s", metricsBody)
+	}
 }
 
 func TestProxyBroadcastsInvalidationAfterSuccessfulWrite(t *testing.T) {
@@ -3084,6 +3088,13 @@ func TestProxyPeerModeRejectsForwardedRingMismatch(t *testing.T) {
 	if rec.Code != http.StatusBadGateway {
 		t.Fatalf("status = %d, want 502; body=%q", rec.Code, rec.Body.String())
 	}
+	if ready, reason := p.Readiness(); ready || !strings.Contains(reason, "peer ring mismatch") {
+		t.Fatalf("Readiness() = (%v, %q), want peer ring mismatch degradation", ready, reason)
+	}
+	metricsBody := renderProxyMetrics(t, p.metrics)
+	if !strings.Contains(metricsBody, `simple_s3_cache_degraded{reason="peer ring mismatch"} 1`) {
+		t.Fatalf("metrics missing degraded ring mismatch:\n%s", metricsBody)
+	}
 }
 
 func TestProxyPeerModeRejectsForwardedMissingRing(t *testing.T) {
@@ -3108,6 +3119,41 @@ func TestProxyPeerModeRejectsForwardedMissingRing(t *testing.T) {
 
 	if rec.Code != http.StatusBadGateway {
 		t.Fatalf("status = %d, want 502; body=%q", rec.Code, rec.Body.String())
+	}
+	if ready, reason := p.Readiness(); !ready || reason != "" {
+		t.Fatalf("Readiness() = (%v, %q), want ready after missing ring header rejection", ready, reason)
+	}
+}
+
+func TestProxyMarksNotReadyWhenLocalCacheCorruptionCannotBeRepaired(t *testing.T) {
+	p := testProxy(t, "http://upstream.invalid")
+	p.cache = openPageCorruptFailingCache{cacheStore: p.cache}
+	target := s3request.Target{Bucket: "bucket", Key: "corrupt.bin"}
+	obj := cache.Object{
+		ID:    cache.ObjectKey(target.Bucket, target.Key),
+		ETag:  `"etag"`,
+		Epoch: 1,
+	}
+
+	body, ok, err := p.openCachedPage(context.Background(), target, obj, 0, newRequestStats(
+		httptest.NewRequest(http.MethodGet, "/bucket/corrupt.bin", nil),
+		target,
+	), true)
+	if err == nil {
+		t.Fatal("openCachedPage() error = nil, want corruption error")
+	}
+	if ok {
+		if body != nil {
+			_ = body.Close()
+		}
+		t.Fatal("openCachedPage() ok = true, want false")
+	}
+	if ready, reason := p.Readiness(); ready || !strings.Contains(reason, "local cache corruption") {
+		t.Fatalf("Readiness() = (%v, %q), want local cache corruption degradation", ready, reason)
+	}
+	metricsBody := renderProxyMetrics(t, p.metrics)
+	if !strings.Contains(metricsBody, `simple_s3_cache_degraded{reason="local cache corruption"} 1`) {
+		t.Fatalf("metrics missing degraded local cache corruption:\n%s", metricsBody)
 	}
 }
 
@@ -3455,6 +3501,14 @@ func (c invalidationFailingCache) DeleteObject(context.Context, string, string) 
 
 func (c invalidationFailingCache) InvalidateObject(context.Context, string, string, int64) (int64, error) {
 	return 0, errors.New("invalidation failed")
+}
+
+type openPageCorruptFailingCache struct {
+	cacheStore
+}
+
+func (c openPageCorruptFailingCache) OpenPage(context.Context, string, int64, string, int64) (io.ReadCloser, bool, error) {
+	return nil, false, errors.New("delete corrupt page file: permission denied")
 }
 
 type beginPageWriteFailingCache struct {
