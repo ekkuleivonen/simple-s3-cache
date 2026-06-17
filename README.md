@@ -521,6 +521,22 @@ Every peer must use the same `peers` list and a unique `local_id` matching its
 StatefulSet ordinal or other stable identity. Peer forwarding is internal HTTP;
 protect it with Kubernetes networking controls appropriate for the cluster.
 
+## Kubernetes / Helm
+
+A Helm chart is available at `charts/simple-s3-cache`. It supports all three
+deployment topologies:
+
+* `topology: single` for the default one-pod cache deployment.
+* `topology: peer` for direct peer mode behind a cache Service.
+* `topology: gateway` for stateless gateway pods routing directly to owner cache
+  peers.
+
+The chart generates stable StatefulSet peer IDs and DNS names, renders
+`peer.local_id` from each cache pod's `HOSTNAME`, and can use either an existing
+upstream credential Secret or chart-managed test credentials. See
+`charts/simple-s3-cache/README.md` and the example values files under
+`charts/simple-s3-cache/examples`.
+
 ## Observability
 
 Metrics and structured logs are part of production readiness, not an

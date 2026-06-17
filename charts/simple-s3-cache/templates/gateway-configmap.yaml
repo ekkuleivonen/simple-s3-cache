@@ -1,0 +1,28 @@
+{{- if eq (include "simple-s3-cache.topology" .) "gateway" }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "simple-s3-cache.fullname" . }}-gateway
+  labels:
+    {{- include "simple-s3-cache.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gateway
+data:
+  gateway.yaml: |
+    listen: ":8080"
+
+    http:
+      read_header_timeout: {{ .Values.http.readHeaderTimeout }}
+      read_timeout: {{ .Values.http.readTimeout }}
+      write_timeout: {{ .Values.http.writeTimeout }}
+      idle_timeout: {{ .Values.http.idleTimeout }}
+
+    peer:
+      mode: peer
+      forward_timeout: {{ .Values.peer.forwardTimeout }}
+      peers:
+      {{ $replicas := int (include "simple-s3-cache.cacheReplicas" .) }}
+      {{ range $i := until $replicas }}
+        - id: {{ include "simple-s3-cache.fullname" $ }}-{{ $i }}
+          url: {{ include "simple-s3-cache.peerURL" (list $ $i) }}
+      {{ end }}
+{{- end }}

@@ -1,0 +1,29 @@
+topology: single
+
+image:
+  repository: ghcr.io/ekkuleivonen/simple-s3-cache
+  tag: latest
+
+upstream:
+  endpoint: http://rustfs-api.rustfs.svc.cluster.local:9000
+  region: us-east-1
+  credentials:
+    existingSecret: rustfs-credentials
+    accessKeyKey: RUSTFS_ACCESS_KEY
+    secretKeyKey: RUSTFS_SECRET_KEY
+
+cache:
+  maxSize: 90GiB
+  pageSize: 4MiB
+
+persistence:
+  data:
+    size: 100Gi
+    storageClass: local-storage-nvme
+  meta:
+    size: 20Gi
+    storageClass: local-storage-nvme
+
+cacheService:
+  type: ClusterIP
+  port: 8080

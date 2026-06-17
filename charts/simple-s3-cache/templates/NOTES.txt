@@ -1,0 +1,17 @@
+simple-s3-cache has been installed in {{ include "simple-s3-cache.topology" . }} topology.
+
+{{- if eq (include "simple-s3-cache.topology" .) "gateway" }}
+Use the gateway Service for client S3 traffic:
+  {{ include "simple-s3-cache.fullname" . }}-gateway.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.gateway.service.port }}
+{{- else }}
+Use the cache Service for client S3 traffic:
+  {{ include "simple-s3-cache.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.cacheService.port }}
+{{- end }}
+
+Peer DNS names are generated from the StatefulSet:
+{{- $replicas := int (include "simple-s3-cache.cacheReplicas" .) }}
+{{- range $i := until $replicas }}
+  - {{ include "simple-s3-cache.fullname" $ }}-{{ $i }}.{{ include "simple-s3-cache.peerServiceName" $ }}.{{ $.Release.Namespace }}.svc.cluster.local
+{{- end }}
+
+Keep peer replica count and peer DNS names stable during peer and gateway rollouts.

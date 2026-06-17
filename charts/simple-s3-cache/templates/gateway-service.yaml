@@ -1,0 +1,29 @@
+{{- if eq (include "simple-s3-cache.topology" .) "gateway" }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "simple-s3-cache.fullname" . }}-gateway
+  labels:
+    {{- include "simple-s3-cache.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gateway
+    simple-s3-cache.elei.io/metrics: "true"
+  {{- with .Values.gateway.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.gateway.service.type }}
+  {{- if .Values.gateway.service.externalTrafficPolicy }}
+  externalTrafficPolicy: {{ .Values.gateway.service.externalTrafficPolicy }}
+  {{- end }}
+  {{- if .Values.gateway.service.loadBalancerIP }}
+  loadBalancerIP: {{ .Values.gateway.service.loadBalancerIP }}
+  {{- end }}
+  selector:
+    {{- include "simple-s3-cache.gatewaySelectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.gateway.service.port }}
+      targetPort: http
+      protocol: TCP
+{{- end }}

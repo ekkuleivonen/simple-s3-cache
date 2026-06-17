@@ -1,0 +1,144 @@
+# Supported topologies:
+# - single: one cache pod, no peer routing.
+# - peer: multiple cache peers behind the cache Service.
+# - gateway: stateless gateway Deployment routing directly to cache owners.
+topology: single
+
+replicaCount: 1
+
+image:
+  repository: ghcr.io/ekkuleivonen/simple-s3-cache
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+upstream:
+  endpoint: http://rustfs:9000
+  host: ""
+  region: us-east-1
+  responseHeaderTimeout: 30s
+  credentials:
+    existingSecret: ""
+    accessKeyKey: access_key
+    secretKeyKey: secret_key
+    sessionTokenKey: session_token
+    sessionTokenEnabled: false
+    accessKey: simple-s3-cache
+    secretKey: change-me
+    sessionToken: ""
+
+cache:
+  cachePath: /cache/objects
+  metaPath: /meta
+  maxSize: 1TiB
+  pageSize: 4MiB
+  metadataGCInterval: 1h
+  metadataMaxAge: 24h
+  metadataGCBatchSize: 512
+  sqliteCheckpointInterval: 6h
+
+http:
+  readHeaderTimeout: 5s
+  readTimeout: 10m
+  writeTimeout: 10m
+  idleTimeout: 2m
+
+upload:
+  spoolPath: /cache/spool
+  maxSpoolSize: 10GiB
+
+peer:
+  forwardTimeout: 10m
+
+initConfig:
+  image:
+    repository: busybox
+    tag: stable
+    pullPolicy: IfNotPresent
+
+cacheService:
+  # Defaults to enabled for single and peer topologies, disabled for gateway.
+  enabled: null
+  type: ClusterIP
+  port: 8080
+  annotations: {}
+  externalTrafficPolicy: ""
+  loadBalancerIP: ""
+
+peerService:
+  publishNotReadyAddresses: true
+  annotations: {}
+
+gateway:
+  replicaCount: 2
+  service:
+    type: ClusterIP
+    port: 8080
+    annotations: {}
+    externalTrafficPolicy: ""
+    loadBalancerIP: ""
+  resources: {}
+  podAnnotations: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+persistence:
+  enabled: true
+  data:
+    size: 100Gi
+    storageClass: ""
+    accessModes:
+      - ReadWriteOnce
+    selector: {}
+  meta:
+    size: 20Gi
+    storageClass: ""
+    accessModes:
+      - ReadWriteOnce
+    selector: {}
+
+resources: {}
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext:
+  fsGroup: 65532
+  runAsGroup: 65532
+  runAsUser: 65532
+
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+podAntiAffinity:
+  enabled: false
+  required: true
+  topologyKey: kubernetes.io/hostname
+
+serviceMonitor:
+  enabled: false
+  interval: 30s
+  labels: {}
+
+networkPolicy:
+  enabled: false
+  # Restricts client ingress. Empty means namespace-local ingress for single,
+  # peer, and gateway pods. In gateway topology, cache peer ingress is limited to
+  # gateway pods and cache peers from this release.
+  ingressFrom: []
+  egress:
+    allowDNS: true
+    allowAll: true

@@ -1,0 +1,252 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "simple-s3-cache.fullname" . }}
+  labels:
+    {{- include "simple-s3-cache.labels" . | nindent 4 }}
+    app.kubernetes.io/component: cache
+spec:
+  serviceName: {{ include "simple-s3-cache.peerServiceName" . }}
+  replicas: {{ include "simple-s3-cache.cacheReplicas" . }}
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      {{- include "simple-s3-cache.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "simple-s3-cache.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      enableServiceLinks: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- if or .Values.affinity .Values.podAntiAffinity.enabled }}
+      affinity:
+        {{- with .Values.affinity }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- if .Values.podAntiAffinity.enabled }}
+        podAntiAffinity:
+          {{- if .Values.podAntiAffinity.required }}
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  {{- include "simple-s3-cache.selectorLabels" . | nindent 18 }}
+              topologyKey: {{ .Values.podAntiAffinity.topologyKey }}
+          {{- else }}
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    {{- include "simple-s3-cache.selectorLabels" . | nindent 20 }}
+                topologyKey: {{ .Values.podAntiAffinity.topologyKey }}
+          {{- end }}
+        {{- end }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      initContainers:
+        - name: render-config
+          image: "{{ .Values.initConfig.image.repository }}:{{ .Values.initConfig.image.tag }}"
+          imagePullPolicy: {{ .Values.initConfig.image.pullPolicy }}
+          securityContext:
+            runAsGroup: 0
+            runAsUser: 0
+          env:
+            - name: UPSTREAM_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "simple-s3-cache.secretName" . }}
+                  key: {{ .Values.upstream.credentials.accessKeyKey }}
+            - name: UPSTREAM_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "simple-s3-cache.secretName" . }}
+                  key: {{ .Values.upstream.credentials.secretKeyKey }}
+            {{- if .Values.upstream.credentials.sessionTokenEnabled }}
+            - name: UPSTREAM_SESSION_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "simple-s3-cache.secretName" . }}
+                  key: {{ .Values.upstream.credentials.sessionTokenKey }}
+            {{- end }}
+          command:
+            - sh
+            - -c
+            - |
+              set -eu
+              install -d -o 65532 -g 65532 -m 0750 {{ .Values.cache.cachePath }} {{ .Values.upload.spoolPath }} {{ .Values.cache.metaPath }} /config
+
+              cat > /config/simple-s3-cache.yaml <<EOF
+              listen: ":8080"
+
+              upstream:
+                endpoint: {{ .Values.upstream.endpoint }}
+              {{ if .Values.upstream.host }}
+                host: {{ .Values.upstream.host }}
+              {{ end }}
+                region: {{ .Values.upstream.region }}
+                access_key: |-
+                  ${UPSTREAM_ACCESS_KEY}
+                secret_key: |-
+                  ${UPSTREAM_SECRET_KEY}
+              {{ if .Values.upstream.credentials.sessionTokenEnabled }}
+                session_token: |-
+                  ${UPSTREAM_SESSION_TOKEN}
+              {{ end }}
+                response_header_timeout: {{ .Values.upstream.responseHeaderTimeout }}
+
+              cache:
+                cache_path: {{ .Values.cache.cachePath }}
+                meta_path: {{ .Values.cache.metaPath }}
+                max_size: {{ .Values.cache.maxSize }}
+                page_size: {{ .Values.cache.pageSize }}
+                metadata_gc_interval: {{ .Values.cache.metadataGCInterval }}
+                metadata_max_age: {{ .Values.cache.metadataMaxAge }}
+                metadata_gc_batch_size: {{ .Values.cache.metadataGCBatchSize }}
+                sqlite_checkpoint_interval: {{ .Values.cache.sqliteCheckpointInterval }}
+
+              http:
+                read_header_timeout: {{ .Values.http.readHeaderTimeout }}
+                read_timeout: {{ .Values.http.readTimeout }}
+                write_timeout: {{ .Values.http.writeTimeout }}
+                idle_timeout: {{ .Values.http.idleTimeout }}
+
+              upload:
+                spool_path: {{ .Values.upload.spoolPath }}
+                max_spool_size: {{ .Values.upload.maxSpoolSize }}
+
+              peer:
+              {{ if eq (include "simple-s3-cache.topology" .) "single" }}
+                mode: single
+                forward_timeout: {{ .Values.peer.forwardTimeout }}
+              {{ else }}
+                mode: peer
+                local_id: ${HOSTNAME}
+                forward_timeout: {{ .Values.peer.forwardTimeout }}
+                peers:
+              {{ $replicas := int (include "simple-s3-cache.cacheReplicas" .) }}
+              {{ range $i := until $replicas }}
+                  - id: {{ include "simple-s3-cache.fullname" $ }}-{{ $i }}
+                    url: {{ include "simple-s3-cache.peerURL" (list $ $i) }}
+              {{ end }}
+              {{ end }}
+              EOF
+              chown 65532:65532 /config/simple-s3-cache.yaml
+              chmod 0440 /config/simple-s3-cache.yaml
+          volumeMounts:
+            - name: cache-data
+              mountPath: /cache
+            - name: cache-meta
+              mountPath: {{ .Values.cache.metaPath }}
+            - name: rendered-config
+              mountPath: /config
+      containers:
+        - name: simple-s3-cache
+          image: {{ include "simple-s3-cache.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - -config
+            - /config/simple-s3-cache.yaml
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: cache-data
+              mountPath: /cache
+            - name: cache-meta
+              mountPath: {{ .Values.cache.metaPath }}
+            - name: rendered-config
+              mountPath: /config
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: rendered-config
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+        {{- if not .Values.persistence.enabled }}
+        - name: cache-data
+          emptyDir: {}
+        - name: cache-meta
+          emptyDir: {}
+        {{- end }}
+  {{- if .Values.persistence.enabled }}
+  volumeClaimTemplates:
+    - apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
+        name: cache-data
+      spec:
+        accessModes:
+          {{- toYaml .Values.persistence.data.accessModes | nindent 10 }}
+        {{- if .Values.persistence.data.storageClass }}
+        storageClassName: {{ .Values.persistence.data.storageClass }}
+        {{- end }}
+        {{- with .Values.persistence.data.selector }}
+        selector:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.data.size }}
+    - apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
+        name: cache-meta
+      spec:
+        accessModes:
+          {{- toYaml .Values.persistence.meta.accessModes | nindent 10 }}
+        {{- if .Values.persistence.meta.storageClass }}
+        storageClassName: {{ .Values.persistence.meta.storageClass }}
+        {{- end }}
+        {{- with .Values.persistence.meta.selector }}
+        selector:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.meta.size }}
+  {{- end }}

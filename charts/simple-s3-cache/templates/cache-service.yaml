@@ -1,0 +1,28 @@
+{{- if eq (include "simple-s3-cache.cacheServiceEnabled" .) "true" }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "simple-s3-cache.fullname" . }}
+  labels:
+    {{- include "simple-s3-cache.labels" . | nindent 4 }}
+    app.kubernetes.io/component: cache
+  {{- with .Values.cacheService.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.cacheService.type }}
+  {{- if .Values.cacheService.externalTrafficPolicy }}
+  externalTrafficPolicy: {{ .Values.cacheService.externalTrafficPolicy }}
+  {{- end }}
+  {{- if .Values.cacheService.loadBalancerIP }}
+  loadBalancerIP: {{ .Values.cacheService.loadBalancerIP }}
+  {{- end }}
+  selector:
+    {{- include "simple-s3-cache.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.cacheService.port }}
+      targetPort: http
+      protocol: TCP
+{{- end }}

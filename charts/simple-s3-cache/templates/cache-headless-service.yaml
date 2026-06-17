@@ -1,0 +1,22 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "simple-s3-cache.peerServiceName" . }}
+  labels:
+    {{- include "simple-s3-cache.labels" . | nindent 4 }}
+    app.kubernetes.io/component: cache
+    simple-s3-cache.elei.io/metrics: "true"
+  {{- with .Values.peerService.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: {{ .Values.peerService.publishNotReadyAddresses }}
+  selector:
+    {{- include "simple-s3-cache.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      protocol: TCP
