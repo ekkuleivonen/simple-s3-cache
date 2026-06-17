@@ -113,6 +113,10 @@ func (r *Recorder) RecordPeerForwardFailure(bucket, peerID, reason string) {
 	r.inc("simple_s3_cache_peer_forward_failures_total", labels(label{"bucket", bucket}, label{"peer_id", peerID}, label{"reason", reason}), 1)
 }
 
+func (r *Recorder) RecordPeerReadFallback(bucket, peerID, reason string) {
+	r.inc("simple_s3_cache_peer_read_fallbacks_total", labels(label{"bucket", bucket}, label{"peer_id", peerID}, label{"reason", reason}), 1)
+}
+
 func (r *Recorder) RecordPeerForwardResponseBytes(bucket, peerID string, bytes int64) {
 	r.inc("simple_s3_cache_peer_forward_response_bytes_total", labels(label{"bucket", bucket}, label{"peer_id", peerID}), float64(bytes))
 }

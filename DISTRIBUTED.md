@@ -628,19 +628,19 @@ Defaults should be boring:
 
 ### Milestone 7: Coordinator Read Path
 
-- [ ] Obtain metadata locally or by upstream `HEAD`.
-- [ ] Treat metadata as object identity: ETag, epoch, size, page size, headers.
-- [ ] Honor client conditionals before peer fanout where possible.
-- [ ] Parse full-object and single-range reads into page spans.
-- [ ] Select read strategy using `object`, `page`, or `auto`.
-- [ ] Group page spans by page owner.
-- [ ] Batch page requests by owner.
-- [ ] Stream response bytes to the client in correct byte order.
-- [ ] Fall back to upstream pass-through before response commit when a peer read
+- [x] Obtain metadata locally or by upstream `HEAD`.
+- [x] Treat metadata as object identity: ETag, epoch, size, page size, headers.
+- [x] Honor client conditionals before peer fanout where possible.
+- [x] Parse full-object and single-range reads into page spans.
+- [x] Select read strategy using `object`, `page`, or `auto`.
+- [x] Group page spans by page owner.
+- [x] Batch page requests by owner.
+- [x] Stream response bytes to the client in correct byte order.
+- [x] Fall back to upstream pass-through before response commit when a peer read
   fails.
-- [ ] Do not store degraded pass-through bytes into distributed pages.
-- [ ] Close the downstream connection on post-commit peer/page failures.
-- [ ] Add tests for single-page, multi-page, multi-owner, fallback, and
+- [x] Do not store degraded pass-through bytes into distributed pages.
+- [x] Close the downstream connection on post-commit peer/page failures.
+- [x] Add tests for single-page, multi-page, multi-owner, fallback, and
   post-commit failure behavior.
 
 ### Milestone 8: Distributed Invalidation And Epochs

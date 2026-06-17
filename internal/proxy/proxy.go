@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -138,6 +139,19 @@ type internalPageReadRequest struct {
 	ETag       string  `json:"etag"`
 	Epoch      int64   `json:"epoch"`
 	Pages      []int64 `json:"pages"`
+}
+
+type coordinatorPageBatch struct {
+	owner  peerrouter.Peer
+	pages  []int64
+	body   io.Closer
+	reader *peerrouter.PageFrameReader
+}
+
+type coordinatorPageReader struct {
+	batch  *coordinatorPageBatch
+	frame  peerrouter.PageFrame
+	loaded bool
 }
 
 type requestStats struct {
@@ -621,7 +635,7 @@ func (p *Proxy) serveS3HTTP(w http.ResponseWriter, r *http.Request) {
 	})
 
 	stats := newRequestStats(r, target)
-	if p.shouldForwardToPeer(w, r, target, stats) {
+	if p.shouldForwardToPeer(w, r, target, classification, stats) {
 		return
 	}
 	start := time.Now()
@@ -686,7 +700,7 @@ func (p *Proxy) serveS3HTTP(w http.ResponseWriter, r *http.Request) {
 	p.logger.LogAttrs(r.Context(), slog.LevelInfo, "proxy request", attrs...)
 }
 
-func (p *Proxy) shouldForwardToPeer(w http.ResponseWriter, r *http.Request, target s3request.Target, stats *requestStats) bool {
+func (p *Proxy) shouldForwardToPeer(w http.ResponseWriter, r *http.Request, target s3request.Target, classification s3request.Classification, stats *requestStats) bool {
 	if p.peerRouter == nil || !target.IsObject() {
 		return false
 	}
@@ -721,6 +735,11 @@ func (p *Proxy) shouldForwardToPeer(w http.ResponseWriter, r *http.Request, targ
 		}
 		stats.peerDecision = "local"
 		p.recordPeerMetrics(stats)
+		return false
+	}
+
+	if !forwardedRequest && isCoordinatorReadCandidate(classification) {
+		stats.peerDecision = "coordinator"
 		return false
 	}
 
@@ -771,6 +790,11 @@ func (p *Proxy) shouldForwardToPeer(w http.ResponseWriter, r *http.Request, targ
 		slog.Int64("peer_response_body_read_chunks", stats.peerResponseBodyReadChunks),
 	)
 	return true
+}
+
+func isCoordinatorReadCandidate(classification s3request.Classification) bool {
+	return classification.Disposition == s3request.CacheableFullObject ||
+		classification.Disposition == s3request.CacheableRangeObject
 }
 
 func (p *Proxy) handle(w http.ResponseWriter, r *http.Request, target s3request.Target, classification s3request.Classification, stats *requestStats) (int, int64, error) {
@@ -1356,6 +1380,38 @@ func (p *Proxy) recordUpstreamFailure(bucket, operation string) {
 	}
 }
 
+func (p *Proxy) forwardObjectReadToOwner(w http.ResponseWriter, r *http.Request, target s3request.Target, stats *requestStats) (bool, int, int64, error) {
+	if p.peerRouter == nil || stats.readStrategy != readShardingObject || r.Header.Get(peerForwardedHeader) != "" {
+		return false, 0, 0, nil
+	}
+	owner := p.peerRouter.Owner(target.Bucket, target.Key)
+	if owner.ID == p.peerRouter.LocalID() {
+		stats.peerDecision = "local"
+		return false, 0, 0, nil
+	}
+
+	stats.peerMode = "peer"
+	stats.peerLocalID = p.peerRouter.LocalID()
+	stats.peerOwnerID = owner.ID
+	stats.peerRingID = p.peerRouter.RingID()
+	stats.peerForwarded = true
+	stats.peerDecision = "remote"
+	stats.cacheResult = "peer_forward"
+
+	start := time.Now()
+	status, bytesWritten, err := p.forwardToPeer(w, r, owner, stats)
+	stats.peerForwardDuration = time.Since(start)
+	stats.status = status
+	stats.bytesSent = bytesWritten
+	if err != nil {
+		stats.peerForwardFailure = "request_failed"
+		p.recordPeerMetrics(stats)
+		return true, status, bytesWritten, err
+	}
+	p.recordPeerMetrics(stats)
+	return true, status, bytesWritten, nil
+}
+
 func (p *Proxy) serveCachedHead(w http.ResponseWriter, r *http.Request, target s3request.Target, stats *requestStats) (int, int64, error) {
 	metadataStart := time.Now()
 	obj, ok, err := p.cache.GetObject(r.Context(), target.Bucket, target.Key)
@@ -1430,6 +1486,9 @@ func (p *Proxy) serveCachedRange(w http.ResponseWriter, r *http.Request, target 
 		w.WriteHeader(status)
 		return status, 0, nil
 	}
+	if handled, status, bytesWritten, err := p.forwardObjectReadToOwner(w, r, target, stats); handled {
+		return status, bytesWritten, err
+	}
 
 	byteRange, err := cacheplan.ParseRange(r.Header.Get("Range"), obj.Size)
 	if err != nil {
@@ -1437,6 +1496,10 @@ func (p *Proxy) serveCachedRange(w http.ResponseWriter, r *http.Request, target 
 		return p.forward(w, r, stats)
 	}
 	stats.bytesRequested = byteRange.End - byteRange.Start + 1
+
+	if stats.readStrategy == readShardingPage {
+		return p.serveDistributedPageRead(w, r, target, obj, byteRange, true, stats)
+	}
 
 	pages, firstPage, err := p.prepareFirstPage(r, target, obj, byteRange, stats)
 	if errors.Is(err, errObjectChanged) {
@@ -1495,6 +1558,9 @@ func (p *Proxy) serveCachedFullObject(w http.ResponseWriter, r *http.Request, ta
 		w.WriteHeader(status)
 		return status, 0, nil
 	}
+	if handled, status, bytesWritten, err := p.forwardObjectReadToOwner(w, r, target, stats); handled {
+		return status, bytesWritten, err
+	}
 	stats.bytesRequested = obj.Size
 	if obj.Size == 0 {
 		stats.cacheResult = "hit"
@@ -1504,6 +1570,10 @@ func (p *Proxy) serveCachedFullObject(w http.ResponseWriter, r *http.Request, ta
 	}
 
 	byteRange := cacheplan.ByteRange{Start: 0, End: obj.Size - 1}
+	if stats.readStrategy == readShardingPage {
+		return p.serveDistributedPageRead(w, r, target, obj, byteRange, false, stats)
+	}
+
 	pages, err := cacheplan.PagesForRange(byteRange, obj.PageSize)
 	if err != nil {
 		return 0, 0, err
@@ -1868,6 +1938,211 @@ func (p *Proxy) refetchAfterObjectChanged(r *http.Request, target s3request.Targ
 
 	pages, firstPage, err := p.prepareFirstPage(r, target, obj, requestedRange, stats)
 	return obj, requestedRange, pages, firstPage, err
+}
+
+func (p *Proxy) serveDistributedPageRead(w http.ResponseWriter, r *http.Request, target s3request.Target, obj cache.Object, byteRange cacheplan.ByteRange, rangeResponse bool, stats *requestStats) (int, int64, error) {
+	pages, err := cacheplan.PagesForRange(byteRange, obj.PageSize)
+	if err != nil {
+		return 0, 0, err
+	}
+	stats.pagesRequested = int64(len(pages))
+
+	batches, err := p.openCoordinatorPageBatches(r, target, obj, pages, stats)
+	if err != nil {
+		closeCoordinatorPageBatches(batches)
+		stats.cacheResult = "fallback"
+		return p.forward(w, r, stats)
+	}
+	defer closeCoordinatorPageBatches(batches)
+
+	writeCachedObjectHeaders(w.Header(), obj, rangeResponse)
+	status := http.StatusOK
+	if rangeResponse {
+		status = http.StatusPartialContent
+		w.Header().Set("Content-Length", strconv.FormatInt(byteRange.End-byteRange.Start+1, 10))
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", byteRange.Start, byteRange.End, obj.Size))
+	}
+	w.WriteHeader(status)
+
+	start := time.Now()
+	bytesWritten, err := p.streamCoordinatorPageSpans(w, r, target, obj, pages, batches, stats)
+	stats.cacheServeDuration += time.Since(start)
+	stats.finishCachedResult()
+	return status, bytesWritten, err
+}
+
+func (p *Proxy) openCoordinatorPageBatches(r *http.Request, target s3request.Target, obj cache.Object, pages []cacheplan.PageSpan, stats *requestStats) (map[string]*coordinatorPageBatch, error) {
+	batches := p.groupCoordinatorPageBatches(target, pages)
+	for _, batch := range batches {
+		if batch.owner.ID == p.peerRouter.LocalID() {
+			continue
+		}
+		if err := p.openRemoteCoordinatorPageBatch(r, target, obj, batch, stats); err != nil {
+			return batches, err
+		}
+	}
+	return batches, nil
+}
+
+func (p *Proxy) groupCoordinatorPageBatches(target s3request.Target, pages []cacheplan.PageSpan) map[string]*coordinatorPageBatch {
+	batches := make(map[string]*coordinatorPageBatch)
+	for _, page := range pages {
+		owner := p.peerRouter.PageOwner(target.Bucket, target.Key, page.Index)
+		batch := batches[owner.ID]
+		if batch == nil {
+			batch = &coordinatorPageBatch{owner: owner}
+			batches[owner.ID] = batch
+		}
+		batch.pages = append(batch.pages, page.Index)
+	}
+	return batches
+}
+
+func (p *Proxy) openRemoteCoordinatorPageBatch(r *http.Request, target s3request.Target, obj cache.Object, batch *coordinatorPageBatch, stats *requestStats) error {
+	body := internalPageReadRequest{
+		Bucket:     target.Bucket,
+		Key:        target.Key,
+		ObjectSize: obj.Size,
+		PageSize:   obj.PageSize,
+		ETag:       obj.ETag,
+		Epoch:      obj.Epoch,
+		Pages:      batch.pages,
+	}
+	data, err := json.Marshal(body)
+	if err != nil {
+		return err
+	}
+
+	peerURL := strings.TrimRight(batch.owner.URL, "/") + "/internal/v1/pages/read"
+	ctx := r.Context()
+	if p.peerTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, p.peerTimeout)
+		defer cancel()
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, peerURL, bytes.NewReader(data))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(peerFromHeader, p.peerRouter.LocalID())
+	req.Header.Set(peerRingHeader, p.peerRouter.RingID())
+
+	headerStart := time.Now()
+	resp, err := p.peerClient.Do(req)
+	stats.peerResponseHeaderDuration += time.Since(headerStart)
+	if err != nil {
+		p.recordPeerReadFallback(r.Context(), target, batch.owner.ID, "request_failed", err)
+		return err
+	}
+	if resp.StatusCode != http.StatusOK {
+		defer resp.Body.Close()
+		err := fmt.Errorf("peer %s page read returned status %d", batch.owner.ID, resp.StatusCode)
+		p.recordPeerReadFallback(r.Context(), target, batch.owner.ID, "status", err)
+		return err
+	}
+	if got := resp.Header.Get("Content-Type"); !strings.HasPrefix(got, peerrouter.PageFrameContentType) {
+		defer resp.Body.Close()
+		err := fmt.Errorf("peer %s page read content type %q", batch.owner.ID, got)
+		p.recordPeerReadFallback(r.Context(), target, batch.owner.ID, "content_type", err)
+		return err
+	}
+	reader, err := peerrouter.NewPageFrameReader(resp.Body, batch.pages, obj.PageSize)
+	if err != nil {
+		defer resp.Body.Close()
+		p.recordPeerReadFallback(r.Context(), target, batch.owner.ID, "frame", err)
+		return err
+	}
+	batch.body = resp.Body
+	batch.reader = reader
+	return nil
+}
+
+func (p *Proxy) recordPeerReadFallback(ctx context.Context, target s3request.Target, peerID, reason string, err error) {
+	if p.metrics != nil {
+		p.metrics.RecordPeerReadFallback(target.Bucket, peerID, reason)
+	}
+	p.logger.WarnContext(ctx, "distributed page read falling back to upstream pass-through",
+		slog.String("bucket", target.Bucket),
+		slog.String("key", target.Key),
+		slog.String("peer_id", peerID),
+		slog.String("reason", reason),
+		slog.String("error", err.Error()),
+	)
+}
+
+func closeCoordinatorPageBatches(batches map[string]*coordinatorPageBatch) {
+	for _, batch := range batches {
+		if batch.body != nil {
+			_ = batch.body.Close()
+		}
+	}
+}
+
+func (p *Proxy) streamCoordinatorPageSpans(w http.ResponseWriter, r *http.Request, target s3request.Target, obj cache.Object, pages []cacheplan.PageSpan, batches map[string]*coordinatorPageBatch, stats *requestStats) (int64, error) {
+	readers := make(map[string]*coordinatorPageReader)
+	var total int64
+	for _, page := range pages {
+		owner := p.peerRouter.PageOwner(target.Bucket, target.Key, page.Index)
+		batch := batches[owner.ID]
+		if batch == nil {
+			err := fmt.Errorf("missing page batch for owner %s", owner.ID)
+			abortCommittedResponse(w, total)
+			return total, err
+		}
+		n, err := p.streamCoordinatorPageSpan(w, r, target, obj, page, batch, readers, stats)
+		stats.cacheResponseBytes += n
+		total += n
+		if err != nil {
+			abortCommittedResponse(w, total)
+			return total, err
+		}
+	}
+	for _, batch := range batches {
+		if batch.reader == nil {
+			continue
+		}
+		readStart := time.Now()
+		_, err := batch.reader.NextPage()
+		stats.peerResponseBodyReadDuration += time.Since(readStart)
+		if !errors.Is(err, io.EOF) {
+			abortCommittedResponse(w, total)
+			return total, err
+		}
+	}
+	return total, nil
+}
+
+func (p *Proxy) streamCoordinatorPageSpan(w http.ResponseWriter, r *http.Request, target s3request.Target, obj cache.Object, page cacheplan.PageSpan, batch *coordinatorPageBatch, readers map[string]*coordinatorPageReader, stats *requestStats) (int64, error) {
+	if batch.owner.ID == p.peerRouter.LocalID() {
+		return p.streamPageSpan(w, r, target, obj, page, stats)
+	}
+
+	reader := readers[batch.owner.ID]
+	if reader == nil {
+		reader = &coordinatorPageReader{batch: batch}
+		readers[batch.owner.ID] = reader
+	}
+	if !reader.loaded || reader.frame.Index != page.Index {
+		readStart := time.Now()
+		frame, err := batch.reader.NextPage()
+		stats.peerResponseBodyReadDuration += time.Since(readStart)
+		if err != nil {
+			return 0, err
+		}
+		stats.peerResponseBodyReadChunks++
+		stats.peerResponseBytes += int64(len(frame.Bytes))
+		reader.frame = frame
+		reader.loaded = true
+	}
+	if reader.frame.Index != page.Index {
+		return 0, fmt.Errorf("peer %s returned page %d while coordinator wanted page %d", batch.owner.ID, reader.frame.Index, page.Index)
+	}
+
+	copyStart := time.Now()
+	n, err := copyPageSpan(w, bytes.NewReader(reader.frame.Bytes), page, obj.PageSize)
+	stats.cacheResponseCopyDuration += time.Since(copyStart)
+	return n, err
 }
 
 func (p *Proxy) streamCachedPages(w http.ResponseWriter, r *http.Request, target s3request.Target, obj cache.Object, pages []cacheplan.PageSpan, firstPage io.ReadCloser, stats *requestStats) (int64, error) {
