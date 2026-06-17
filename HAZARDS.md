@@ -372,6 +372,6 @@ test. Until then, treat it as load-bearing.
   require peer headers, matching ring fingerprint, and a signed peer MAC before
   touching cache state. They should be kept under a clearly internal path or
   listener. Never trust client-visible headers for upstream page fills.
-* **Watch:** Public handlers that route `/internal/*`; gateway or peer code that
-  forwards client-supplied internal headers; internal endpoints without tests for
-  missing or mismatched peer identity.
+* **Watch:** Public handlers that route `/internal/*`; peer code that forwards
+  client-supplied internal headers; internal endpoints without tests for missing
+  or mismatched peer identity.

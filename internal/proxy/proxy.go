@@ -30,6 +30,7 @@ import (
 	"github.com/ekkuleivonen/simple-s3-cache/internal/cacheplan"
 	appconfig "github.com/ekkuleivonen/simple-s3-cache/internal/config"
 	"github.com/ekkuleivonen/simple-s3-cache/internal/metrics"
+	"github.com/ekkuleivonen/simple-s3-cache/internal/ops"
 	peerrouter "github.com/ekkuleivonen/simple-s3-cache/internal/peer"
 	"github.com/ekkuleivonen/simple-s3-cache/internal/s3request"
 )
@@ -100,32 +101,33 @@ type cacheStore interface {
 }
 
 type Proxy struct {
-	upstreamEndpoint *url.URL
-	upstreamHost     string
-	region           string
-	credentials      aws.CredentialsProvider
-	signer           *v4.Signer
-	client           *http.Client
-	logger           *slog.Logger
-	cache            cacheStore
-	pageSize         int64
-	pageSizeByBucket map[string]int64
-	upload           uploadOptions
-	metrics          *metrics.Recorder
-	peerRouter       *peerrouter.Router
-	peerClient       *http.Client
-	peerTimeout      time.Duration
-	peerAuthSecret   string
-	readSharding     string
-	pageShardMin     int64
-	pageFillMu       sync.Mutex
-	pageFills        map[pageFillKey]*pageFillCall
-	peerFillSem      chan struct{}
-	objectFillMu     sync.Mutex
-	objectFillSems   map[string]chan struct{}
-	objectFillLimit  int
-	degradedMu       sync.RWMutex
-	degradedReason   string
+	upstreamEndpoint       *url.URL
+	upstreamHost           string
+	region                 string
+	credentials            aws.CredentialsProvider
+	signer                 *v4.Signer
+	client                 *http.Client
+	logger                 *slog.Logger
+	cache                  cacheStore
+	pageSize               int64
+	pageSizeByBucket       map[string]int64
+	upload                 uploadOptions
+	metrics                *metrics.Recorder
+	peerRouter             *peerrouter.Router
+	peerClient             *http.Client
+	peerTimeout            time.Duration
+	peerAuthSecret         string
+	readSharding           string
+	pageShardMin           int64
+	pageFillMu             sync.Mutex
+	pageFills              map[pageFillKey]*pageFillCall
+	peerFillSem            chan struct{}
+	objectFillMu           sync.Mutex
+	objectFillSems         map[string]chan struct{}
+	objectFillLimit        int
+	degradedMu             sync.RWMutex
+	degraded               *ops.DegradedState
+	internalPeerSuccessLog bool
 }
 
 type readStrategySelection struct {
@@ -228,13 +230,11 @@ func New(ctx context.Context, cfg appconfig.Config, logger *slog.Logger) (*Proxy
 	if err != nil {
 		return nil, fmt.Errorf("parse upstream endpoint: %w", err)
 	}
+	if err := prepareUploadSpool(cfg.Upload.SpoolPath); err != nil {
+		return nil, err
+	}
 
 	recorder := metrics.NewRecorder(cfg.Cache.MaxSize)
-	if cfg.Peer.Mode == "peer" {
-		if err := cache.WipeLocalState(cfg.Cache.CachePath, cfg.Cache.MetaPath); err != nil {
-			return nil, fmt.Errorf("wipe peer cache state: %w", err)
-		}
-	}
 	cacheStore, err := cache.Open(ctx, cache.Options{
 		CachePath:                cfg.Cache.CachePath,
 		MetaPath:                 cfg.Cache.MetaPath,
@@ -267,7 +267,7 @@ func New(ctx context.Context, cfg appconfig.Config, logger *slog.Logger) (*Proxy
 			_ = cacheStore.Close()
 			return nil, fmt.Errorf("create peer router: %w", err)
 		}
-		recorder.SetPeerRingInfo("peer", router.LocalID(), router.RingID())
+		recorder.SetPeerRingInfo("peer", router.LocalID(), router.RingID(), len(cfg.Peer.Peers))
 	}
 
 	return &Proxy{
@@ -285,17 +285,28 @@ func New(ctx context.Context, cfg appconfig.Config, logger *slog.Logger) (*Proxy
 			spoolPath:    cfg.Upload.SpoolPath,
 			maxSpoolSize: cfg.Upload.MaxSpoolSize,
 		},
-		metrics:         recorder,
-		peerRouter:      router,
-		peerClient:      newPeerHTTPClient(cfg.Peer.ForwardTimeout),
-		peerTimeout:     cfg.Peer.ForwardTimeout,
-		peerAuthSecret:  strings.TrimSpace(cfg.Peer.AuthSecret),
-		readSharding:    strings.TrimSpace(cfg.Peer.ReadSharding),
-		pageShardMin:    cfg.Peer.PageShardingMinPages,
-		peerFillSem:     make(chan struct{}, cfg.Peer.MaxFillConcurrency),
-		objectFillSems:  make(map[string]chan struct{}),
-		objectFillLimit: cfg.Peer.MaxObjectFillConcurrency,
+		metrics:                recorder,
+		peerRouter:             router,
+		peerClient:             newPeerHTTPClient(cfg.Peer.ForwardTimeout),
+		peerTimeout:            cfg.Peer.ForwardTimeout,
+		peerAuthSecret:         strings.TrimSpace(cfg.Peer.AuthSecret),
+		readSharding:           strings.TrimSpace(cfg.Peer.ReadSharding),
+		pageShardMin:           cfg.Peer.PageShardingMinPages,
+		peerFillSem:            make(chan struct{}, cfg.Peer.MaxFillConcurrency),
+		objectFillSems:         make(map[string]chan struct{}),
+		objectFillLimit:        cfg.Peer.MaxObjectFillConcurrency,
+		internalPeerSuccessLog: cfg.Logging.InternalPeerSuccessLog,
 	}, nil
+}
+
+func prepareUploadSpool(path string) error {
+	if strings.TrimSpace(path) == "" {
+		return nil
+	}
+	if err := os.MkdirAll(path, 0o700); err != nil {
+		return fmt.Errorf("prepare upload spool path: %w", err)
+	}
+	return nil
 }
 
 func newUpstreamHTTPClient(cfg appconfig.UpstreamConfig) *http.Client {
@@ -369,6 +380,34 @@ func (p *Proxy) MetricsHandler() http.Handler {
 	return p.metrics.Handler()
 }
 
+func (p *Proxy) PeerState() ops.PeerState {
+	readiness := p.ReadinessDetail()
+	state := ops.PeerState{
+		Mode:                 "single",
+		CacheMode:            "single",
+		ReadSharding:         p.readSharding,
+		PageShardingMinPages: p.pageShardMin,
+		Ready:                readiness.Ready,
+		Degraded:             readiness.Degraded,
+		AuthConfigured:       strings.TrimSpace(p.peerAuthSecret) != "",
+	}
+	if p.peerRouter == nil {
+		return state
+	}
+	state.Mode = "peer"
+	state.CacheMode = "peer"
+	state.LocalID = p.peerRouter.LocalID()
+	state.RingID = p.peerRouter.RingID()
+	for _, peer := range p.peerRouter.Peers() {
+		state.Peers = append(state.Peers, ops.Peer{
+			ID:    peer.ID,
+			URL:   peer.URL,
+			Local: peer.ID == p.peerRouter.LocalID(),
+		})
+	}
+	return state
+}
+
 func (p *Proxy) Close() error {
 	if p.cache == nil {
 		return nil
@@ -377,18 +416,50 @@ func (p *Proxy) Close() error {
 }
 
 func (p *Proxy) Readiness() (bool, string) {
+	readiness := p.ReadinessDetail()
+	if readiness.Ready {
+		return true, ""
+	}
+	if readiness.Degraded != nil {
+		return false, readiness.Degraded.Reason
+	}
+	return false, "degraded"
+}
+
+func (p *Proxy) ReadinessDetail() ops.Readiness {
 	p.degradedMu.RLock()
 	defer p.degradedMu.RUnlock()
-	if p.degradedReason != "" {
-		return false, p.degradedReason
+	if p.degraded != nil {
+		degraded := cloneDegradedState(p.degraded)
+		return ops.Readiness{Ready: false, Degraded: &degraded}
 	}
-	return true, ""
+	return ops.Readiness{Ready: true}
 }
 
 func (p *Proxy) currentDegradedReason() string {
+	degraded := p.currentDegradedState()
+	if degraded == nil {
+		return ""
+	}
+	return degraded.Reason
+}
+
+func (p *Proxy) currentDegradedCode() string {
+	degraded := p.currentDegradedState()
+	if degraded == nil {
+		return ""
+	}
+	return degraded.Code
+}
+
+func (p *Proxy) currentDegradedState() *ops.DegradedState {
 	p.degradedMu.RLock()
 	defer p.degradedMu.RUnlock()
-	return p.degradedReason
+	if p.degraded == nil {
+		return nil
+	}
+	degraded := cloneDegradedState(p.degraded)
+	return &degraded
 }
 
 func (p *Proxy) localPeerID() string {
@@ -398,25 +469,91 @@ func (p *Proxy) localPeerID() string {
 	return ""
 }
 
-func (p *Proxy) markDegraded(reason string) {
-	reason = strings.TrimSpace(reason)
-	if reason == "" {
-		reason = "degraded"
+func (p *Proxy) localRingID() string {
+	if p.peerRouter != nil {
+		return p.peerRouter.RingID()
 	}
+	return ""
+}
+
+func (p *Proxy) markDegraded(reason string) {
+	p.markDegradedWithContext(reason, nil)
+}
+
+func (p *Proxy) markDegradedWithContext(reason string, context map[string]string) {
+	state := p.newDegradedState(reason, context)
 	p.degradedMu.Lock()
-	first := p.degradedReason == ""
+	first := p.degraded == nil
 	if first {
-		p.degradedReason = reason
+		p.degraded = &state
 	}
 	p.degradedMu.Unlock()
 	if !first {
 		return
 	}
 	if p.metrics != nil {
-		p.metrics.SetDegraded(reason)
+		p.metrics.SetDegraded(state.Code)
 	}
 	if p.logger != nil {
-		p.logger.Error("proxy marked degraded", slog.String("reason", reason))
+		p.logger.Error("proxy marked degraded",
+			slog.String("reason_code", state.Code),
+			slog.String("reason", state.Reason),
+			slog.String("peer_id", state.PeerID),
+			slog.String("ring_id", state.RingID),
+		)
+	}
+}
+
+func (p *Proxy) newDegradedState(reason string, context map[string]string) ops.DegradedState {
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "degraded"
+	}
+	copiedContext := make(map[string]string, len(context))
+	for key, value := range context {
+		key = strings.TrimSpace(key)
+		value = strings.TrimSpace(value)
+		if key != "" && value != "" {
+			copiedContext[key] = value
+		}
+	}
+	return ops.DegradedState{
+		Code:    degradedReasonCode(reason),
+		Reason:  reason,
+		Since:   time.Now().UTC(),
+		PeerID:  p.localPeerID(),
+		RingID:  p.localRingID(),
+		Context: copiedContext,
+	}
+}
+
+func cloneDegradedState(state *ops.DegradedState) ops.DegradedState {
+	cloned := *state
+	if state.Context != nil {
+		cloned.Context = make(map[string]string, len(state.Context))
+		for key, value := range state.Context {
+			cloned.Context[key] = value
+		}
+	}
+	return cloned
+}
+
+func degradedReasonCode(reason string) string {
+	switch strings.ToLower(strings.TrimSpace(reason)) {
+	case "local invalidation failed":
+		return "local_invalidation_failed"
+	case "write invalidation failed":
+		return "write_invalidation_failed"
+	case "peer invalidation failed":
+		return "peer_invalidation_failed"
+	case "peer ring mismatch":
+		return "peer_ring_mismatch"
+	case "local cache corruption":
+		return "local_cache_corruption"
+	case "":
+		return "degraded"
+	default:
+		return strings.NewReplacer(" ", "_", "-", "_").Replace(strings.ToLower(strings.TrimSpace(reason)))
 	}
 }
 
@@ -480,7 +617,7 @@ func (p *Proxy) serveInternalInvalidate(w http.ResponseWriter, r *http.Request) 
 
 	epoch, err := p.cache.InvalidateObject(r.Context(), req.Bucket, req.Key, req.Epoch)
 	if err != nil {
-		p.markDegraded("local invalidation failed")
+		p.markDegradedWithContext("local invalidation failed", map[string]string{"bucket": req.Bucket})
 		p.logger.ErrorContext(r.Context(), "internal invalidation failed",
 			slog.String("bucket", req.Bucket),
 			slog.String("key", req.Key),
@@ -497,6 +634,7 @@ func (p *Proxy) serveInternalInvalidate(w http.ResponseWriter, r *http.Request) 
 }
 
 func (p *Proxy) serveInternalPageRead(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
 	status := http.StatusOK
 	bytesServed := int64(0)
 	var req internalPageReadRequest
@@ -508,6 +646,7 @@ func (p *Proxy) serveInternalPageRead(w http.ResponseWriter, r *http.Request) {
 		statusClass := peerStatusClass(status)
 		if p.metrics != nil {
 			p.metrics.RecordPageOwnerRequest(req.Bucket, ownerID, statusClass)
+			p.metrics.ObserveInternalPeerRequestDuration(req.Bucket, ownerID, statusClass, time.Since(start))
 			if bytesServed > 0 {
 				p.metrics.RecordPageOwnerBytesServed(req.Bucket, ownerID, bytesServed)
 			}
@@ -679,19 +818,21 @@ func (p *Proxy) serveInternalPageRead(w http.ResponseWriter, r *http.Request) {
 			slog.String("error", err.Error()),
 		)
 	}
-	p.logger.InfoContext(r.Context(), "internal page read served",
-		slog.String("coordinator_id", strings.TrimSpace(r.Header.Get(peerFromHeader))),
-		slog.String("page_owner_id", p.localPeerID()),
-		slog.String("ring_id", strings.TrimSpace(r.Header.Get(peerRingHeader))),
-		slog.String("bucket", req.Bucket),
-		slog.String("key", req.Key),
-		slog.Any("page_indexes", req.Pages),
-		slog.String("etag", req.ETag),
-		slog.Int64("epoch", req.Epoch),
-		slog.String("status_class", peerStatusClass(status)),
-		slog.Int64("bytes_served", bytesServed),
-		slog.Int64("upstream_fill_bytes", stats.bytesFetchedUpstream-upstreamFillBefore),
-	)
+	if p.internalPeerSuccessLog {
+		p.logger.InfoContext(r.Context(), "internal page read served",
+			slog.String("coordinator_id", strings.TrimSpace(r.Header.Get(peerFromHeader))),
+			slog.String("page_owner_id", p.localPeerID()),
+			slog.String("ring_id", strings.TrimSpace(r.Header.Get(peerRingHeader))),
+			slog.String("bucket", req.Bucket),
+			slog.String("key", req.Key),
+			slog.Any("page_indexes", req.Pages),
+			slog.String("etag", req.ETag),
+			slog.Int64("epoch", req.Epoch),
+			slog.String("status_class", peerStatusClass(status)),
+			slog.Int64("bytes_served", bytesServed),
+			slog.Int64("upstream_fill_bytes", stats.bytesFetchedUpstream-upstreamFillBefore),
+		)
+	}
 }
 
 func validateInternalPageReadRequest(req internalPageReadRequest) error {
@@ -848,7 +989,7 @@ func (p *Proxy) validateInternalPeerHeaders(w http.ResponseWriter, r *http.Reque
 	ringID := strings.TrimSpace(r.Header.Get(peerRingHeader))
 	if ringID == "" || ringID != p.peerRouter.RingID() {
 		if ringID != "" {
-			p.markDegraded("peer ring mismatch")
+			p.markDegradedWithContext("peer ring mismatch", map[string]string{"peer_ring_id": ringID})
 		}
 		http.Error(w, "peer ring mismatch", http.StatusBadGateway)
 		return false
@@ -1049,8 +1190,11 @@ func (p *Proxy) serveS3HTTP(w http.ResponseWriter, r *http.Request) {
 	if stats.fallbackReason != "" {
 		attrs = append(attrs, slog.String("fallback_reason", stats.fallbackReason))
 	}
-	if reason := p.currentDegradedReason(); reason != "" {
-		attrs = append(attrs, slog.String("degraded_reason", reason))
+	if degraded := p.currentDegradedState(); degraded != nil {
+		attrs = append(attrs,
+			slog.String("degraded_reason_code", degraded.Code),
+			slog.String("degraded_reason", degraded.Reason),
+		)
 	}
 	if stats.peerMode != "" {
 		attrs = append(attrs,
@@ -1086,7 +1230,7 @@ func (p *Proxy) shouldForwardToPeer(w http.ResponseWriter, r *http.Request, targ
 	if forwardedRequest {
 		stats.peerForwardRingID = r.Header.Get(peerRingHeader)
 		if stats.peerForwardRingID != stats.peerRingID {
-			p.markDegraded("peer ring mismatch")
+			p.markDegradedWithContext("peer ring mismatch", map[string]string{"peer_ring_id": stats.peerForwardRingID})
 			stats.peerForwarded = true
 			stats.cacheResult = "peer_ring_mismatch"
 			stats.peerForwardFailure = "ring_mismatch"
@@ -1188,7 +1332,7 @@ func (p *Proxy) handle(w http.ResponseWriter, r *http.Request, target s3request.
 		status, bytesWritten, err := p.forward(w, r, stats)
 		if err == nil && isSuccessfulStatus(status) && shouldInvalidateAfterWrite(r, target) {
 			if _, deleteErr := p.invalidateObject(r.Context(), target); deleteErr != nil {
-				p.markDegraded("write invalidation failed")
+				p.markDegradedWithContext("write invalidation failed", map[string]string{"bucket": target.Bucket})
 				p.logger.ErrorContext(r.Context(), "cache invalidation failed after successful write",
 					slog.String("bucket", target.Bucket),
 					slog.String("key", target.Key),
@@ -1218,7 +1362,7 @@ func (p *Proxy) invalidateObject(ctx context.Context, target s3request.Target) (
 		return epoch, nil
 	}
 	if err := p.broadcastInvalidation(ctx, target, epoch); err != nil {
-		p.markDegraded("peer invalidation failed")
+		p.markDegradedWithContext("peer invalidation failed", map[string]string{"bucket": target.Bucket})
 		return epoch, err
 	}
 	return epoch, nil
@@ -1230,9 +1374,11 @@ func (p *Proxy) broadcastInvalidation(ctx context.Context, target s3request.Targ
 		if peer.ID == p.peerRouter.LocalID() {
 			continue
 		}
+		start := time.Now()
 		if err := p.sendPeerInvalidation(ctx, peer, target, epoch); err != nil {
 			if p.metrics != nil {
 				p.metrics.RecordInvalidationBroadcast(target.Bucket, peer.ID, "failure")
+				p.metrics.ObserveInvalidationBroadcastDuration(target.Bucket, peer.ID, "failure", time.Since(start))
 			}
 			p.logger.ErrorContext(ctx, "peer invalidation failed",
 				slog.String("bucket", target.Bucket),
@@ -1246,6 +1392,7 @@ func (p *Proxy) broadcastInvalidation(ctx context.Context, target s3request.Targ
 		}
 		if p.metrics != nil {
 			p.metrics.RecordInvalidationBroadcast(target.Bucket, peer.ID, "success")
+			p.metrics.ObserveInvalidationBroadcastDuration(target.Bucket, peer.ID, "success", time.Since(start))
 		}
 	}
 	if len(failures) > 0 {
@@ -1780,6 +1927,9 @@ func (p *Proxy) recordMetrics(stats *requestStats) {
 			p.metrics.RecordBytesServedFromCache(stats.bucket, stats.bytesSent)
 		}
 	}
+	if stats.cacheResult != "" {
+		p.metrics.RecordCacheResult(stats.bucket, stats.cacheResult, peerStatusClass(stats.status), stats.bytesSent)
+	}
 	if stats.bytesRequested > 0 {
 		p.metrics.ObserveRequestedBytes(stats.bucket, stats.bytesRequested)
 		p.metrics.ObserveReadAmplification(stats.bucket, stats.readAmplification())
@@ -1799,48 +1949,11 @@ func (p *Proxy) recordMetrics(stats *requestStats) {
 	if stats.cacheServeDuration > 0 {
 		p.metrics.ObserveCacheServeDuration(stats.bucket, stats.cacheServeDuration)
 	}
-	if stats.cacheMetadataDuration > 0 {
-		p.metrics.ObserveCacheMetadataDuration(stats.bucket, stats.cacheResult, stats.cacheMetadataDuration)
-	}
-	if stats.cachePageOpenDuration > 0 {
-		p.metrics.ObserveCachePageOpenDuration(stats.bucket, stats.cacheResult, stats.cachePageOpenDuration)
-	}
-	if stats.cacheResponseCopyDuration > 0 {
-		p.metrics.ObserveCacheResponseCopyDuration(stats.bucket, stats.cacheResult, stats.cacheResponseCopyDuration)
-	}
 }
 
 func (p *Proxy) recordPeerMetrics(stats *requestStats) {
-	if p.metrics == nil {
-		return
-	}
-	if stats.peerDecision != "" {
-		p.metrics.RecordPeerDecision(stats.bucket, stats.peerDecision, stats.peerOwnerID)
-	}
-	if !stats.peerForwarded {
-		return
-	}
-	if stats.peerForwardFailure != "" {
-		p.metrics.RecordPeerForwardFailure(stats.bucket, stats.peerOwnerID, stats.peerForwardFailure)
-	}
-	statusClass := peerStatusClass(stats.status)
-	if stats.peerForwardDuration > 0 {
-		p.metrics.ObservePeerForwardDuration(stats.bucket, stats.peerOwnerID, statusClass, stats.peerForwardDuration)
-	}
-	if stats.peerResponseHeaderDuration > 0 {
-		p.metrics.ObservePeerResponseHeaderDuration(stats.bucket, stats.peerOwnerID, statusClass, stats.peerResponseHeaderDuration)
-	}
-	if stats.peerResponseCopyDuration > 0 {
-		p.metrics.ObservePeerResponseCopyDuration(stats.bucket, stats.peerOwnerID, statusClass, stats.peerResponseCopyDuration)
-		p.metrics.ObservePeerResponseBodyReadDuration(stats.bucket, stats.peerOwnerID, statusClass, stats.peerResponseBodyReadDuration)
-		p.metrics.ObservePeerDownstreamWriteDuration(stats.bucket, stats.peerOwnerID, statusClass, stats.peerDownstreamWriteDuration)
-	}
-	if stats.peerForwardFailure == "" {
-		p.metrics.RecordPeerForward(stats.bucket, stats.peerOwnerID, stats.method, statusClass)
-		if stats.bytesSent > 0 {
-			p.metrics.RecordPeerForwardResponseBytes(stats.bucket, stats.peerOwnerID, stats.bytesSent)
-		}
-	}
+	// Owner-aware forwarding remains logged, but it is not part of the stable
+	// v0.0.7 metric surface for page-sharded peer mode.
 }
 
 func peerStatusClass(status int) string {
@@ -2593,12 +2706,13 @@ func (p *Proxy) openRemoteCoordinatorPageBatch(r *http.Request, target s3request
 func (p *Proxy) recordPeerReadFallback(ctx context.Context, target s3request.Target, peerID, reason string, err error) {
 	if p.metrics != nil {
 		p.metrics.RecordPeerReadFallback(target.Bucket, peerID, reason)
+		p.metrics.RecordInternalPeerRequestFailure(target.Bucket, peerID, reason)
 	}
 	p.logger.WarnContext(ctx, "distributed page read falling back to upstream pass-through",
 		slog.String("bucket", target.Bucket),
 		slog.String("key", target.Key),
 		slog.String("peer_id", peerID),
-		slog.String("reason", reason),
+		slog.String("fallback_reason", reason),
 		slog.String("error", err.Error()),
 	)
 }
@@ -2732,7 +2846,7 @@ func (p *Proxy) openCachedPage(ctx context.Context, target s3request.Target, obj
 	stats.cachePageOpenDuration += time.Since(start)
 	if err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "corrupt") {
-			p.markDegraded("local cache corruption")
+			p.markDegradedWithContext("local cache corruption", map[string]string{"bucket": target.Bucket})
 		}
 		return nil, false, err
 	}

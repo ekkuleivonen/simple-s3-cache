@@ -90,6 +90,21 @@ upstream:
 	if cfg.Peer.MaxObjectFillConcurrency != 4 {
 		t.Fatalf("Peer.MaxObjectFillConcurrency = %d, want 4", cfg.Peer.MaxObjectFillConcurrency)
 	}
+	if !cfg.Logging.AccessLog {
+		t.Fatal("Logging.AccessLog = false, want true")
+	}
+	if cfg.Logging.InternalPeerAccessLog {
+		t.Fatal("Logging.InternalPeerAccessLog = true, want false")
+	}
+	if cfg.Logging.InternalPeerSuccessLog {
+		t.Fatal("Logging.InternalPeerSuccessLog = true, want false")
+	}
+	if cfg.Operator.Enabled {
+		t.Fatal("Operator.Enabled = true, want false")
+	}
+	if cfg.Operator.Path != "/debug/peer" {
+		t.Fatalf("Operator.Path = %q, want /debug/peer", cfg.Operator.Path)
+	}
 }
 
 func TestLoadSingleModeDoesNotRequirePeerConfig(t *testing.T) {
@@ -159,6 +174,14 @@ peer:
       url: http://cache-0.cache-peers:8080
     - id: cache-1
       url: http://cache-1.cache-peers:8080
+logging:
+  access_log: false
+  internal_peer_access_log: true
+  internal_peer_success_log: true
+operator:
+  enabled: true
+  path: /debug/cache-peer
+  bearer_token: configured-token
 `)
 
 	cfg, err := Load(path)
@@ -259,44 +282,23 @@ peer:
 	if len(cfg.Peer.Peers) != 2 {
 		t.Fatalf("len(Peer.Peers) = %d, want 2", len(cfg.Peer.Peers))
 	}
-}
-
-func TestLoadGatewayRequiresOnlyHTTPAndPeerConfig(t *testing.T) {
-	path := writeConfig(t, `
-listen: "127.0.0.1:8082"
-http:
-  read_header_timeout: 2s
-peer:
-  mode: peer
-  auth_secret: gateway-peer-secret
-  peers:
-    - id: cache-1
-      url: http://cache-1.cache-peers:8080
-    - id: cache-0
-      url: http://cache-0.cache-peers:8080
-`)
-
-	cfg, err := LoadGateway(path)
-	if err != nil {
-		t.Fatalf("LoadGateway() error = %v", err)
+	if cfg.Logging.AccessLog {
+		t.Fatal("Logging.AccessLog = true, want false")
 	}
-	if cfg.Listen != "127.0.0.1:8082" {
-		t.Fatalf("Listen = %q, want configured gateway listen", cfg.Listen)
+	if !cfg.Logging.InternalPeerAccessLog {
+		t.Fatal("Logging.InternalPeerAccessLog = false, want true")
 	}
-	if cfg.HTTP.ReadHeaderTimeout != 2*time.Second {
-		t.Fatalf("HTTP.ReadHeaderTimeout = %s, want 2s", cfg.HTTP.ReadHeaderTimeout)
+	if !cfg.Logging.InternalPeerSuccessLog {
+		t.Fatal("Logging.InternalPeerSuccessLog = false, want true")
 	}
-	if cfg.Peer.Mode != "peer" {
-		t.Fatalf("Peer.Mode = %q, want peer", cfg.Peer.Mode)
+	if !cfg.Operator.Enabled {
+		t.Fatal("Operator.Enabled = false, want true")
 	}
-	if cfg.Peer.LocalID != "" {
-		t.Fatalf("Peer.LocalID = %q, want empty for gateway", cfg.Peer.LocalID)
+	if cfg.Operator.Path != "/debug/cache-peer" {
+		t.Fatalf("Operator.Path = %q", cfg.Operator.Path)
 	}
-	if cfg.Peer.AuthSecret != "gateway-peer-secret" {
-		t.Fatalf("Peer.AuthSecret = %q", cfg.Peer.AuthSecret)
-	}
-	if len(cfg.Peer.Peers) != 2 {
-		t.Fatalf("Peer.Peers len = %d, want 2", len(cfg.Peer.Peers))
+	if cfg.Operator.BearerToken != "configured-token" {
+		t.Fatalf("Operator.BearerToken = %q", cfg.Operator.BearerToken)
 	}
 }
 

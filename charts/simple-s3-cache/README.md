@@ -3,11 +3,10 @@
 This chart deploys simple-s3-cache in one of two supported modes:
 
 - `single`: one cache pod. This is the default and has the least operational complexity.
-- `peer`: several cache peers behind one Service. Any peer can coordinate a
-  request; large-object pages are deterministically sharded across peers.
+- `peer`: several cache peers. Any peer can coordinate a request; large-object
+  pages are deterministically sharded across peers.
 
-Peer mode is the distributed deployment for v2. It does not require an
-owner-aware gateway.
+Peer mode is the distributed deployment for v2.
 
 ## Install
 
@@ -39,7 +38,8 @@ Use this when one node has enough NVMe capacity and bandwidth.
 ### Peer
 
 Peer mode creates a cache StatefulSet with `replicaCount` pods, a headless peer
-Service, and a client-facing cache Service.
+Service, and a client-facing cache Service. Production deployments can also
+create one LoadBalancer Service per peer.
 
 Each pod renders `peer.local_id` from its StatefulSet pod name. The peer list is
 generated from the StatefulSet DNS names:
@@ -48,13 +48,48 @@ generated from the StatefulSet DNS names:
 <release>-simple-s3-cache-0.<release>-simple-s3-cache-peers.<namespace>.svc.cluster.local
 ```
 
-Use this when you want more aggregate cache capacity or disk bandwidth without
-running a separate gateway component.
+Use this when you want more aggregate cache capacity or disk bandwidth. Any cache
+pod can coordinate a client request. Large cache-hit reads benefit from many
+concurrent client requests because owner page reads spread across peers; one
+client TCP stream remains bounded by the chosen coordinator's egress path.
+
+### Production Peer Topology
+
+The recommended steady-state Kubernetes shape for cross-cluster clients is:
+
+- storage cluster: one StatefulSet cache ring next to object storage;
+- storage cluster: one headless peer Service for stable StatefulSet DNS;
+- storage cluster: one LoadBalancer Service per peer, each selecting exactly one
+  StatefulSet pod;
+- services cluster: DNS round-robin or EndpointSlice records over the per-peer
+  VIPs.
+
+This avoids one shared LoadBalancer IP becoming the coordinator ingress
+bottleneck. The chart can create the per-peer Services:
+
+```yaml
+peerLoadBalancerServices:
+  enabled: true
+  port: 9000
+  loadBalancerIPs:
+    - 192.168.30.217
+    - 192.168.30.218
+    - 192.168.30.219
+    - 192.168.30.220
+```
+
+Each generated Service is named `<release>-simple-s3-cache-peer-<ordinal>` and
+selects a single pod with `statefulset.kubernetes.io/pod-name`.
 
 Peer mode uses the configured page size and `peer.page_sharding_min_pages` to
 choose between object-style reads and distributed page reads under the `auto`
 strategy. Writes pass through to upstream and broadcast invalidation/epoch
 advancement to every peer.
+
+The owner-aware gateway topology from early v2 experiments is legacy. For
+steady-state peer mode, point clients at either the cache Service for simple
+in-cluster deployments or DNS round-robin across per-peer VIPs for production
+cross-cluster deployments. Any peer can coordinate.
 
 ## Credentials
 
@@ -71,14 +106,31 @@ upstream:
 For local tests, `upstream.credentials.accessKey` and
 `upstream.credentials.secretKey` create a chart-managed Secret.
 
+Peer mode also needs a shared peer-auth secret. For production, prefer an
+existing Secret:
+
+```yaml
+peer:
+  auth:
+    existingSecret: simple-s3-cache-peer-auth
+    key: auth_secret
+```
+
+`peer.authSecret` is still available for local-only tests, but peer mode fails
+template rendering if it is empty or set to the placeholder `change-me`.
+
 ## Rollout Rules
 
 Peer mode uses a static page ownership ring. Treat `replicaCount`, release name,
 namespace, and peer Service name as part of that ring.
 
 - Avoid mixed peer-list rollouts.
+- Prefer a pinned `image.tag`; `latest` fails template rendering.
 - Changing `replicaCount` moves some pages to new owners and makes them cold.
 - Restarted cache pods start cold and may temporarily increase upstream load.
+- Use one shared peer-auth Secret across all peers.
+- Set `pdb`, `topologySpreadConstraints`, `podAntiAffinity`, and
+  `updateStrategy` values intentionally for your platform.
 - Writes must pass through simple-s3-cache. Out-of-band upstream writes can leave
   resident cached objects stale until invalidation or eviction.
 - If a page owner is unavailable before response headers are committed, the
@@ -91,11 +143,38 @@ Set `serviceMonitor.enabled: true` when using the Prometheus Operator. Watch at
 least these signals:
 
 - `simple_s3_cache_peer_ring_info`
-- peer coordinator request metrics
-- page-owner request metrics
-- invalidation broadcast failures
+- `simple_s3_cache_degraded{reason_code="..."}`
+- `simple_s3_cache_coordinator_requests_total`
+- `simple_s3_cache_page_owner_requests_total`
+- `simple_s3_cache_cache_requests_total`
+- `simple_s3_cache_cache_bytes_total`
+- `simple_s3_cache_internal_peer_request_duration_seconds`
+- `simple_s3_cache_internal_peer_request_failures_total`
+- `simple_s3_cache_invalidation_broadcasts_total`
+- `simple_s3_cache_invalidation_broadcast_duration_seconds`
+- `simple_s3_cache_peer_read_fallbacks_total`
 - peer fanout, page batch size, and coalesced fill metrics
 - per-peer hit rate, upstream fill bytes, cached bytes, and evictions
+
+`/healthz` remains live where possible and reports `ready:false` with a stable
+degraded reason. `/readyz` returns `503` when a peer self-quarantines. Enable the
+operator endpoint with `operator.enabled: true` for a lightweight peer-state JSON
+view; set `operator.bearerToken` unless access is protected by a private ops
+network.
+
+Set `prometheusRule.enabled: true` to install starter alerts for degraded peers,
+invalidation failures, and peer-read fallbacks. Treat them as a baseline and tune
+durations/severity for your cluster.
+
+Useful dashboard snippets:
+
+```promql
+sum by (local_id, reason_code) (simple_s3_cache_degraded)
+sum by (bucket, cache_status) (rate(simple_s3_cache_cache_bytes_total[5m]))
+sum by (owner_id, status_class) (rate(simple_s3_cache_page_owner_requests_total[5m]))
+histogram_quantile(0.95, sum by (le) (rate(simple_s3_cache_internal_peer_request_duration_seconds_bucket[5m])))
+sum by (reason) (rate(simple_s3_cache_peer_read_fallbacks_total[5m]))
+```
 
 ## Performance Validation
 

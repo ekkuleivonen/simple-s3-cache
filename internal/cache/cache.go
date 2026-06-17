@@ -1074,16 +1074,6 @@ func isCorruptDatabaseError(err error) bool {
 		strings.Contains(text, "database disk image is malformed")
 }
 
-func WipeLocalState(cachePath, metaPath string) error {
-	if cachePath == "" {
-		return errors.New("cache path is required")
-	}
-	if metaPath == "" {
-		return errors.New("metadata path is required")
-	}
-	return resetLocalCacheState(cachePath, filepath.Join(metaPath, "cache.db"))
-}
-
 func resetLocalCacheState(cachePath, dbPath string) error {
 	if err := os.RemoveAll(filepath.Join(cachePath, "objects")); err != nil {
 		return fmt.Errorf("reset cache objects after corrupt db: %w", err)

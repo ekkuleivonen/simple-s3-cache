@@ -36,6 +36,7 @@ const (
 	defaultPeerPageShardingMinPages      = 2
 	defaultPeerMaxFillConcurrency        = 32
 	defaultPeerMaxObjectFillConcurrency  = 4
+	defaultOperatorPath                  = "/debug/peer"
 )
 
 // Config is the process configuration loaded from YAML.
@@ -46,6 +47,8 @@ type Config struct {
 	HTTP     HTTPConfig     `yaml:"http"`
 	Upload   UploadConfig   `yaml:"upload"`
 	Peer     PeerConfig     `yaml:"peer"`
+	Logging  LoggingConfig  `yaml:"logging"`
+	Operator OperatorConfig `yaml:"operator"`
 }
 
 type UpstreamConfig struct {
@@ -119,6 +122,18 @@ type Peer struct {
 	URL string `yaml:"url"`
 }
 
+type LoggingConfig struct {
+	AccessLog              bool `yaml:"access_log"`
+	InternalPeerAccessLog  bool `yaml:"internal_peer_access_log"`
+	InternalPeerSuccessLog bool `yaml:"internal_peer_success_log"`
+}
+
+type OperatorConfig struct {
+	Enabled     bool   `yaml:"enabled"`
+	Path        string `yaml:"path"`
+	BearerToken string `yaml:"bearer_token"`
+}
+
 // Load reads a YAML config file, applies defaults, and validates required fields.
 func Load(path string) (Config, error) {
 	cfg, err := readConfig(path)
@@ -126,19 +141,6 @@ func Load(path string) (Config, error) {
 		return Config{}, err
 	}
 	if err := cfg.Validate(); err != nil {
-		return Config{}, err
-	}
-
-	return cfg, nil
-}
-
-// LoadGateway reads a YAML config file for the owner-aware gateway.
-func LoadGateway(path string) (Config, error) {
-	cfg, err := readConfig(path)
-	if err != nil {
-		return Config{}, err
-	}
-	if err := cfg.ValidateGateway(); err != nil {
 		return Config{}, err
 	}
 
@@ -200,6 +202,12 @@ func Default() Config {
 			MaxFillConcurrency:       defaultPeerMaxFillConcurrency,
 			MaxObjectFillConcurrency: defaultPeerMaxObjectFillConcurrency,
 			ForwardTimeout:           defaultPeerForwardTimeout,
+		},
+		Logging: LoggingConfig{
+			AccessLog: true,
+		},
+		Operator: OperatorConfig{
+			Path: defaultOperatorPath,
 		},
 	}
 }
@@ -376,49 +384,31 @@ func (cfg Config) Validate() error {
 	if cfg.Upload.MaxSpoolSize <= 0 {
 		errs = append(errs, errors.New("upload.max_spool_size must be greater than zero"))
 	}
-	errs = append(errs, cfg.validatePeer(true)...)
+	if cfg.Operator.Enabled {
+		if strings.TrimSpace(cfg.Operator.Path) == "" {
+			errs = append(errs, errors.New("operator.path is required when operator.enabled is true"))
+		} else if !strings.HasPrefix(strings.TrimSpace(cfg.Operator.Path), "/") {
+			errs = append(errs, errors.New("operator.path must start with /"))
+		}
+	}
+	errs = append(errs, cfg.validatePeer()...)
 
 	return errors.Join(errs...)
 }
 
-func (cfg Config) ValidateGateway() error {
-	var errs []error
-
-	if strings.TrimSpace(cfg.Listen) == "" {
-		errs = append(errs, errors.New("listen is required"))
-	} else if _, _, err := net.SplitHostPort(cfg.Listen); err != nil {
-		errs = append(errs, fmt.Errorf("listen must be host:port or :port: %w", err))
-	}
-	if cfg.HTTP.ReadHeaderTimeout <= 0 {
-		errs = append(errs, errors.New("http.read_header_timeout must be greater than zero"))
-	}
-	if cfg.HTTP.ReadTimeout <= 0 {
-		errs = append(errs, errors.New("http.read_timeout must be greater than zero"))
-	}
-	if cfg.HTTP.WriteTimeout <= 0 {
-		errs = append(errs, errors.New("http.write_timeout must be greater than zero"))
-	}
-	if cfg.HTTP.IdleTimeout <= 0 {
-		errs = append(errs, errors.New("http.idle_timeout must be greater than zero"))
-	}
-	errs = append(errs, cfg.validatePeer(false)...)
-
-	return errors.Join(errs...)
-}
-
-func (cfg Config) validatePeer(requireLocal bool) []error {
+func (cfg Config) validatePeer() []error {
 	var errs []error
 	mode := strings.TrimSpace(cfg.Peer.Mode)
 	switch mode {
 	case "peer":
 	default:
-		if requireLocal && (mode == "" || mode == "single") {
+		if mode == "" || mode == "single" {
 			return nil
 		}
 		return []error{fmt.Errorf("peer.mode must be peer")}
 	}
 
-	if requireLocal && strings.TrimSpace(cfg.Peer.LocalID) == "" {
+	if strings.TrimSpace(cfg.Peer.LocalID) == "" {
 		errs = append(errs, errors.New("peer.local_id is required in peer mode"))
 	}
 	if strings.TrimSpace(cfg.Peer.AuthSecret) == "" {
@@ -456,7 +446,7 @@ func (cfg Config) validatePeer(requireLocal bool) []error {
 				errs = append(errs, fmt.Errorf("peer.peers id %q is duplicated", id))
 			}
 			seen[id] = struct{}{}
-			if requireLocal && id == cfg.Peer.LocalID {
+			if id == cfg.Peer.LocalID {
 				hasLocal = true
 			}
 		}
@@ -474,7 +464,7 @@ func (cfg Config) validatePeer(requireLocal bool) []error {
 			errs = append(errs, fmt.Errorf("peer.peers[%d].url must include a host", i))
 		}
 	}
-	if requireLocal && len(cfg.Peer.Peers) > 0 && !hasLocal {
+	if len(cfg.Peer.Peers) > 0 && !hasLocal {
 		errs = append(errs, errors.New("peer.peers must include peer.local_id"))
 	}
 	return errs

@@ -18,20 +18,16 @@ func TestRecorderRendersGlobalAndBucketMetrics(t *testing.T) {
 	recorder.RecordCacheWriteFailure("photos")
 	recorder.RecordEviction("photos")
 	recorder.RecordUpstreamFailure("photos", "fill")
-	recorder.RecordPeerDecision("photos", "remote", "cache-1")
 	recorder.RecordReadStrategy("photos", "page")
-	recorder.RecordPeerForward("photos", "cache-1", http.MethodGet, "2xx")
-	recorder.RecordPeerForwardFailure("photos", "cache-1", "request_failed")
+	recorder.RecordCacheResult("photos", "hit", "2xx", 3)
+	recorder.RecordPeerReadFallback("photos", "cache-1", "status")
 	recorder.RecordCoordinatorRequest("photos", http.MethodGet, "page", "2xx")
 	recorder.RecordPageOwnerRequest("photos", "cache-1", "2xx")
 	recorder.RecordPageOwnerBytesServed("photos", "cache-1", 34)
 	recorder.RecordPageOwnerUpstreamFillBytes("photos", "cache-1", 13)
 	recorder.RecordInvalidationBroadcast("photos", "cache-1", "success")
+	recorder.RecordInternalPeerRequestFailure("photos", "cache-1", "status")
 	recorder.RecordFillCoalesced("photos", "hit")
-	recorder.RecordPeerForwardResponseBytes("photos", "cache-1", 13)
-	recorder.RecordGatewayRequest("photos", "owner", "cache-1", http.MethodGet, "2xx")
-	recorder.RecordGatewayForwardFailure("photos", "cache-1", "request_failed")
-	recorder.RecordGatewayResponseBytes("photos", "cache-1", 21)
 	recorder.RecordBytesServedFromCache("photos", 3)
 	recorder.RecordBytesServedFromUpstream("photos", 5)
 	recorder.RecordUpstreamFillBytes("photos", 8)
@@ -40,28 +36,16 @@ func TestRecorderRendersGlobalAndBucketMetrics(t *testing.T) {
 	recorder.ObserveReadAmplification("photos", float64(8)/3)
 	recorder.ObserveUpstreamDuration("photos", "fill", 25*time.Millisecond)
 	recorder.ObserveCacheServeDuration("photos", 2*time.Millisecond)
-	recorder.ObserveCacheMetadataDuration("photos", "hit", time.Millisecond)
-	recorder.ObserveCachePageOpenDuration("photos", "hit", 2*time.Millisecond)
-	recorder.ObserveCacheResponseCopyDuration("photos", "hit", 3*time.Millisecond)
-	recorder.ObservePeerForwardDuration("photos", "cache-1", "2xx", time.Millisecond)
-	recorder.ObservePeerResponseHeaderDuration("photos", "cache-1", "2xx", 2*time.Millisecond)
-	recorder.ObservePeerResponseCopyDuration("photos", "cache-1", "2xx", 3*time.Millisecond)
-	recorder.ObservePeerResponseBodyReadDuration("photos", "cache-1", "2xx", time.Millisecond)
-	recorder.ObservePeerDownstreamWriteDuration("photos", "cache-1", "2xx", 2*time.Millisecond)
 	recorder.ObserveInternalPeerRequestsPerClientRequest("photos", "page", 2)
 	recorder.ObservePageBatchSize("photos", "cache-1", 3)
-	recorder.ObserveGatewayForwardDuration("photos", "owner", "cache-1", "2xx", time.Millisecond)
-	recorder.ObserveGatewayResponseHeaderDuration("photos", "owner", "cache-1", "2xx", 2*time.Millisecond)
-	recorder.ObserveGatewayResponseCopyDuration("photos", "owner", "cache-1", "2xx", 3*time.Millisecond)
-	recorder.ObserveGatewayResponseBodyReadDuration("photos", "owner", "cache-1", "2xx", time.Millisecond)
-	recorder.ObserveGatewayDownstreamWriteDuration("photos", "owner", "cache-1", "2xx", 2*time.Millisecond)
+	recorder.ObserveInternalPeerRequestDuration("photos", "cache-1", "2xx", 20*time.Millisecond)
+	recorder.ObserveInvalidationBroadcastDuration("photos", "cache-1", "success", 30*time.Millisecond)
 	recorder.SetCachedBytes(64, map[string]int64{"photos": 64})
-	recorder.SetPeerRingInfo("peer", "cache-0", "ring-123")
-	recorder.SetDegraded("peer ring mismatch")
+	recorder.SetPeerRingInfo("peer", "cache-0", "ring-123", 4)
+	recorder.SetDegraded("peer_ring_mismatch")
 
 	body := renderMetrics(t, recorder)
 	for _, want := range []string{
-		`simple_s3_cache_page_hits_total 1`,
 		`simple_s3_cache_page_hits_total{bucket="photos"} 1`,
 		`simple_s3_cache_page_misses_total{bucket="photos"} 1`,
 		`simple_s3_cache_pass_through_requests_total{bucket="photos",method="GET"} 1`,
@@ -69,50 +53,39 @@ func TestRecorderRendersGlobalAndBucketMetrics(t *testing.T) {
 		`simple_s3_cache_cache_write_failures_total{bucket="photos"} 1`,
 		`simple_s3_cache_evictions_total{bucket="photos"} 1`,
 		`simple_s3_cache_upstream_request_failures_total{bucket="photos",operation="fill"} 1`,
-		`simple_s3_cache_peer_owner_decisions_total{bucket="photos",decision="remote",owner_id="cache-1"} 1`,
 		`simple_s3_cache_read_strategy_selected_total{bucket="photos",strategy="page"} 1`,
-		`simple_s3_cache_peer_forwarded_requests_total{bucket="photos",peer_id="cache-1",method="GET",status_class="2xx"} 1`,
-		`simple_s3_cache_peer_forward_failures_total{bucket="photos",peer_id="cache-1",reason="request_failed"} 1`,
+		`simple_s3_cache_cache_requests_total{bucket="photos",cache_status="hit",status_class="2xx"} 1`,
+		`simple_s3_cache_cache_bytes_total{bucket="photos",cache_status="hit",status_class="2xx"} 3`,
+		`simple_s3_cache_peer_read_fallbacks_total{bucket="photos",peer_id="cache-1",reason="status"} 1`,
 		`simple_s3_cache_coordinator_requests_total{bucket="photos",method="GET",strategy="page",status_class="2xx"} 1`,
 		`simple_s3_cache_page_owner_requests_total{bucket="photos",owner_id="cache-1",status_class="2xx"} 1`,
 		`simple_s3_cache_page_owner_bytes_served_total{bucket="photos",owner_id="cache-1"} 34`,
 		`simple_s3_cache_page_owner_upstream_fill_bytes_total{bucket="photos",owner_id="cache-1"} 13`,
 		`simple_s3_cache_invalidation_broadcasts_total{bucket="photos",peer_id="cache-1",status="success"} 1`,
+		`simple_s3_cache_internal_peer_request_failures_total{bucket="photos",peer_id="cache-1",reason="status"} 1`,
 		`simple_s3_cache_fill_coalesced_total{bucket="photos",result="hit"} 1`,
-		`simple_s3_cache_peer_forward_response_bytes_total{bucket="photos",peer_id="cache-1"} 13`,
-		`simple_s3_cache_gateway_requests_total{bucket="photos",route="owner",peer_id="cache-1",method="GET",status_class="2xx"} 1`,
-		`simple_s3_cache_gateway_forward_failures_total{bucket="photos",peer_id="cache-1",reason="request_failed"} 1`,
-		`simple_s3_cache_gateway_response_bytes_total{bucket="photos",peer_id="cache-1"} 21`,
 		`simple_s3_cache_bytes_served_from_cache_total{bucket="photos"} 3`,
 		`simple_s3_cache_bytes_served_from_upstream_total{bucket="photos"} 5`,
 		`simple_s3_cache_upstream_fill_bytes_total{bucket="photos"} 8`,
 		`simple_s3_cache_cached_bytes 64`,
 		`simple_s3_cache_cached_bytes{bucket="photos"} 64`,
 		`simple_s3_cache_cache_max_bytes 1024`,
-		`simple_s3_cache_peer_ring_info{mode="peer",local_id="cache-0",ring_id="ring-123"} 1`,
-		`simple_s3_cache_degraded{reason="peer ring mismatch"} 1`,
+		`simple_s3_cache_peer_ring_info{mode="peer",local_id="cache-0",ring_id="ring-123",peer_count="4"} 1`,
+		`simple_s3_cache_degraded{reason_code="peer_ring_mismatch"} 1`,
 		`simple_s3_cache_requested_bytes_sum{bucket="photos"} 3`,
 		`simple_s3_cache_pages_touched_sum{bucket="photos"} 2`,
 		`simple_s3_cache_read_amplification_sum{bucket="photos"} 2.666`,
-		`simple_s3_cache_cache_metadata_duration_seconds_count{bucket="photos",cache_result="hit"} 1`,
-		`simple_s3_cache_cache_page_open_duration_seconds_count{bucket="photos",cache_result="hit"} 1`,
-		`simple_s3_cache_cache_response_copy_duration_seconds_count{bucket="photos",cache_result="hit"} 1`,
-		`simple_s3_cache_peer_forward_duration_seconds_count{bucket="photos",peer_id="cache-1",status_class="2xx"} 1`,
-		`simple_s3_cache_peer_response_header_duration_seconds_count{bucket="photos",peer_id="cache-1",status_class="2xx"} 1`,
-		`simple_s3_cache_peer_response_copy_duration_seconds_count{bucket="photos",peer_id="cache-1",status_class="2xx"} 1`,
-		`simple_s3_cache_peer_response_body_read_duration_seconds_count{bucket="photos",peer_id="cache-1",status_class="2xx"} 1`,
-		`simple_s3_cache_peer_downstream_write_duration_seconds_count{bucket="photos",peer_id="cache-1",status_class="2xx"} 1`,
 		`simple_s3_cache_internal_peer_requests_per_client_request_count{bucket="photos",strategy="page"} 1`,
 		`simple_s3_cache_page_batch_size_count{bucket="photos",owner_id="cache-1"} 1`,
-		`simple_s3_cache_gateway_forward_duration_seconds_count{bucket="photos",route="owner",peer_id="cache-1",status_class="2xx"} 1`,
-		`simple_s3_cache_gateway_response_header_duration_seconds_count{bucket="photos",route="owner",peer_id="cache-1",status_class="2xx"} 1`,
-		`simple_s3_cache_gateway_response_copy_duration_seconds_count{bucket="photos",route="owner",peer_id="cache-1",status_class="2xx"} 1`,
-		`simple_s3_cache_gateway_response_body_read_duration_seconds_count{bucket="photos",route="owner",peer_id="cache-1",status_class="2xx"} 1`,
-		`simple_s3_cache_gateway_downstream_write_duration_seconds_count{bucket="photos",route="owner",peer_id="cache-1",status_class="2xx"} 1`,
+		`simple_s3_cache_internal_peer_request_duration_seconds_count{bucket="photos",owner_id="cache-1",status_class="2xx"} 1`,
+		`simple_s3_cache_invalidation_broadcast_duration_seconds_count{bucket="photos",peer_id="cache-1",status="success"} 1`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("metrics body missing %q:\n%s", want, body)
 		}
+	}
+	if strings.Contains(body, "simple_s3_cache_page_hits_total 1\n") {
+		t.Fatalf("metrics body includes duplicate unlabeled counter series:\n%s", body)
 	}
 }
 

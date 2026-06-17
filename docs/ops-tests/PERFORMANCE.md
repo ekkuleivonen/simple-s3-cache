@@ -89,6 +89,10 @@ Capture per-peer metrics before and after each run:
 - `simple_s3_cache_upstream_request_failures_total`
 - `simple_s3_cache_degraded`
 
+Use labelled series for before/after deltas and aggregate across buckets or peers
+in the query layer when needed. The exporter does not publish duplicate
+unlabelled rollups for labelled counters and histograms.
+
 Also collect:
 
 - client-side p50/p95/p99 latency;

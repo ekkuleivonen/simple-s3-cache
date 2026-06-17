@@ -29,6 +29,17 @@ upload:
   spool_path: /cache/spool
   max_spool_size: 10GB
 
+logging:
+  access_log: true
+  # Keep normal internal peer success traffic quiet during load.
+  internal_peer_access_log: false
+  internal_peer_success_log: false
+
+operator:
+  enabled: false
+  path: /debug/peer
+  # bearer_token: change-me
+
 peer:
   mode: single
   forward_timeout: 10m

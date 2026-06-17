@@ -3,4 +3,4 @@ name: simple-s3-cache
 description: A transparent page-based read-through cache for S3-compatible object storage.
 type: application
 version: 0.1.0
-appVersion: "latest"
+appVersion: "0.0.7"

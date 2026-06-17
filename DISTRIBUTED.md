@@ -14,7 +14,6 @@ avoid external state systems such as Redis, NATS, ZooKeeper, or etcd.
 - Reduce deployment modes to two:
   - `single`: one cache process, local cache only.
   - `peer`: static peer ring, deterministic page sharding, peer invalidation.
-- Remove the owner-aware gateway as a correctness requirement.
 - Allow any cache peer to receive any request and coordinate the response.
 - Spread large-object range traffic across all cache peers automatically.
 - Preserve correctness when all writes pass through the cache.
@@ -112,8 +111,6 @@ The app can send S3 traffic to a normal Service in front of cache peers:
 ```text
 App -> cache Service -> any cache peer
 ```
-
-The owner-aware gateway is not part of the v2 deployment model.
 
 ## Peer Ring
 
@@ -494,18 +491,24 @@ Distributed mode needs visibility by coordinator and page owner.
 
 Recommended metrics:
 
-- peer ring fingerprint by peer.
-- coordinator requests by method, bucket, status class.
-- page-owner requests by bucket, owner peer, status class.
-- page bytes served by page owner.
-- page bytes fetched from upstream by page owner.
-- page hits and misses by page owner.
-- invalidation broadcasts by status and failed peer.
-- internal peer request duration.
-- internal peer requests per client request.
-- page batch size and pages per coordinator request.
-- coalesced page fills by page owner.
-- upstream fill errors by status and response body class.
+- `simple_s3_cache_peer_ring_info` by peer.
+- `simple_s3_cache_degraded{reason_code="..."}` for self-quarantine state.
+- `simple_s3_cache_cache_requests_total` and
+  `simple_s3_cache_cache_bytes_total` by bucket, cache status, and status class.
+- `simple_s3_cache_coordinator_requests_total` by method, bucket, strategy, and
+  status class.
+- `simple_s3_cache_page_owner_requests_total` and
+  `simple_s3_cache_page_owner_bytes_served_total` by bucket, owner peer, and
+  status class.
+- `simple_s3_cache_page_owner_upstream_fill_bytes_total` by page owner.
+- `simple_s3_cache_invalidation_broadcasts_total` and
+  `simple_s3_cache_invalidation_broadcast_duration_seconds` by status and peer.
+- `simple_s3_cache_internal_peer_request_duration_seconds` and
+  `simple_s3_cache_internal_peer_request_failures_total`.
+- `simple_s3_cache_internal_peer_requests_per_client_request`.
+- `simple_s3_cache_page_batch_size`.
+- `simple_s3_cache_fill_coalesced_total`.
+- `simple_s3_cache_upstream_request_failures_total`.
 
 Recommended log fields:
 
@@ -515,6 +518,7 @@ Recommended log fields:
 - page indexes or page range.
 - ETag and epoch.
 - ring ID.
+- cache status, fallback reason, and degraded reason code.
 - upstream status and capped response body on fill failure.
 
 ## Configuration
@@ -532,9 +536,19 @@ peer:
       url: http://simple-s3-cache-1.simple-s3-cache-peers:8080
   read_sharding: auto # object | page | auto
   page_sharding_min_pages: 2
-  invalidation_timeout: 5s
-  page_request_timeout: 30s
+  forward_timeout: 10m
   max_peer_fill_concurrency: 32
+  max_peer_object_fill_concurrency: 4
+
+logging:
+  access_log: true
+  internal_peer_access_log: false
+  internal_peer_success_log: false
+
+operator:
+  enabled: true
+  path: /debug/peer
+  bearer_token: replace-me
 ```
 
 Read strategy behavior:
@@ -691,30 +705,29 @@ Defaults should be boring:
 
 ### Milestone 11: Performance Proof
 
-- [ ] Benchmark `object`, `page`, and `auto` strategies under realistic parquet
+- [x] Benchmark `object`, `page`, and `auto` strategies under realistic parquet
   concurrency.
-- [ ] Prove `page` or `auto` beats `object` for large-object workloads at p50.
-- [ ] Prove `page` or `auto` beats `object` for large-object workloads at p95.
-- [ ] Prove small and medium object workloads do not materially regress under
+- [x] Prove `page` or `auto` beats `object` for large-object workloads at p50.
+- [x] Prove `page` or `auto` beats `object` for large-object workloads at p95.
+- [x] Prove small and medium object workloads do not materially regress under
   `auto`.
-- [ ] Measure RustFS pressure during cold cache with overlapping reads.
-- [ ] Verify fill coalescing reduces duplicate upstream page fills.
-- [ ] Verify aggregate throughput improves under many concurrent large reads.
-- [ ] Document that one client TCP stream remains coordinator-egress limited.
+- [x] Measure RustFS pressure during cold cache with overlapping reads.
+- [x] Verify fill coalescing reduces duplicate upstream page fills.
+- [x] Verify aggregate throughput improves under many concurrent large reads.
+- [x] Document that one client TCP stream remains coordinator-egress limited.
 
 ### Milestone 12: Documentation And Deployment
 
-- [ ] Update README with v2 peer mode behavior.
-- [ ] Update Helm values for peer read strategy, page threshold, and peer
+- [x] Update README with v2 peer mode behavior.
+- [x] Update Helm values for peer read strategy, page threshold, and peer
   timeouts.
-- [ ] Update examples for the two supported modes:
-  - [ ] `single`;
-  - [ ] `peer`.
-- [ ] Remove or clearly deprecate owner-aware gateway guidance if no longer
-  required.
-- [ ] Document failure semantics for peer read fallback, invalidation failure,
+- [x] Update examples for the two supported modes:
+  - [x] `single`;
+  - [x] `peer`.
+- [x] Remove owner-aware deployment guidance.
+- [x] Document failure semantics for peer read fallback, invalidation failure,
   readiness failure, and ring mismatch.
-- [ ] Document operational metrics and alert suggestions.
+- [x] Document operational metrics and alert suggestions.
 
 ## Acceptance Criteria
 

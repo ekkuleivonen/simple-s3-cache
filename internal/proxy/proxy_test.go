@@ -250,6 +250,106 @@ func TestNewSingleModeDoesNotRequirePeerConfig(t *testing.T) {
 	}
 }
 
+func TestNewPeerModePreservesExistingCacheState(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	root := t.TempDir()
+	cachePath := filepath.Join(root, "cache-bytes")
+	metaPath := filepath.Join(root, "cache-meta")
+	sentinelPath := filepath.Join(cachePath, "objects", "existing-page")
+	if err := os.MkdirAll(filepath.Dir(sentinelPath), 0o755); err != nil {
+		t.Fatalf("create sentinel dir: %v", err)
+	}
+	if err := os.WriteFile(sentinelPath, []byte("warm cache state"), 0o600); err != nil {
+		t.Fatalf("write sentinel: %v", err)
+	}
+
+	cfg := appconfig.Default()
+	cfg.Upstream.Endpoint = upstream.URL
+	cfg.Upstream.AccessKey = "test-access-key"
+	cfg.Upstream.SecretKey = "test-secret-key"
+	cfg.Cache.CachePath = cachePath
+	cfg.Cache.MetaPath = metaPath
+	cfg.Peer.Mode = "peer"
+	cfg.Peer.LocalID = "cache-0"
+	cfg.Peer.AuthSecret = "test-peer-secret"
+	cfg.Peer.Peers = []appconfig.Peer{
+		{ID: "cache-0", URL: "http://cache-0.example.test:8080"},
+	}
+
+	p, err := New(context.Background(), cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	defer p.Close()
+
+	got, err := os.ReadFile(sentinelPath)
+	if err != nil {
+		t.Fatalf("read sentinel after New: %v", err)
+	}
+	if string(got) != "warm cache state" {
+		t.Fatalf("sentinel = %q, want preserved warm cache state", got)
+	}
+}
+
+func TestNewPreparesConfiguredUploadSpoolPath(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	root := t.TempDir()
+	spoolPath := filepath.Join(root, "upload-spool")
+	cfg := appconfig.Default()
+	cfg.Upstream.Endpoint = upstream.URL
+	cfg.Upstream.AccessKey = "test-access-key"
+	cfg.Upstream.SecretKey = "test-secret-key"
+	cfg.Cache.CachePath = filepath.Join(root, "cache-bytes")
+	cfg.Cache.MetaPath = filepath.Join(root, "cache-meta")
+	cfg.Upload.SpoolPath = spoolPath
+
+	p, err := New(context.Background(), cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	defer p.Close()
+
+	info, err := os.Stat(spoolPath)
+	if err != nil {
+		t.Fatalf("stat spool path: %v", err)
+	}
+	if !info.IsDir() {
+		t.Fatalf("spool path is not a directory")
+	}
+}
+
+func TestNewRejectsUploadSpoolPathThatIsFile(t *testing.T) {
+	root := t.TempDir()
+	spoolPath := filepath.Join(root, "upload-spool")
+	if err := os.WriteFile(spoolPath, []byte("not a directory"), 0o600); err != nil {
+		t.Fatalf("write spool file: %v", err)
+	}
+
+	cfg := appconfig.Default()
+	cfg.Upstream.Endpoint = "http://upstream.invalid"
+	cfg.Upstream.AccessKey = "test-access-key"
+	cfg.Upstream.SecretKey = "test-secret-key"
+	cfg.Cache.CachePath = filepath.Join(root, "cache-bytes")
+	cfg.Cache.MetaPath = filepath.Join(root, "cache-meta")
+	cfg.Upload.SpoolPath = spoolPath
+
+	_, err := New(context.Background(), cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err == nil {
+		t.Fatal("New() error = nil, want spool path validation error")
+	}
+	if !strings.Contains(err.Error(), "prepare upload spool path") {
+		t.Fatalf("New() error = %v, want upload spool path error", err)
+	}
+}
+
 func TestProxyPublicBoundaryStripsSpoofedPeerHeaders(t *testing.T) {
 	var gotHeader http.Header
 	var upstreamRequests int
@@ -1302,14 +1402,8 @@ func TestProxyStreamsMultiPageFullGetThroughCache(t *testing.T) {
 		t.Fatalf("StorePage() calls = %d, want 0 with direct page writer", got)
 	}
 	metricsBody := renderProxyMetrics(t, p.metrics)
-	for _, want := range []string{
-		`simple_s3_cache_cache_metadata_duration_seconds_count{bucket="bucket",cache_result="hit"} 1`,
-		`simple_s3_cache_cache_page_open_duration_seconds_count{bucket="bucket",cache_result="hit"} 1`,
-		`simple_s3_cache_cache_response_copy_duration_seconds_count{bucket="bucket",cache_result="hit"} 1`,
-	} {
-		if !strings.Contains(metricsBody, want) {
-			t.Fatalf("metrics missing %q:\n%s", want, metricsBody)
-		}
+	if !strings.Contains(metricsBody, `simple_s3_cache_hit_duration_seconds_count{bucket="bucket"} 2`) {
+		t.Fatalf("metrics missing cache serve duration:\n%s", metricsBody)
 	}
 }
 
@@ -1899,7 +1993,7 @@ func TestProxyDoesNotFailSuccessfulWriteWhenInvalidationFails(t *testing.T) {
 		t.Fatalf("Readiness() = (%v, %q), want degraded reason", ready, reason)
 	}
 	metricsBody := renderProxyMetrics(t, p.metrics)
-	if !strings.Contains(metricsBody, `simple_s3_cache_degraded{reason="write invalidation failed"} 1`) {
+	if !strings.Contains(metricsBody, `simple_s3_cache_degraded{reason_code="write_invalidation_failed"} 1`) {
 		t.Fatalf("metrics missing degraded reason:\n%s", metricsBody)
 	}
 	if !strings.Contains(metricsBody, `simple_s3_cache_invalidation_broadcasts_total{bucket="bucket",peer_id="cache-0",status="failure"} 1`) {
@@ -2266,19 +2360,8 @@ func TestProxyPeerModeForwardsRemoteOwnerRequest(t *testing.T) {
 		t.Fatalf("peer requests = %d, want 1", peerRequests)
 	}
 	metricsBody := renderProxyMetrics(t, p.metrics)
-	for _, want := range []string{
-		`simple_s3_cache_peer_owner_decisions_total{bucket="bucket",decision="remote",owner_id="cache-1"} 1`,
-		`simple_s3_cache_peer_forwarded_requests_total{bucket="bucket",peer_id="cache-1",method="GET",status_class="2xx"} 1`,
-		`simple_s3_cache_peer_forward_response_bytes_total{bucket="bucket",peer_id="cache-1"} 9`,
-		`simple_s3_cache_peer_forward_duration_seconds_count{bucket="bucket",peer_id="cache-1",status_class="2xx"} 1`,
-		`simple_s3_cache_peer_response_header_duration_seconds_count{bucket="bucket",peer_id="cache-1",status_class="2xx"} 1`,
-		`simple_s3_cache_peer_response_copy_duration_seconds_count{bucket="bucket",peer_id="cache-1",status_class="2xx"} 1`,
-		`simple_s3_cache_peer_response_body_read_duration_seconds_count{bucket="bucket",peer_id="cache-1",status_class="2xx"} 1`,
-		`simple_s3_cache_peer_downstream_write_duration_seconds_count{bucket="bucket",peer_id="cache-1",status_class="2xx"} 1`,
-	} {
-		if !strings.Contains(metricsBody, want) {
-			t.Fatalf("metrics missing %q:\n%s", want, metricsBody)
-		}
+	if strings.Contains(metricsBody, "simple_s3_cache_peer_forward") {
+		t.Fatalf("metrics include pruned peer forwarding series:\n%s", metricsBody)
 	}
 }
 
@@ -2320,9 +2403,6 @@ func TestProxyPeerModeHandlesLocalOwnerRequestLocally(t *testing.T) {
 		t.Fatalf("peer invalidations = %d, want 1", invalidations)
 	}
 	metricsBody := renderProxyMetrics(t, p.metrics)
-	if !strings.Contains(metricsBody, `simple_s3_cache_peer_owner_decisions_total{bucket="bucket",decision="local",owner_id="cache-0"} 1`) {
-		t.Fatalf("metrics missing local owner decision:\n%s", metricsBody)
-	}
 	if !strings.Contains(metricsBody, `simple_s3_cache_peer_ring_info{mode="peer",local_id="cache-0",ring_id="`) {
 		t.Fatalf("metrics missing peer ring info:\n%s", metricsBody)
 	}
@@ -2788,7 +2868,7 @@ func TestProxyDistributedFallbackClearsLocalPlanningState(t *testing.T) {
 	}
 }
 
-func TestNewPeerModeWipesLocalCacheOnStartup(t *testing.T) {
+func TestNewPeerModePreservesLocalCacheOnStartup(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
 	cachePath := filepath.Join(root, "cache-bytes")
@@ -2848,8 +2928,8 @@ func TestNewPeerModeWipesLocalCacheOnStartup(t *testing.T) {
 
 	if _, ok, err := p.cache.GetObject(ctx, "bucket", "stale-after-downtime.bin"); err != nil {
 		t.Fatalf("GetObject() error = %v", err)
-	} else if ok {
-		t.Fatal("peer-mode startup preserved stale local cache metadata")
+	} else if !ok {
+		t.Fatal("peer-mode startup lost existing local cache metadata")
 	}
 }
 
@@ -3650,10 +3730,6 @@ func TestProxyPeerModeRejectsForwardingLoop(t *testing.T) {
 	if rec.Code != http.StatusBadGateway {
 		t.Fatalf("status = %d, want 502; body=%q", rec.Code, rec.Body.String())
 	}
-	metricsBody := renderProxyMetrics(t, p.metrics)
-	if !strings.Contains(metricsBody, `simple_s3_cache_peer_forward_failures_total{bucket="bucket",peer_id="cache-1",reason="routing_mismatch"} 1`) {
-		t.Fatalf("metrics missing routing mismatch failure:\n%s", metricsBody)
-	}
 }
 
 func TestProxyPeerModeRejectsForwardedRingMismatch(t *testing.T) {
@@ -3684,8 +3760,45 @@ func TestProxyPeerModeRejectsForwardedRingMismatch(t *testing.T) {
 		t.Fatalf("Readiness() = (%v, %q), want peer ring mismatch degradation", ready, reason)
 	}
 	metricsBody := renderProxyMetrics(t, p.metrics)
-	if !strings.Contains(metricsBody, `simple_s3_cache_degraded{reason="peer ring mismatch"} 1`) {
+	if !strings.Contains(metricsBody, `simple_s3_cache_degraded{reason_code="peer_ring_mismatch"} 1`) {
 		t.Fatalf("metrics missing degraded ring mismatch:\n%s", metricsBody)
+	}
+}
+
+func TestProxyPeerStateReportsRingAndDegradedSnapshot(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	p := testProxy(t, upstream.URL)
+	router := enablePeerMode(t, p, "cache-0", []peerrouter.Peer{
+		{ID: "cache-0", URL: "http://cache-0.invalid"},
+		{ID: "cache-1", URL: "http://cache-1.invalid"},
+	})
+	p.markDegradedWithContext("peer ring mismatch", map[string]string{"peer_ring_id": "different-ring"})
+
+	state := p.PeerState()
+	if state.Mode != "peer" {
+		t.Fatalf("Mode = %q, want peer", state.Mode)
+	}
+	if state.LocalID != "cache-0" {
+		t.Fatalf("LocalID = %q, want cache-0", state.LocalID)
+	}
+	if state.RingID != router.RingID() {
+		t.Fatalf("RingID = %q, want %q", state.RingID, router.RingID())
+	}
+	if state.Ready {
+		t.Fatal("Ready = true, want degraded not-ready")
+	}
+	if state.Degraded == nil || state.Degraded.Code != "peer_ring_mismatch" {
+		t.Fatalf("Degraded = %#v, want peer_ring_mismatch", state.Degraded)
+	}
+	if len(state.Peers) != 2 {
+		t.Fatalf("len(Peers) = %d, want 2", len(state.Peers))
+	}
+	if !state.AuthConfigured {
+		t.Fatal("AuthConfigured = false, want true")
 	}
 }
 
@@ -3744,7 +3857,7 @@ func TestProxyMarksNotReadyWhenLocalCacheCorruptionCannotBeRepaired(t *testing.T
 		t.Fatalf("Readiness() = (%v, %q), want local cache corruption degradation", ready, reason)
 	}
 	metricsBody := renderProxyMetrics(t, p.metrics)
-	if !strings.Contains(metricsBody, `simple_s3_cache_degraded{reason="local cache corruption"} 1`) {
+	if !strings.Contains(metricsBody, `simple_s3_cache_degraded{reason_code="local_cache_corruption"} 1`) {
 		t.Fatalf("metrics missing degraded local cache corruption:\n%s", metricsBody)
 	}
 }
@@ -3773,10 +3886,6 @@ func TestProxyPeerModeRejectsForwardedOwnerMismatch(t *testing.T) {
 
 	if rec.Code != http.StatusBadGateway {
 		t.Fatalf("status = %d, want 502; body=%q", rec.Code, rec.Body.String())
-	}
-	metricsBody := renderProxyMetrics(t, p.metrics)
-	if !strings.Contains(metricsBody, `simple_s3_cache_peer_forward_failures_total{bucket="bucket",peer_id="cache-0",reason="owner_mismatch"} 1`) {
-		t.Fatalf("metrics missing owner mismatch failure:\n%s", metricsBody)
 	}
 }
 

@@ -2,7 +2,7 @@ topology: single
 
 image:
   repository: ghcr.io/ekkuleivonen/simple-s3-cache
-  tag: latest
+  tag: "0.0.7"
 
 upstream:
   endpoint: http://rustfs-api.rustfs.svc.cluster.local:9000
@@ -27,3 +27,12 @@ persistence:
 cacheService:
   type: ClusterIP
   port: 8080
+
+logging:
+  accessLog: true
+  internalPeerAccessLog: false
+  internalPeerSuccessLog: false
+
+operator:
+  enabled: false
+  path: /debug/peer

@@ -1,4 +1,4 @@
-{{- if eq (include "simple-s3-cache.cacheEnabled" .) "true" }}
+{{- include "simple-s3-cache.validate" . }}
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -10,6 +10,10 @@ spec:
   serviceName: {{ include "simple-s3-cache.peerServiceName" . }}
   replicas: {{ include "simple-s3-cache.cacheReplicas" . }}
   podManagementPolicy: Parallel
+  {{- with .Values.updateStrategy }}
+  updateStrategy:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
   selector:
     matchLabels:
       {{- include "simple-s3-cache.selectorLabels" . | nindent 6 }}
@@ -64,13 +68,16 @@ spec:
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       initContainers:
         - name: render-config
           image: "{{ .Values.initConfig.image.repository }}:{{ .Values.initConfig.image.tag }}"
           imagePullPolicy: {{ .Values.initConfig.image.pullPolicy }}
           securityContext:
-            runAsGroup: 0
-            runAsUser: 0
+            {{- toYaml .Values.initConfig.securityContext | nindent 12 }}
           env:
             - name: UPSTREAM_ACCESS_KEY
               valueFrom:
@@ -89,12 +96,23 @@ spec:
                   name: {{ include "simple-s3-cache.secretName" . }}
                   key: {{ .Values.upstream.credentials.sessionTokenKey }}
             {{- end }}
+            {{- if eq (include "simple-s3-cache.topology" .) "peer" }}
+            - name: PEER_AUTH_SECRET
+              {{- if .Values.peer.auth.existingSecret }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "simple-s3-cache.peerAuthSecretName" . }}
+                  key: {{ .Values.peer.auth.key }}
+              {{- else }}
+              value: {{ .Values.peer.authSecret | quote }}
+              {{- end }}
+            {{- end }}
           command:
             - sh
             - -c
             - |
               set -eu
-              install -d -o 65532 -g 65532 -m 0750 {{ .Values.cache.cachePath }} {{ .Values.upload.spoolPath }} {{ .Values.cache.metaPath }} /config
+              install -d -m 0750 {{ .Values.cache.cachePath }} {{ .Values.upload.spoolPath }} {{ .Values.cache.metaPath }} /config
 
               cat > /config/simple-s3-cache.yaml <<EOF
               listen: ":8080"
@@ -135,6 +153,18 @@ spec:
                 spool_path: {{ .Values.upload.spoolPath }}
                 max_spool_size: {{ .Values.upload.maxSpoolSize }}
 
+              logging:
+                access_log: {{ .Values.logging.accessLog }}
+                internal_peer_access_log: {{ .Values.logging.internalPeerAccessLog }}
+                internal_peer_success_log: {{ .Values.logging.internalPeerSuccessLog }}
+
+              operator:
+                enabled: {{ .Values.operator.enabled }}
+                path: {{ .Values.operator.path }}
+              {{ if .Values.operator.bearerToken }}
+                bearer_token: {{ .Values.operator.bearerToken | quote }}
+              {{ end }}
+
               peer:
               {{ if eq (include "simple-s3-cache.topology" .) "single" }}
                 mode: single
@@ -142,9 +172,12 @@ spec:
               {{ else }}
                 mode: peer
                 local_id: ${HOSTNAME}
-                auth_secret: {{ .Values.peer.authSecret | quote }}
+                auth_secret: |-
+                  ${PEER_AUTH_SECRET}
                 read_sharding: {{ .Values.peer.readSharding }}
                 page_sharding_min_pages: {{ .Values.peer.pageShardingMinPages }}
+                max_peer_fill_concurrency: {{ .Values.peer.maxPeerFillConcurrency }}
+                max_peer_object_fill_concurrency: {{ .Values.peer.maxPeerObjectFillConcurrency }}
                 forward_timeout: {{ .Values.peer.forwardTimeout }}
                 peers:
               {{ $replicas := int (include "simple-s3-cache.cacheReplicas" .) }}
@@ -154,7 +187,6 @@ spec:
               {{ end }}
               {{ end }}
               EOF
-              chown 65532:65532 /config/simple-s3-cache.yaml
               chmod 0440 /config/simple-s3-cache.yaml
           volumeMounts:
             - name: cache-data
@@ -254,4 +286,3 @@ spec:
           requests:
             storage: {{ .Values.persistence.meta.size }}
   {{- end }}
-{{- end }}

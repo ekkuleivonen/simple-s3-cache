@@ -242,10 +242,33 @@ X-Simple-S3-Cache-Peer-Ring: <ring-id>
 Internal page and invalidation requests with a missing or mismatched ring
 fingerprint fail closed before touching local cache state.
 
-Peer mode is a good fit for a Kubernetes StatefulSet with stable peer IDs and a
-headless Service, for example `simple-s3-cache-0.simple-s3-cache-peers`. All
-peers must run the same peer list. Changing the peer list moves page ownership
-and can make moved pages cold; avoid mixed peer-list rollouts.
+Peer mode is a good fit for a Kubernetes StatefulSet with stable peer IDs, a
+headless Service for peer DNS, and a normal cache Service or LoadBalancer for
+client S3 traffic. The steady-state shape is:
+
+```text
+Services cluster clients
+  |
+  v
+cache Service or LoadBalancer
+  |
+  v
+Any StatefulSet peer, acting as coordinator
+  |
+  v
+Headless peer DNS / per-peer VIPs for owner page reads
+  |
+  v
+S3-compatible storage
+```
+
+For Kubernetes, keep peer pod names and DNS names stable, for example
+`simple-s3-cache-0.simple-s3-cache-peers`. All peers must run the same peer list.
+Changing the peer list moves page ownership and can make moved pages cold; avoid
+mixed peer-list rollouts. A single shared LoadBalancer IP is fine for client
+entry, but one client TCP stream remains limited by the coordinator's egress
+path. Aggregate throughput improves when many concurrent reads spread page-owner
+work across peers.
 
 If a page owner is unavailable before response headers are committed, the
 coordinator falls back to a pass-through upstream read and does not store the
@@ -256,8 +279,7 @@ Multiple independent cache instances outside peer mode do not coordinate
 invalidation. If a write is routed through one cache instance, other instances
 may continue serving stale cached metadata or pages for the same object.
 
-The owner-aware gateway topology is not part of the v2 deployment model. Peer
-mode runs behind a normal Service or LoadBalancer because any peer can
+Peer mode runs behind a normal Service or LoadBalancer because any peer can
 coordinate any request.
 
 If the cache instance fails, it can be restarted with an empty cache. No object
@@ -413,6 +435,16 @@ upload:
 peer:
   mode: single
   forward_timeout: 10m
+
+logging:
+  access_log: true
+  internal_peer_access_log: false
+  internal_peer_success_log: false
+
+operator:
+  enabled: false
+  path: /debug/peer
+  # bearer_token: change-me
 ```
 
 `cache_path` stores cached page files. `meta_path` stores the SQLite cache
@@ -423,6 +455,13 @@ Page size is the primary tuning knob. Larger pages reduce metadata overhead but
 amplify over-fetch on small scattered reads (a tiny Parquet footer still pulls a
 whole page). The 4 MB default favors the analytical and random-access workloads
 this cache targets.
+
+`/healthz` always stays live when possible and includes `ready:false` plus a
+stable degraded reason when the peer self-quarantines. `/readyz` returns `503`
+for degraded peers. When `operator.enabled` is true, the configured operator
+endpoint returns peer ID, ring ID, peer list, read-sharding settings, auth
+configuration, and degraded state. Set `operator.bearer_token` unless the
+endpoint is reachable only through a trusted private ops path.
 
 Metadata cleanup is enabled by default. `metadata_gc_interval` controls how
 often old page-less metadata is considered for deletion, `metadata_max_age`
