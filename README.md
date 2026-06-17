@@ -105,7 +105,7 @@ pass-through (uncached); the embedded client signature is not used.
 simple-s3-cache is a good fit when:
 
 * Clients can reach it through a trusted network or existing auth layer.
-* A single cache instance is acceptable, or static owner-sharded peer mode is
+* A single cache instance is acceptable, or v2 page-sharded peer mode is
   acceptable.
 * Stale reads are unacceptable only for writes that pass through the cache.
 * Clients use path-style S3 requests for object reads and writes.
@@ -113,8 +113,8 @@ simple-s3-cache is a good fit when:
 
 Do not use simple-s3-cache as-is when:
 
-* Multiple active cache replicas must stay coherent without static object
-  ownership.
+* Multiple active cache replicas must stay coherent without the v2 peer ring and
+  distributed invalidation protocol.
 * Clients rely on per-user IAM authorization at the proxy.
 * Objects may be modified directly in upstream storage and stale reads are not
   acceptable.
@@ -180,7 +180,7 @@ cached pages for the affected object on success.
 
 ## Deployment Model
 
-simple-s3-cache supports three deployment topologies.
+simple-s3-cache supports two deployment modes.
 
 Single mode is the default and the recommended starting point when one cache
 instance has enough capacity and bandwidth:
@@ -197,115 +197,68 @@ S3-compatible storage
 
 This keeps cache invalidation local and avoids distributed coordination.
 
-Direct peer mode is available when more local cache capacity or disk bandwidth is
-needed without adding a separate gateway process:
+Peer mode is available when more aggregate cache capacity, disk bandwidth, or
+node network bandwidth is needed:
 
-In peer mode, every instance has the same static peer list and uses rendezvous
-hashing over `bucket/key` to choose exactly one owner for each object. Any
-instance may receive a request, but all object requests — reads, writes, deletes,
-COPY destinations, and multipart completion or abort requests — are owned by the
-destination `bucket/key`. Non-owners stream the request to the owner before any
-local cache handling begins.
+In peer mode, every instance has the same static peer list. Any peer may receive
+any client request and coordinate the response. Cacheable reads use an explicit
+read strategy:
+
+```text
+object: one peer handles the object read path
+page: pages are deterministically sharded across peers
+auto: use object for small objects, page for objects spanning enough pages
+```
+
+The `auto` strategy uses the configured page size, including bucket-specific
+overrides, and `peer.page_sharding_min_pages` to avoid peer fanout for small
+objects while spreading large-object bytes across the ring.
 
 ```text
 Client
-  ↓
+  |
 LB / Service
-  ↓
-simple-s3-cache peer that received the request
-  ↓ if needed
-simple-s3-cache peer that owns /bucket/key
-  ↓
+  |
+Any simple-s3-cache peer, acting as coordinator
+  |
+Page owner peers selected by bucket/key/pageIndex
+  |
 S3-compatible storage
 ```
 
-Reads and writes for a given object therefore converge on the same owner, so the
-existing local invalidation path remains authoritative for that object. Bucket
-operations and other requests without a single object owner are handled by the
-receiving peer and pass through to upstream.
+Writes remain pass-through to upstream. After a successful mutating operation,
+the handling peer broadcasts invalidation and an epoch advance to every peer.
+Every peer must either apply the invalidation or mark itself not-ready. This is
+the distributed freshness contract for peer mode.
 
-Peer forwarding uses internal coordination headers:
+Peer communication uses internal coordination headers:
 
 ```text
 X-Simple-S3-Cache-Peer-Forwarded: 1
-X-Simple-S3-Cache-Peer-Owner: <owner-id>
 X-Simple-S3-Cache-Peer-From: <sender-id>
 X-Simple-S3-Cache-Peer-Ring: <ring-id>
 ```
 
-If a peer receives `X-Simple-S3-Cache-Peer-Forwarded: 1` but the request does
-not belong to that peer, it returns `502` instead of forwarding again. This makes
-peer-list disagreement fail closed. If the forwarded request's ring fingerprint
-is missing or does not match the receiver's configured peer list, the receiver
-also returns `502` before touching local cache state. If the receiver is the
-computed owner but the forwarded owner header names a different peer, the
-receiver returns `502` as well.
+Internal page and invalidation requests with a missing or mismatched ring
+fingerprint fail closed before touching local cache state.
 
-Peer mode is intentionally static in this version. It is a good fit for a
-Kubernetes StatefulSet with stable peer IDs and a headless Service, for example
-`simple-s3-cache-0.simple-s3-cache-peers`. All peers must run the same peer list.
-Changing the peer list moves some object ownership and makes those objects cold
-on the new owner. Mixed peer-list rollouts are a correctness hazard because two
-peers may temporarily believe they own the same object; avoid them.
+Peer mode is a good fit for a Kubernetes StatefulSet with stable peer IDs and a
+headless Service, for example `simple-s3-cache-0.simple-s3-cache-peers`. All
+peers must run the same peer list. Changing the peer list moves page ownership
+and can make moved pages cold; avoid mixed peer-list rollouts.
 
-If the owner peer is unavailable, remote-owner object requests fail closed
-instead of being served by the wrong local cache. Restarting the owner with an
-empty cache is safe because upstream storage remains the source of truth.
+If a page owner is unavailable before response headers are committed, the
+coordinator falls back to a pass-through upstream read and does not store the
+fallback bytes into distributed pages. Once response bytes are committed, peer
+read failures close the downstream response so clients detect the short read.
 
 Multiple independent cache instances outside peer mode do not coordinate
 invalidation. If a write is routed through one cache instance, other instances
 may continue serving stale cached metadata or pages for the same object.
 
-### Owner-Aware Gateway
-
-Peer mode can run directly behind a LoadBalancer, but non-owner requests are
-relayed through the ingress peer before reaching the owner. For high-throughput
-deployments, the same image also includes an optional stateless gateway:
-
-```text
-Client / service
-  ↓
-simple-s3-cache-gateway
-  ↓ direct owner route
-simple-s3-cache peer that owns /bucket/key
-  ↓
-S3-compatible storage
-```
-
-Run it with:
-
-```bash
-simple-s3-cache-gateway -config /etc/simple-s3-cache/gateway.yaml
-```
-
-The gateway uses the same `peer.peers` list and the same rendezvous hash logic as
-peer mode. It does not need `upstream`, `cache`, `upload`, or `peer.local_id`
-configuration. See `simple-s3-cache-gateway.example.yaml`.
-
-Deploy the gateway near the clients or compute services that generate S3
-traffic, not as a sidecar on the cache pods. Cache peers should remain a
-StatefulSet with stable IDs and a headless Service; the gateway should be a
-stateless Deployment that forwards to those stable peer DNS names.
-
-Object-scoped operations are routed by destination `bucket/key`, including
-reads, writes, deletes, COPY destinations, and multipart completion or abort.
-Bucket-level requests and requests without a single object owner go to a
-deterministic default peer and pass through from there. `DeleteObjects`
-(`POST /bucket?delete`) is rejected by the gateway because one request can name
-many independently-owned keys; send individual `DELETE Object` requests through
-the gateway or send multi-object deletes directly to a cache peer/upstream path
-that matches your invalidation policy.
-
-The gateway preserves the original `Host` and AWS signing headers when
-forwarding to a peer, while dialing the peer URL from the configured ring. For
-object-scoped routes it stamps the same internal peer coordination headers used
-by peer forwarding, so a peer-list mismatch fails closed before local cache state
-is touched. Client-supplied peer coordination headers are stripped at the gateway
-boundary.
-
-The gateway is optional. Use direct peer mode when avoiding another component is
-more important than avoiding the extra internal hop. Use gateway mode when cache
-throughput or large response proxying makes direct owner routing worthwhile.
+The owner-aware gateway topology is not part of the v2 deployment model. Peer
+mode runs behind a normal Service or LoadBalancer because any peer can
+coordinate any request.
 
 If the cache instance fails, it can be restarted with an empty cache. No object
 data is lost because upstream S3-compatible storage remains the source of truth.
@@ -527,18 +480,12 @@ A Helm chart is available at `charts/simple-s3-cache`. It supports these
 deployment topologies:
 
 * `topology: single` for the default one-pod cache deployment.
-* `topology: peer` for direct peer mode behind a cache Service.
-* `topology: gateway` for stateless gateway pods routing directly to owner cache
-  peers.
-* `topology: external-gateway` for gateway-only deployments that route to cache
-  peers in another cluster.
+* `topology: peer` for v2 page-sharded peer mode behind a cache Service.
 
 For cache deployments, the chart generates stable StatefulSet peer IDs and DNS
 names, renders `peer.local_id` from each cache pod's `HOSTNAME`, and can use
 either an existing upstream credential Secret or chart-managed test credentials.
-For external gateway deployments, provide explicit `gateway.externalPeers` with
-peer IDs that exactly match the storage-cluster cache peers. See
-`charts/simple-s3-cache/README.md` and the example values files under
+See `charts/simple-s3-cache/README.md` and the example values files under
 `charts/simple-s3-cache/examples`.
 
 ## Observability
@@ -556,37 +503,34 @@ fetched to fill cache, evictions, and cached bytes — globally and **per bucket
 Full counter, gauge, histogram, and log-field requirements are in
 [PLAN.md](PLAN.md#observability).
 
-Peer mode also emits structured log fields for `peer_mode`, `peer_local_id`,
-`peer_owner_id`, `peer_ring_id`, `peer_forward_ring_id`, `peer_forwarded`, and
-`peer_forward_duration_ms`. Metrics expose the active peer ring fingerprint,
-owner decisions by `bucket`, `decision`, and `owner_id`; forwarded requests by
-`bucket`, `peer_id`, `method`, and `status_class`; forwarding failures by
-`bucket`, `peer_id`, and bounded `reason`; peer response bytes; and peer
-forwarding duration.
+Peer mode also emits structured log fields for coordinator peer, page owner
+peer, selected read strategy, page indexes, object ETag/epoch, peer ring ID, and
+fallback/degraded reasons. Metrics expose the active peer ring fingerprint,
+coordinator requests, page-owner requests, page bytes by owner, peer fanout,
+batch size, coalesced fills, and invalidation broadcast results.
 
-All peers and gateways in one deployment should report the same `peer_ring_id`.
-A mismatch means the static peer list differs and object ownership may not be
-consistent. Forwarded object requests with a missing or mismatched ring
-fingerprint, or a mismatched owner header, fail closed with `502`.
+All peers in one deployment should report the same `peer_ring_id`. A mismatch
+means the static peer list differs and page ownership may not be consistent.
+Internal page and invalidation requests with a missing or mismatched ring
+fingerprint fail closed with `502`.
 
 ## Performance Validation
 
-Use the e2e performance runner to compare single, direct peer, and gateway
-deployments from the client network:
+Use the e2e performance runner to compare single and peer deployments from the
+client network:
 
 ```bash
 cd e2e
 uv run python perf/s3_read_bench.py \
   --target single=http://single-cache.example.internal:8080 \
   --target peer=http://peer-cache.example.internal:8080 \
-  --target gateway=http://gateway.example.internal:8080 \
   --bucket "$S3CACHE_S3_BUCKET" \
   --output perf-results.json
 ```
 
 The runner exercises cold and warm full-object reads plus cold and warm sparse
 range reads. See `e2e/perf/README.md` for methodology notes and guidance on when
-single mode, direct peer mode, or gateway mode is the better operational choice.
+single mode or peer mode is the better operational choice.
 
 ## Why?
 

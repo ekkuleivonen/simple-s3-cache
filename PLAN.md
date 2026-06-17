@@ -42,17 +42,23 @@ one workload.
 - Treat local SQLite and page files as disposable cache state.
 - Keep concurrency correctness explicit: multiple clients may request the same
   object, range, or missing page at the same time.
-- Target a single active cache instance. Do not add distributed
-  invalidation, cache ownership, shared cache storage, or external coordination.
+- Keep single mode simple, but support v2 peer mode with deterministic page
+  ownership, any-peer coordination, and distributed invalidation without
+  requiring an external state workload.
 - Avoid clever cache policy. Fetch pages only when requested.
 
 ## Deployment Model
 
-Single active cache instance. See [README.md](README.md#deployment-model) for the
-topology and the multi-instance staleness caveat (also hazard H11). The
-implementation consequence is that invalidation is purely local: successful
-writes through the cache invalidate local pages and metadata, and no distributed
-coordination is required.
+Two deployment modes. See [README.md](README.md#deployment-model) for the
+topology and [DISTRIBUTED.md](DISTRIBUTED.md) for the v2 peer design.
+
+In single mode, invalidation is purely local: successful writes through the cache
+invalidate local pages and metadata.
+
+In peer mode, any peer can coordinate a read. Large-object reads can use page
+ownership across the peer ring, and successful writes broadcast
+invalidation/epoch advancement to every peer. No external coordinator such as
+Redis, NATS, or etcd is required.
 
 ### Failure Model
 
@@ -700,8 +706,8 @@ cached reads until invalidation or eviction.
 
 See [README.md](README.md#limitations). In short: writes must pass through the
 cache to stay fresh (there is no freshness TTL — hazard H14), objects modified
-out-of-band may remain stale until invalidated or evicted, and multiple active
-instances do not coordinate.
+out-of-band may remain stale until invalidated or evicted, and only `peer` mode
+coordinates multiple active cache instances.
 
 ## Production Readiness Checklist
 
@@ -830,10 +836,13 @@ Global totals, plus the same counters **labeled by `bucket`** wherever cheap:
 - bytes served from upstream
 - **bytes fetched upstream to fill cache** (on misses; may exceed client
   requested bytes because whole pages are pulled)
-- peer owner decisions by `bucket`, `decision`, and `owner_id`
-- peer forwarded requests by `bucket`, `peer_id`, `method`, and `status_class`
-- peer forwarding failures by `bucket`, `peer_id`, and bounded `reason`
-- peer response bytes and peer forwarding duration by bounded peer labels
+- peer read strategy decisions by `bucket` and `strategy`
+- peer coordinator requests by `bucket`, `method`, and `status_class`
+- page-owner requests by `bucket`, `peer_id`, and `status_class`
+- page bytes served by owner peer
+- internal peer requests per client request
+- page batch sizes and coalesced fills
+- invalidation broadcast successes and failures by peer
 
 Derived ratios worth exposing or computing in dashboards:
 

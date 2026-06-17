@@ -61,10 +61,9 @@ separate from correctness e2e tests:
 uv run python perf/s3_read_bench.py \
   --target single=http://single-cache.example.internal:8080 \
   --target peer=http://peer-cache.example.internal:8080 \
-  --target gateway=http://gateway.example.internal:8080 \
   --bucket "$S3CACHE_S3_BUCKET" \
   --output perf-results.json
 ```
 
 See [perf/README.md](perf/README.md) for the full workload matrix and guidance
-for comparing single, direct peer, and gateway deployments.
+for comparing single and peer deployments.
