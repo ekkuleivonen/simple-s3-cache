@@ -1,0 +1,18 @@
+{{- if .Values.pdb.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "simple-s3-cache.fullname" . }}
+  labels:
+    {{- include "simple-s3-cache.labels" . | nindent 4 }}
+    app.kubernetes.io/component: cache
+spec:
+  {{- if .Values.pdb.minAvailable }}
+  minAvailable: {{ .Values.pdb.minAvailable }}
+  {{- else }}
+  maxUnavailable: {{ .Values.pdb.maxUnavailable }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "simple-s3-cache.selectorLabels" . | nindent 6 }}
+{{- end }}

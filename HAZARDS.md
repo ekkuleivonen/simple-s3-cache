@@ -181,25 +181,24 @@ test. Until then, treat it as load-bearing.
 
 ### H11. Multi-instance staleness
 
-* **Risk:** Multiple cache instances that do not agree on object ownership can
-  serve stale data. A write through one owner while another instance still
-  believes it owns the same object leaves the second cache stale.
-* **Why it matters:** Peer mode is correct only when all object requests for a
-  given `bucket/key` converge on exactly one owner. Mixed peer lists, ordinary
-  replicas outside peer mode, or forwarding loops can silently break that
-  invariant.
-* **Mitigation:** `single` mode remains the default and simplest production
-  topology. In `peer` mode, all object requests route by destination
-  `bucket/key` using the static peer list before any local cache state is
-  touched. Peer-forwarded and gateway-forwarded object requests carry peer
-  coordination headers plus a deterministic peer-ring fingerprint, and fail
-  closed with `502` if they land on a non-owner or report a missing/mismatched
-  ring or owner header. Tests cover remote-owner forwarding, local-owner
-  handling, forwarded write invalidation, peer routing mismatch handling, ring
-  mismatch handling, owner mismatch handling, and gateway owner routing headers.
-* **Watch:** Mixed peer-list rollouts, pods with stale config, peer forwarding
-  failures, ring IDs that differ across gateways and peers, or any code path
-  that touches local object cache state before the owner/ring check.
+* **Risk:** Multiple cache instances that do not participate in the same v2 peer
+  ring and invalidation protocol can serve stale data. A write through one cache
+  while another cache is outside the ring leaves the second cache unaware of the
+  new object epoch.
+* **Why it matters:** Peer mode is correct only when peers agree on page
+  ownership and every mutating path advances or invalidates object identity
+  across the ring. Ordinary replicas outside peer mode still do not coordinate.
+* **Mitigation:** `single` mode remains the simplest topology. In `peer` mode,
+  all peers share the same static peer list and ring fingerprint. Page reads use
+  deterministic page ownership, internal page/invalidation requests carry the
+  ring fingerprint, and missing or mismatched ring IDs fail closed before
+  touching local cache state. Successful writes broadcast invalidation and epoch
+  advancement to every peer; any peer that cannot apply the update must fail
+  readiness.
+* **Watch:** Mixed peer-list rollouts, pods with stale config, ring IDs that
+  differ across peers, cache replicas outside peer mode, invalidation broadcast
+  failures, or any code path that touches distributed page state before the
+  ring/identity checks.
 
 ### H13. Disk-full or cache write failure breaks reads
 
@@ -252,3 +251,127 @@ test. Until then, treat it as load-bearing.
 * **Watch:** Code paths that serve a page based only on file existence, rebuild
   object metadata from page files, or delete metadata and pages in separate
   steps without tolerating crashes between them.
+
+### H18. Distributed invalidation partial failure
+
+* **Risk:** In v2 page-sharded peer mode, an upstream write/delete succeeds
+  but one or more peers fail the invalidation broadcast and retain stale pages or
+  metadata for the object.
+* **Why it matters:** A later read coordinated by any peer may fetch a stale page
+  from a peer that missed invalidation, breaking the write-through freshness
+  guarantee.
+* **Mitigation:** Invalidation must be idempotent and broadcast to all peers.
+  If invalidation cannot be confirmed after upstream write success, the handling
+  peer must fail readiness, emit loud logs, and expose metrics. This is not
+  sufficient by itself: every peer must either apply the invalidation/epoch
+  advance or become not-ready. Page commits and serves must remain fenced by ETag
+  and epoch.
+* **Watch:** Write paths that treat invalidation failure as a warning-only event;
+  peers that keep passing readiness after consistency uncertainty; missing tests
+  for partial invalidation failure.
+
+### H19. Distributed read fallback stores or reroutes incorrectly
+
+* **Risk:** In v2 page-sharded peer mode, a page owner is down or rejects a
+  page read. The coordinator falls back by routing the page to another cache
+  owner or by storing the fallback upstream response into distributed cache.
+* **Why it matters:** Alternate page ownership duplicates placement and makes
+  invalidation ambiguous. Storing degraded fallback responses can create cache
+  state that does not follow the deterministic page-owner rule.
+* **Mitigation:** Before response commit, failed peer reads may fall back to a
+  pass-through upstream read for availability, but must not populate distributed
+  pages. Do not reroute a page to a non-owner. Log and meter the fallback.
+* **Watch:** Recovery code that silently picks another peer for a page; fallback
+  reads that call cache store paths; missing metrics for peer-read fallback.
+
+### H20. Page-owner ring mismatch
+
+* **Risk:** Peers disagree on the static peer ring while using deterministic page
+  ownership, so different peers compute different owners for the same
+  `bucket/key/pageIndex`.
+* **Why it matters:** The cluster can serve duplicate, stale, or missing pages
+  depending on which peer coordinates the request. This is the page-sharded
+  version of multi-instance staleness.
+* **Mitigation:** Every internal page and invalidation request must carry the
+  ring fingerprint. Peers must fail closed on missing or mismatched ring IDs
+  before touching local page state. Metrics must expose local ring fingerprints.
+* **Watch:** Mixed peer-list rollouts, internal routes that skip ring checks,
+  page-owner calculations outside the central router, ring IDs that differ
+  across peers.
+
+### H21. Coordinator/page-owner object identity mismatch
+
+* **Risk:** In v2 page-sharded peer mode, the coordinator sends stale or
+  inconsistent object identity to a page owner: wrong ETag, epoch, object size,
+  or page size.
+* **Why it matters:** The page owner may serve a page for the wrong object
+  version or calculate page bounds differently from the coordinator, producing
+  corrupt or truncated responses.
+* **Mitigation:** Internal page read requests must include the object identity
+  used to plan the response. Page owners may serve only pages that match ETag and
+  epoch, and must compute page bounds from the supplied page size and object
+  size. Upstream fills still use `If-Match`. PUT, DELETE, COPY, multipart
+  completion, overwrite, and conditional writes must all advance or invalidate
+  the object identity through one mechanism.
+* **Watch:** Internal APIs that identify pages only by bucket/key/page index;
+  page owners serving local files without checking ETag/epoch/page size; tests
+  that do not cover object replacement between metadata fetch and page fill.
+
+### H22. Peer fanout amplification
+
+* **Risk:** Distributed page reads turn one client request into many internal
+  peer requests, especially for multi-page ranges or full-object reads.
+* **Why it matters:** Naive fanout can increase latency, socket churn, CPU, and
+  internal network traffic enough to erase page-sharding throughput gains.
+* **Mitigation:** Group requested pages by page owner and batch them into bounded
+  internal requests, but stream page payloads through the internal frame protocol
+  instead of materializing full batches in memory. Bound per-peer and per-object
+  fill concurrency. Use the `object` read strategy for small objects and `auto`
+  thresholds based on effective page size.
+* **Watch:** Internal requests per client request, page batch sizes, peer request
+  latency, fill concurrency, request amplification on small-object workloads.
+
+### H23. Internal page framing corruption
+
+* **Risk:** V2 distributed page reads use an internal framed page protocol,
+  and a coordinator accepts truncated, misordered, duplicate, or corrupted page
+  frames from a page owner.
+* **Why it matters:** The client can receive corrupt bytes under a successful S3
+  response, or the coordinator can block indefinitely waiting for bytes that will
+  never arrive.
+* **Mitigation:** Version the internal page protocol from day one. Each frame
+  must identify page index and byte length, and coordinators must reject
+  unexpected, duplicate, truncated, or oversized frames. Page payloads should be
+  consumed as streams so HTTP/file backpressure, not page-sized heap buffers,
+  controls memory use.
+* **Watch:** Internal page responses without protocol versioning; tests that only
+  cover happy-path frames; handlers that stream page-owner bytes directly to
+  clients without validating frame boundaries.
+
+### H24. Readiness self-quarantine does not trigger
+
+* **Risk:** A peer detects local corruption, repeated invalidation failures, or
+  distributed consistency uncertainty but continues reporting ready.
+* **Why it matters:** The platform keeps routing client traffic to a peer that
+  may serve stale or inconsistent data.
+* **Mitigation:** Separate liveness from readiness. Consistency uncertainty must
+  fail readiness while keeping liveness and diagnostics available. Restart with
+  an empty cache remains safe.
+* **Watch:** Error paths that only log consistency uncertainty; readiness checks
+  that ignore degraded state; tests that do not assert readiness failure after
+  invalidation uncertainty.
+
+### H25. Internal peer API trust boundary
+
+* **Risk:** V2 internal page or invalidation endpoints accept client traffic,
+  trust client-supplied peer coordination headers, or expose cache-control
+  operations outside the peer ring.
+* **Why it matters:** A client could read internal page frames, trigger
+  invalidation, bypass routing checks, or poison peer coordination.
+* **Mitigation:** Strip peer headers at public boundaries. Internal routes must
+  require peer headers, matching ring fingerprint, and a signed peer MAC before
+  touching cache state. They should be kept under a clearly internal path or
+  listener. Never trust client-visible headers for upstream page fills.
+* **Watch:** Public handlers that route `/internal/*`; peer code that forwards
+  client-supplied internal headers; internal endpoints without tests for missing
+  or mismatched peer identity.

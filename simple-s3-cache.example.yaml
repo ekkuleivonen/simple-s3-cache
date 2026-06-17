@@ -29,11 +29,26 @@ upload:
   spool_path: /cache/spool
   max_spool_size: 10GB
 
+logging:
+  access_log: true
+  # Keep normal internal peer success traffic quiet during load.
+  internal_peer_access_log: false
+  internal_peer_success_log: false
+
+operator:
+  enabled: false
+  path: /debug/peer
+  # bearer_token: change-me
+
 peer:
   mode: single
   forward_timeout: 10m
   # To run in peer mode, set mode: peer, give each pod a unique local_id, and
   # provide the same static peer list on every pod.
+  # read_sharding: auto
+  # page_sharding_min_pages: 2
+  # max_peer_fill_concurrency: 32
+  # max_peer_object_fill_concurrency: 4
   # local_id: simple-s3-cache-0
   # peers:
   #   - id: simple-s3-cache-0

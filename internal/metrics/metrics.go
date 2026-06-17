@@ -18,6 +18,7 @@ type Recorder struct {
 	cachedBytes    int64
 	cachedByBucket map[string]int64
 	peerRingInfo   string
+	degradedReason string
 
 	counters   map[string]map[string]float64
 	histograms map[string]*histogram
@@ -46,19 +47,10 @@ func NewRecorder(cacheMaxBytes int64) *Recorder {
 	r.registerHistogram("simple_s3_cache_read_amplification", []float64{0, 1, 1.25, 1.5, 2, 4, 8, 16, 32})
 	r.registerHistogram("simple_s3_cache_upstream_duration_seconds", []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10})
 	r.registerHistogram("simple_s3_cache_hit_duration_seconds", []float64{0.0001, 0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1})
-	r.registerHistogram("simple_s3_cache_cache_metadata_duration_seconds", []float64{0.0001, 0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1})
-	r.registerHistogram("simple_s3_cache_cache_page_open_duration_seconds", []float64{0.0001, 0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1})
-	r.registerHistogram("simple_s3_cache_cache_response_copy_duration_seconds", []float64{0.0001, 0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1})
-	r.registerHistogram("simple_s3_cache_peer_forward_duration_seconds", []float64{0.0001, 0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5})
-	r.registerHistogram("simple_s3_cache_peer_response_header_duration_seconds", []float64{0.0001, 0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5})
-	r.registerHistogram("simple_s3_cache_peer_response_copy_duration_seconds", []float64{0.0001, 0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5})
-	r.registerHistogram("simple_s3_cache_peer_response_body_read_duration_seconds", []float64{0.0001, 0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5})
-	r.registerHistogram("simple_s3_cache_peer_downstream_write_duration_seconds", []float64{0.0001, 0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5})
-	r.registerHistogram("simple_s3_cache_gateway_forward_duration_seconds", []float64{0.0001, 0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5})
-	r.registerHistogram("simple_s3_cache_gateway_response_header_duration_seconds", []float64{0.0001, 0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5})
-	r.registerHistogram("simple_s3_cache_gateway_response_copy_duration_seconds", []float64{0.0001, 0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5})
-	r.registerHistogram("simple_s3_cache_gateway_response_body_read_duration_seconds", []float64{0.0001, 0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5})
-	r.registerHistogram("simple_s3_cache_gateway_downstream_write_duration_seconds", []float64{0.0001, 0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5})
+	r.registerHistogram("simple_s3_cache_internal_peer_requests_per_client_request", []float64{0, 1, 2, 4, 8, 16, 32, 64})
+	r.registerHistogram("simple_s3_cache_page_batch_size", []float64{0, 1, 2, 4, 8, 16, 32, 64, 128})
+	r.registerHistogram("simple_s3_cache_internal_peer_request_duration_seconds", []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10})
+	r.registerHistogram("simple_s3_cache_invalidation_broadcast_duration_seconds", []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10})
 	return r
 }
 
@@ -97,39 +89,66 @@ func (r *Recorder) RecordUpstreamFailure(bucket, operation string) {
 	r.inc("simple_s3_cache_upstream_request_failures_total", labels(label{"bucket", bucket}, label{"operation", operation}), 1)
 }
 
-func (r *Recorder) RecordPeerDecision(bucket, decision, ownerID string) {
-	r.inc("simple_s3_cache_peer_owner_decisions_total", labels(label{"bucket", bucket}, label{"decision", decision}, label{"owner_id", ownerID}), 1)
+func (r *Recorder) RecordReadStrategy(bucket, strategy string) {
+	r.inc("simple_s3_cache_read_strategy_selected_total", labels(label{"bucket", bucket}, label{"strategy", strategy}), 1)
 }
 
-func (r *Recorder) RecordPeerForward(bucket, peerID, method, statusClass string) {
-	r.inc("simple_s3_cache_peer_forwarded_requests_total", labels(label{"bucket", bucket}, label{"peer_id", peerID}, label{"method", method}, label{"status_class", statusClass}), 1)
+func (r *Recorder) RecordCacheResult(bucket, cacheStatus, statusClass string, bytes int64) {
+	labelKey := labels(label{"bucket", bucket}, label{"cache_status", cacheStatus}, label{"status_class", statusClass})
+	r.inc("simple_s3_cache_cache_requests_total", labelKey, 1)
+	if bytes > 0 {
+		r.inc("simple_s3_cache_cache_bytes_total", labelKey, float64(bytes))
+	}
 }
 
-func (r *Recorder) RecordPeerForwardFailure(bucket, peerID, reason string) {
-	r.inc("simple_s3_cache_peer_forward_failures_total", labels(label{"bucket", bucket}, label{"peer_id", peerID}, label{"reason", reason}), 1)
+func (r *Recorder) RecordPeerReadFallback(bucket, peerID, reason string) {
+	r.inc("simple_s3_cache_peer_read_fallbacks_total", labels(label{"bucket", bucket}, label{"peer_id", peerID}, label{"reason", reason}), 1)
 }
 
-func (r *Recorder) RecordPeerForwardResponseBytes(bucket, peerID string, bytes int64) {
-	r.inc("simple_s3_cache_peer_forward_response_bytes_total", labels(label{"bucket", bucket}, label{"peer_id", peerID}), float64(bytes))
+func (r *Recorder) RecordCoordinatorRequest(bucket, method, strategy, statusClass string) {
+	r.inc("simple_s3_cache_coordinator_requests_total", labels(label{"bucket", bucket}, label{"method", method}, label{"strategy", strategy}, label{"status_class", statusClass}), 1)
 }
 
-func (r *Recorder) RecordGatewayRequest(bucket, route, peerID, method, statusClass string) {
-	r.inc("simple_s3_cache_gateway_requests_total", gatewayLabels(bucket, route, peerID, method, statusClass), 1)
+func (r *Recorder) RecordPageOwnerRequest(bucket, ownerID, statusClass string) {
+	r.inc("simple_s3_cache_page_owner_requests_total", pageOwnerStatusLabels(bucket, ownerID, statusClass), 1)
 }
 
-func (r *Recorder) RecordGatewayForwardFailure(bucket, peerID, reason string) {
-	r.inc("simple_s3_cache_gateway_forward_failures_total", labels(label{"bucket", bucket}, label{"peer_id", peerID}, label{"reason", reason}), 1)
+func (r *Recorder) RecordPageOwnerBytesServed(bucket, ownerID string, bytes int64) {
+	r.inc("simple_s3_cache_page_owner_bytes_served_total", pageOwnerLabels(bucket, ownerID), float64(bytes))
 }
 
-func (r *Recorder) RecordGatewayResponseBytes(bucket, peerID string, bytes int64) {
-	r.inc("simple_s3_cache_gateway_response_bytes_total", labels(label{"bucket", bucket}, label{"peer_id", peerID}), float64(bytes))
+func (r *Recorder) RecordPageOwnerUpstreamFillBytes(bucket, ownerID string, bytes int64) {
+	r.inc("simple_s3_cache_page_owner_upstream_fill_bytes_total", pageOwnerLabels(bucket, ownerID), float64(bytes))
 }
 
-func (r *Recorder) SetPeerRingInfo(mode, localID, ringID string) {
+func (r *Recorder) RecordInvalidationBroadcast(bucket, peerID, status string) {
+	r.inc("simple_s3_cache_invalidation_broadcasts_total", labels(label{"bucket", bucket}, label{"peer_id", peerID}, label{"status", status}), 1)
+}
+
+func (r *Recorder) RecordInternalPeerRequestFailure(bucket, peerID, reason string) {
+	r.inc("simple_s3_cache_internal_peer_request_failures_total", labels(label{"bucket", bucket}, label{"peer_id", peerID}, label{"reason", reason}), 1)
+}
+
+func (r *Recorder) RecordFillCoalesced(bucket, result string) {
+	r.inc("simple_s3_cache_fill_coalesced_total", labels(label{"bucket", bucket}, label{"result", result}), 1)
+}
+
+func (r *Recorder) SetPeerRingInfo(mode, localID, ringID string, peerCount ...int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	r.peerRingInfo = labels(label{"mode", mode}, label{"local_id", localID}, label{"ring_id", ringID})
+	values := []label{{"mode", mode}, {"local_id", localID}, {"ring_id", ringID}}
+	if len(peerCount) > 0 {
+		values = append(values, label{"peer_count", strconv.Itoa(peerCount[0])})
+	}
+	r.peerRingInfo = labels(values...)
+}
+
+func (r *Recorder) SetDegraded(reason string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.degradedReason = strings.TrimSpace(reason)
 }
 
 func (r *Recorder) RecordBytesServedFromCache(bucket string, bytes int64) {
@@ -164,56 +183,20 @@ func (r *Recorder) ObserveCacheServeDuration(bucket string, d time.Duration) {
 	r.observe("simple_s3_cache_hit_duration_seconds", bucketLabels(bucket), d.Seconds())
 }
 
-func (r *Recorder) ObserveCacheMetadataDuration(bucket, cacheResult string, d time.Duration) {
-	r.observe("simple_s3_cache_cache_metadata_duration_seconds", cacheResultLabels(bucket, cacheResult), d.Seconds())
+func (r *Recorder) ObserveInternalPeerRequestsPerClientRequest(bucket, strategy string, count int64) {
+	r.observe("simple_s3_cache_internal_peer_requests_per_client_request", labels(label{"bucket", bucket}, label{"strategy", strategy}), float64(count))
 }
 
-func (r *Recorder) ObserveCachePageOpenDuration(bucket, cacheResult string, d time.Duration) {
-	r.observe("simple_s3_cache_cache_page_open_duration_seconds", cacheResultLabels(bucket, cacheResult), d.Seconds())
+func (r *Recorder) ObservePageBatchSize(bucket, ownerID string, pages int64) {
+	r.observe("simple_s3_cache_page_batch_size", pageOwnerLabels(bucket, ownerID), float64(pages))
 }
 
-func (r *Recorder) ObserveCacheResponseCopyDuration(bucket, cacheResult string, d time.Duration) {
-	r.observe("simple_s3_cache_cache_response_copy_duration_seconds", cacheResultLabels(bucket, cacheResult), d.Seconds())
+func (r *Recorder) ObserveInternalPeerRequestDuration(bucket, ownerID, statusClass string, d time.Duration) {
+	r.observe("simple_s3_cache_internal_peer_request_duration_seconds", pageOwnerStatusLabels(bucket, ownerID, statusClass), d.Seconds())
 }
 
-func (r *Recorder) ObservePeerForwardDuration(bucket, peerID, statusClass string, d time.Duration) {
-	r.observe("simple_s3_cache_peer_forward_duration_seconds", labels(label{"bucket", bucket}, label{"peer_id", peerID}, label{"status_class", statusClass}), d.Seconds())
-}
-
-func (r *Recorder) ObservePeerResponseHeaderDuration(bucket, peerID, statusClass string, d time.Duration) {
-	r.observe("simple_s3_cache_peer_response_header_duration_seconds", labels(label{"bucket", bucket}, label{"peer_id", peerID}, label{"status_class", statusClass}), d.Seconds())
-}
-
-func (r *Recorder) ObservePeerResponseCopyDuration(bucket, peerID, statusClass string, d time.Duration) {
-	r.observe("simple_s3_cache_peer_response_copy_duration_seconds", labels(label{"bucket", bucket}, label{"peer_id", peerID}, label{"status_class", statusClass}), d.Seconds())
-}
-
-func (r *Recorder) ObservePeerResponseBodyReadDuration(bucket, peerID, statusClass string, d time.Duration) {
-	r.observe("simple_s3_cache_peer_response_body_read_duration_seconds", labels(label{"bucket", bucket}, label{"peer_id", peerID}, label{"status_class", statusClass}), d.Seconds())
-}
-
-func (r *Recorder) ObservePeerDownstreamWriteDuration(bucket, peerID, statusClass string, d time.Duration) {
-	r.observe("simple_s3_cache_peer_downstream_write_duration_seconds", labels(label{"bucket", bucket}, label{"peer_id", peerID}, label{"status_class", statusClass}), d.Seconds())
-}
-
-func (r *Recorder) ObserveGatewayForwardDuration(bucket, route, peerID, statusClass string, d time.Duration) {
-	r.observe("simple_s3_cache_gateway_forward_duration_seconds", gatewayDurationLabels(bucket, route, peerID, statusClass), d.Seconds())
-}
-
-func (r *Recorder) ObserveGatewayResponseHeaderDuration(bucket, route, peerID, statusClass string, d time.Duration) {
-	r.observe("simple_s3_cache_gateway_response_header_duration_seconds", gatewayDurationLabels(bucket, route, peerID, statusClass), d.Seconds())
-}
-
-func (r *Recorder) ObserveGatewayResponseCopyDuration(bucket, route, peerID, statusClass string, d time.Duration) {
-	r.observe("simple_s3_cache_gateway_response_copy_duration_seconds", gatewayDurationLabels(bucket, route, peerID, statusClass), d.Seconds())
-}
-
-func (r *Recorder) ObserveGatewayResponseBodyReadDuration(bucket, route, peerID, statusClass string, d time.Duration) {
-	r.observe("simple_s3_cache_gateway_response_body_read_duration_seconds", gatewayDurationLabels(bucket, route, peerID, statusClass), d.Seconds())
-}
-
-func (r *Recorder) ObserveGatewayDownstreamWriteDuration(bucket, route, peerID, statusClass string, d time.Duration) {
-	r.observe("simple_s3_cache_gateway_downstream_write_duration_seconds", gatewayDurationLabels(bucket, route, peerID, statusClass), d.Seconds())
+func (r *Recorder) ObserveInvalidationBroadcastDuration(bucket, peerID, status string, d time.Duration) {
+	r.observe("simple_s3_cache_invalidation_broadcast_duration_seconds", labels(label{"bucket", bucket}, label{"peer_id", peerID}, label{"status", status}), d.Seconds())
 }
 
 func (r *Recorder) SetCachedBytes(total int64, byBucket map[string]int64) {
@@ -252,10 +235,7 @@ func (r *Recorder) inc(name, labelKey string, value float64) {
 	if _, ok := r.counters[name]; !ok {
 		r.counters[name] = map[string]float64{}
 	}
-	r.counters[name][""] += value
-	if labelKey != "" {
-		r.counters[name][labelKey] += value
-	}
+	r.counters[name][labelKey] += value
 }
 
 func (r *Recorder) observe(name, labelKey string, value float64) {
@@ -266,10 +246,7 @@ func (r *Recorder) observe(name, labelKey string, value float64) {
 	if !ok {
 		return
 	}
-	h.observe("", value)
-	if labelKey != "" {
-		h.observe(labelKey, value)
-	}
+	h.observe(labelKey, value)
 }
 
 func (h *histogram) observe(labelKey string, value float64) {
@@ -312,6 +289,12 @@ func (r *Recorder) renderGauges(b *strings.Builder) {
 		b.WriteString("# TYPE simple_s3_cache_peer_ring_info gauge\n")
 		writeMetricLine(b, "simple_s3_cache_peer_ring_info", r.peerRingInfo, 1)
 	}
+	b.WriteString("# TYPE simple_s3_cache_degraded gauge\n")
+	if r.degradedReason == "" {
+		writeMetricLine(b, "simple_s3_cache_degraded", "", 0)
+	} else {
+		writeMetricLine(b, "simple_s3_cache_degraded", labels(label{"reason_code", r.degradedReason}), 1)
+	}
 }
 
 func (r *Recorder) renderHistograms(b *strings.Builder) {
@@ -342,16 +325,12 @@ func bucketLabels(bucket string) string {
 	return labels(label{"bucket", bucket})
 }
 
-func cacheResultLabels(bucket, cacheResult string) string {
-	return labels(label{"bucket", bucket}, label{"cache_result", cacheResult})
+func pageOwnerLabels(bucket, ownerID string) string {
+	return labels(label{"bucket", bucket}, label{"owner_id", ownerID})
 }
 
-func gatewayLabels(bucket, route, peerID, method, statusClass string) string {
-	return labels(label{"bucket", bucket}, label{"route", route}, label{"peer_id", peerID}, label{"method", method}, label{"status_class", statusClass})
-}
-
-func gatewayDurationLabels(bucket, route, peerID, statusClass string) string {
-	return labels(label{"bucket", bucket}, label{"route", route}, label{"peer_id", peerID}, label{"status_class", statusClass})
+func pageOwnerStatusLabels(bucket, ownerID, statusClass string) string {
+	return labels(label{"bucket", bucket}, label{"owner_id", ownerID}, label{"status_class", statusClass})
 }
 
 func labels(values ...label) string {

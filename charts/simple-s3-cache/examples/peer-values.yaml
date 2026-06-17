@@ -1,9 +1,9 @@
 topology: peer
-replicaCount: 3
+replicaCount: 4
 
 image:
   repository: ghcr.io/ekkuleivonen/simple-s3-cache
-  tag: latest
+  tag: "0.0.7"
 
 upstream:
   endpoint: http://rustfs-api.rustfs.svc.cluster.local:9000
@@ -17,6 +17,26 @@ cache:
   maxSize: 90GiB
   pageSize: 4MiB
 
+peer:
+  auth:
+    existingSecret: simple-s3-cache-peer-auth
+    key: auth_secret
+  readSharding: auto
+  pageShardingMinPages: 2
+  maxPeerFillConcurrency: 32
+  maxPeerObjectFillConcurrency: 4
+  forwardTimeout: 10m
+
+logging:
+  accessLog: true
+  internalPeerAccessLog: false
+  internalPeerSuccessLog: false
+
+operator:
+  enabled: true
+  path: /debug/peer
+  bearerToken: replace-with-operator-token
+
 persistence:
   data:
     size: 100Gi
@@ -29,9 +49,25 @@ cacheService:
   type: LoadBalancer
   port: 9000
 
+peerLoadBalancerServices:
+  enabled: true
+  port: 9000
+  loadBalancerIPs:
+    - 192.168.30.217
+    - 192.168.30.218
+    - 192.168.30.219
+    - 192.168.30.220
+
 podAntiAffinity:
   enabled: true
   required: true
 
+pdb:
+  enabled: true
+  maxUnavailable: 1
+
 serviceMonitor:
+  enabled: true
+
+prometheusRule:
   enabled: true

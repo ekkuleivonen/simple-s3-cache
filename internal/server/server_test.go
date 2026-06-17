@@ -13,6 +13,7 @@ import (
 
 	"github.com/ekkuleivonen/simple-s3-cache/internal/config"
 	"github.com/ekkuleivonen/simple-s3-cache/internal/metrics"
+	"github.com/ekkuleivonen/simple-s3-cache/internal/ops"
 )
 
 func TestHealthz(t *testing.T) {
@@ -31,9 +32,29 @@ func TestHealthz(t *testing.T) {
 	if got := rec.Header().Get("Content-Type"); got != "application/json" {
 		t.Fatalf("Content-Type = %q, want application/json", got)
 	}
-	if got := rec.Body.String(); got != "{\"status\":\"ok\"}\n" {
+	if got := rec.Body.String(); got != "{\"status\":\"ok\",\"ready\":true}\n" {
 		t.Fatalf("body = %q", got)
 	}
+}
+
+func TestHealthzStaysLiveWhenReadinessFails(t *testing.T) {
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logs, nil))
+	srv := New(config.Config{Listen: ":0"}, logger, failingReadiness{reason: "peer ring mismatch"})
+
+	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	rec := httptest.NewRecorder()
+
+	srv.httpServer.Handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	assertJSONFields(t, rec.Body.Bytes(), map[string]any{
+		"status": "ok",
+		"ready":  false,
+		"reason": "peer ring mismatch",
+	})
 }
 
 func TestReadyz(t *testing.T) {
@@ -55,6 +76,49 @@ func TestReadyz(t *testing.T) {
 	if got := rec.Body.String(); got != "{\"status\":\"ready\"}\n" {
 		t.Fatalf("body = %q", got)
 	}
+}
+
+func TestReadyzFailsWhenCheckerIsNotReady(t *testing.T) {
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logs, nil))
+	srv := New(config.Config{Listen: ":0"}, logger, failingReadiness{reason: "local invalidation failed"})
+
+	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+	rec := httptest.NewRecorder()
+
+	srv.httpServer.Handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusServiceUnavailable)
+	}
+	assertJSONFields(t, rec.Body.Bytes(), map[string]any{
+		"status": "not_ready",
+		"ready":  false,
+		"reason": "local invalidation failed",
+	})
+}
+
+func TestReadyzIncludesStructuredReadinessDetail(t *testing.T) {
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logs, nil))
+	srv := New(config.Config{Listen: ":0", Logging: config.LoggingConfig{AccessLog: true}}, logger, detailedReadiness{})
+
+	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+	rec := httptest.NewRecorder()
+
+	srv.httpServer.Handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusServiceUnavailable)
+	}
+	assertJSONFields(t, rec.Body.Bytes(), map[string]any{
+		"status":      "not_ready",
+		"ready":       false,
+		"reason":      "peer ring mismatch",
+		"reason_code": "peer_ring_mismatch",
+		"peer_id":     "cache-0",
+		"ring_id":     "ring-123",
+	})
 }
 
 func TestMetricsEndpoint(t *testing.T) {
@@ -106,7 +170,7 @@ func TestServerAppliesConfiguredTimeouts(t *testing.T) {
 func TestRequestLoggerWritesStructuredLog(t *testing.T) {
 	var logs bytes.Buffer
 	logger := slog.New(slog.NewJSONHandler(&logs, nil))
-	srv := New(config.Config{Listen: ":0"}, logger)
+	srv := New(config.Config{Listen: ":0", Logging: config.LoggingConfig{AccessLog: true}}, logger)
 
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 	rec := httptest.NewRecorder()
@@ -130,6 +194,54 @@ func TestRequestLoggerWritesStructuredLog(t *testing.T) {
 	if entry["status"] != float64(http.StatusOK) {
 		t.Fatalf("status = %v, want %d", entry["status"], http.StatusOK)
 	}
+}
+
+func TestRequestLoggerSuppressesSuccessfulInternalPeerAccessByDefault(t *testing.T) {
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logs, nil))
+	srv := New(config.Config{Listen: ":0", Logging: config.LoggingConfig{AccessLog: true}}, logger, failingReadiness{})
+
+	req := httptest.NewRequest(http.MethodGet, "/internal/v1/test", nil)
+	rec := httptest.NewRecorder()
+
+	srv.httpServer.Handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusNoContent)
+	}
+	if logs.Len() != 0 {
+		t.Fatalf("logs = %q, want no successful internal peer access log", logs.String())
+	}
+}
+
+func TestOperatorStateEndpointRequiresBearerToken(t *testing.T) {
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logs, nil))
+	cfg := config.Config{
+		Listen:   ":0",
+		Logging:  config.LoggingConfig{AccessLog: true},
+		Operator: config.OperatorConfig{Enabled: true, Path: "/debug/peer", BearerToken: "secret"},
+	}
+	srv := New(cfg, logger, stateHandler{})
+
+	unauthorized := httptest.NewRecorder()
+	srv.httpServer.Handler.ServeHTTP(unauthorized, httptest.NewRequest(http.MethodGet, "/debug/peer", nil))
+	if unauthorized.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthorized status = %d, want %d", unauthorized.Code, http.StatusUnauthorized)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/debug/peer", nil)
+	req.Header.Set("Authorization", "Bearer secret")
+	rec := httptest.NewRecorder()
+	srv.httpServer.Handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("authorized status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	assertJSONFields(t, rec.Body.Bytes(), map[string]any{
+		"mode":    "peer",
+		"ring_id": "ring-123",
+		"ready":   true,
+	})
 }
 
 func TestLoggingResponseWriterPreservesReaderFrom(t *testing.T) {
@@ -200,4 +312,70 @@ type flushingResponseWriter struct {
 
 func (w *flushingResponseWriter) Flush() {
 	w.flushes++
+}
+
+type failingReadiness struct {
+	reason string
+}
+
+func (r failingReadiness) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (r failingReadiness) Readiness() (bool, string) {
+	return false, r.reason
+}
+
+type detailedReadiness struct{}
+
+func (detailedReadiness) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (detailedReadiness) Readiness() (bool, string) {
+	return false, "peer ring mismatch"
+}
+
+func (detailedReadiness) ReadinessDetail() ops.Readiness {
+	return ops.Readiness{
+		Ready: false,
+		Degraded: &ops.DegradedState{
+			Code:   "peer_ring_mismatch",
+			Reason: "peer ring mismatch",
+			PeerID: "cache-0",
+			RingID: "ring-123",
+		},
+	}
+}
+
+type stateHandler struct{}
+
+func (stateHandler) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (stateHandler) Readiness() (bool, string) {
+	return true, ""
+}
+
+func (stateHandler) PeerState() ops.PeerState {
+	return ops.PeerState{
+		Mode:   "peer",
+		RingID: "ring-123",
+		Ready:  true,
+	}
+}
+
+func assertJSONFields(t *testing.T, body []byte, want map[string]any) {
+	t.Helper()
+
+	var got map[string]any
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatalf("decode JSON body: %v\nbody: %s", err, body)
+	}
+	for key, wantValue := range want {
+		if got[key] != wantValue {
+			t.Fatalf("body field %q = %v, want %v\nbody: %s", key, got[key], wantValue, body)
+		}
+	}
 }

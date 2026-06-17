@@ -33,34 +33,12 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 app.kubernetes.io/component: cache
 {{- end -}}
 
-{{- define "simple-s3-cache.gatewaySelectorLabels" -}}
-app.kubernetes.io/name: {{ include "simple-s3-cache.name" . }}
-app.kubernetes.io/instance: {{ .Release.Name }}
-app.kubernetes.io/component: gateway
-{{- end -}}
-
 {{- define "simple-s3-cache.topology" -}}
 {{- $topology := default "single" .Values.topology -}}
-{{- if not (has $topology (list "single" "peer" "gateway" "external-gateway")) -}}
-{{- fail "topology must be one of: single, peer, gateway, external-gateway" -}}
+{{- if not (has $topology (list "single" "peer")) -}}
+{{- fail "topology must be one of: single, peer" -}}
 {{- end -}}
 {{- $topology -}}
-{{- end -}}
-
-{{- define "simple-s3-cache.cacheEnabled" -}}
-{{- if eq (include "simple-s3-cache.topology" .) "external-gateway" -}}
-false
-{{- else -}}
-true
-{{- end -}}
-{{- end -}}
-
-{{- define "simple-s3-cache.gatewayEnabled" -}}
-{{- if has (include "simple-s3-cache.topology" .) (list "gateway" "external-gateway") -}}
-true
-{{- else -}}
-false
-{{- end -}}
 {{- end -}}
 
 {{- define "simple-s3-cache.cacheReplicas" -}}
@@ -72,12 +50,20 @@ false
 {{- end -}}
 
 {{- define "simple-s3-cache.image" -}}
-{{- $tag := default .Chart.AppVersion .Values.image.tag -}}
+{{- $tag := include "simple-s3-cache.imageTag" . -}}
 {{- printf "%s:%s" .Values.image.repository $tag -}}
+{{- end -}}
+
+{{- define "simple-s3-cache.imageTag" -}}
+{{- default .Chart.AppVersion .Values.image.tag -}}
 {{- end -}}
 
 {{- define "simple-s3-cache.secretName" -}}
 {{- default (printf "%s-upstream" (include "simple-s3-cache.fullname" .)) .Values.upstream.credentials.existingSecret -}}
+{{- end -}}
+
+{{- define "simple-s3-cache.peerAuthSecretName" -}}
+{{- .Values.peer.auth.existingSecret -}}
 {{- end -}}
 
 {{- define "simple-s3-cache.peerServiceName" -}}
@@ -85,36 +71,10 @@ false
 {{- end -}}
 
 {{- define "simple-s3-cache.cacheServiceEnabled" -}}
-{{- if eq (include "simple-s3-cache.cacheEnabled" .) "false" -}}
-false
-{{- else if kindIs "bool" .Values.cacheService.enabled -}}
+{{- if kindIs "bool" .Values.cacheService.enabled -}}
 {{- .Values.cacheService.enabled -}}
-{{- else if eq (include "simple-s3-cache.topology" .) "gateway" -}}
-false
 {{- else -}}
 true
-{{- end -}}
-{{- end -}}
-
-{{- define "simple-s3-cache.validateGatewayPeers" -}}
-{{- if and (eq (include "simple-s3-cache.topology" .) "external-gateway") (eq (len .Values.gateway.externalPeers) 0) -}}
-{{- fail "gateway.externalPeers must contain at least one peer when topology is external-gateway" -}}
-{{- end -}}
-{{- end -}}
-
-{{- define "simple-s3-cache.gatewayPeerList" -}}
-{{- include "simple-s3-cache.validateGatewayPeers" . -}}
-{{- if .Values.gateway.externalPeers -}}
-{{- range .Values.gateway.externalPeers }}
-        - id: {{ .id }}
-          url: {{ .url }}
-{{- end -}}
-{{- else -}}
-{{- $replicas := int (include "simple-s3-cache.cacheReplicas" .) -}}
-{{- range $i := until $replicas }}
-        - id: {{ include "simple-s3-cache.fullname" $ }}-{{ $i }}
-          url: {{ include "simple-s3-cache.peerURL" (list $ $i) }}
-{{- end -}}
 {{- end -}}
 {{- end -}}
 
@@ -124,4 +84,21 @@ true
 {{- $fullname := include "simple-s3-cache.fullname" $root -}}
 {{- $peerService := include "simple-s3-cache.peerServiceName" $root -}}
 {{- printf "http://%s-%d.%s.%s.svc.cluster.local:8080" $fullname $ordinal $peerService $root.Release.Namespace -}}
+{{- end -}}
+
+{{- define "simple-s3-cache.validate" -}}
+{{- $tag := include "simple-s3-cache.imageTag" . -}}
+{{- if eq $tag "latest" -}}
+{{- fail "image.tag must not be latest; set image.tag to an immutable release tag or leave it empty to use Chart.appVersion" -}}
+{{- end -}}
+{{- if eq (include "simple-s3-cache.topology" .) "peer" -}}
+{{- $existingPeerSecret := .Values.peer.auth.existingSecret -}}
+{{- $inlinePeerSecret := .Values.peer.authSecret -}}
+{{- if and (not $existingPeerSecret) (or (not $inlinePeerSecret) (eq $inlinePeerSecret "change-me")) -}}
+{{- fail "peer mode requires peer.auth.existingSecret or a non-placeholder peer.authSecret" -}}
+{{- end -}}
+{{- if and $existingPeerSecret (not .Values.peer.auth.key) -}}
+{{- fail "peer.auth.key is required when peer.auth.existingSecret is set" -}}
+{{- end -}}
+{{- end -}}
 {{- end -}}

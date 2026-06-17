@@ -184,7 +184,7 @@ def parse_args() -> argparse.Namespace:
         action="append",
         required=True,
         metavar="NAME=URL",
-        help="Endpoint to benchmark. Repeat for single, peer, gateway, etc.",
+        help="Endpoint to benchmark. Repeat for single, peer, etc.",
     )
     parser.add_argument(
         "--metrics",

@@ -458,7 +458,7 @@ def test_proxy_path_style_keys_with_escaping(cache_s3_client, s3_client, e2e_con
 def test_proxy_healthz(cache_endpoint: str) -> None:
     with urllib.request.urlopen(f"{cache_endpoint}/healthz", timeout=5) as response:
         assert response.status == 200
-        assert response.read() == b'{"status":"ok"}\n'
+        assert response.read() == b'{"status":"ok","ready":true}\n'
 
 
 def test_proxy_readyz(cache_endpoint: str) -> None:

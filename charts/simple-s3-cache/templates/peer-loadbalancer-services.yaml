@@ -1,0 +1,40 @@
+{{- if and (eq (include "simple-s3-cache.topology" .) "peer") .Values.peerLoadBalancerServices.enabled }}
+{{- $replicas := int (include "simple-s3-cache.cacheReplicas" .) }}
+{{- $fullname := include "simple-s3-cache.fullname" . }}
+{{- range $i := until $replicas }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fullname }}-peer-{{ $i }}
+  labels:
+    {{- include "simple-s3-cache.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: cache
+    app.kubernetes.io/pod-index: {{ $i | quote }}
+  {{- with $.Values.peerLoadBalancerServices.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ $.Values.peerLoadBalancerServices.type }}
+  {{- if $.Values.peerLoadBalancerServices.externalTrafficPolicy }}
+  externalTrafficPolicy: {{ $.Values.peerLoadBalancerServices.externalTrafficPolicy }}
+  {{- end }}
+  {{- $lbIPs := $.Values.peerLoadBalancerServices.loadBalancerIPs }}
+  {{- if and $lbIPs (lt $i (len $lbIPs)) }}
+  loadBalancerIP: {{ index $lbIPs $i }}
+  {{- end }}
+  {{- with $.Values.peerLoadBalancerServices.loadBalancerSourceRanges }}
+  loadBalancerSourceRanges:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  selector:
+    {{- include "simple-s3-cache.selectorLabels" $ | nindent 4 }}
+    statefulset.kubernetes.io/pod-name: {{ $fullname }}-{{ $i }}
+  ports:
+    - name: http
+      port: {{ $.Values.peerLoadBalancerServices.port }}
+      targetPort: http
+      protocol: TCP
+{{- end }}
+{{- end }}

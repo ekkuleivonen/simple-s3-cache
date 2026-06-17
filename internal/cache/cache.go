@@ -388,54 +388,101 @@ WHERE id = ?
 }
 
 func (c *Cache) DeleteObject(ctx context.Context, bucket, key string) error {
-	obj, ok, err := c.GetObject(ctx, bucket, key)
-	if err != nil {
-		return err
+	_, err := c.InvalidateObject(ctx, bucket, key, 0)
+	return err
+}
+
+func (c *Cache) InvalidateObject(ctx context.Context, bucket, key string, minEpoch int64) (int64, error) {
+	if bucket == "" {
+		return 0, errors.New("bucket is required")
 	}
-	if !ok {
-		return nil
+	if key == "" {
+		return 0, errors.New("key is required")
+	}
+	if minEpoch < 0 {
+		return 0, errors.New("minimum epoch must not be negative")
 	}
 
-	pages, err := c.ListPages(ctx, obj.ID)
-	if err != nil {
-		return err
-	}
-
+	id := ObjectKey(bucket, key)
 	now := c.timestamp()
 	tx, unlock, err := c.beginWriteTx(ctx)
 	if err != nil {
-		return fmt.Errorf("begin delete object: %w", err)
+		return 0, fmt.Errorf("begin invalidate object: %w", err)
 	}
 	defer unlock()
 	if _, err := tx.ExecContext(ctx, `
 INSERT INTO object_generations (id, epoch, updated_at)
 VALUES (?, 0, ?)
 ON CONFLICT(id) DO NOTHING
-`, obj.ID, now); err != nil {
+`, id, now); err != nil {
 		_ = tx.Rollback()
-		return fmt.Errorf("ensure object generation: %w", err)
+		return 0, fmt.Errorf("ensure object generation: %w", err)
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE object_generations SET epoch = epoch + 1, updated_at = ? WHERE id = ?`, now, obj.ID); err != nil {
+
+	var currentEpoch int64
+	if err := tx.QueryRowContext(ctx, `SELECT epoch FROM object_generations WHERE id = ?`, id).Scan(&currentEpoch); err != nil {
 		_ = tx.Rollback()
-		return fmt.Errorf("bump object generation: %w", err)
+		return 0, fmt.Errorf("read object generation: %w", err)
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM objects WHERE id = ?`, obj.ID); err != nil {
+
+	nextEpoch := currentEpoch + 1
+	if minEpoch > 0 {
+		nextEpoch = currentEpoch
+		if nextEpoch < minEpoch {
+			nextEpoch = minEpoch
+		}
+	}
+
+	var obj Object
+	var headersJSON string
+	objectErr := tx.QueryRowContext(ctx, `
+SELECT id, bucket, key, etag, size, page_size, headers_json, epoch
+FROM objects
+WHERE id = ?
+`, id).Scan(&obj.ID, &obj.Bucket, &obj.Key, &obj.ETag, &obj.Size, &obj.PageSize, &headersJSON, &obj.Epoch)
+	if objectErr != nil && !errors.Is(objectErr, sql.ErrNoRows) {
 		_ = tx.Rollback()
-		return fmt.Errorf("delete object: %w", err)
+		return 0, fmt.Errorf("read object for invalidation: %w", objectErr)
+	}
+
+	var pages []Page
+	shouldDeleteObject := objectErr == nil
+	if shouldDeleteObject && minEpoch > 0 {
+		shouldDeleteObject = obj.Epoch <= minEpoch
+	}
+	if shouldDeleteObject {
+		pages, err = listPagesTx(ctx, tx, obj.ID)
+		if err != nil {
+			_ = tx.Rollback()
+			return 0, err
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM objects WHERE id = ?`, obj.ID); err != nil {
+			_ = tx.Rollback()
+			return 0, fmt.Errorf("delete object: %w", err)
+		}
+	}
+
+	if nextEpoch > currentEpoch {
+		if _, err := tx.ExecContext(ctx, `UPDATE object_generations SET epoch = ?, updated_at = ? WHERE id = ?`, nextEpoch, now, id); err != nil {
+			_ = tx.Rollback()
+			return 0, fmt.Errorf("advance object generation: %w", err)
+		}
 	}
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit delete object: %w", err)
+		return 0, fmt.Errorf("commit invalidate object: %w", err)
 	}
 
 	for _, page := range pages {
 		if err := os.Remove(filepath.Join(c.cacheRoot, page.Path)); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("delete page file: %w", err)
+			return nextEpoch, fmt.Errorf("delete page file: %w", err)
 		}
 	}
-	c.adjustCacheSize(obj.Bucket, -pagesSize(pages))
-	c.requestMetricsRefresh()
+	if len(pages) > 0 {
+		c.adjustCacheSize(obj.Bucket, -pagesSize(pages))
+		c.requestMetricsRefresh()
+	}
 
-	return nil
+	return nextEpoch, nil
 }
 
 func (c *Cache) PutPage(ctx context.Context, page Page) error {
@@ -495,6 +542,32 @@ ORDER BY page_index
 		return nil, fmt.Errorf("list pages: %w", err)
 	}
 
+	return pages, nil
+}
+
+func listPagesTx(ctx context.Context, tx *sql.Tx, objectID string) ([]Page, error) {
+	rows, err := tx.QueryContext(ctx, `
+SELECT object_id, page_index, etag, epoch, size, path
+FROM pages
+WHERE object_id = ?
+ORDER BY page_index
+`, objectID)
+	if err != nil {
+		return nil, fmt.Errorf("list pages: %w", err)
+	}
+	defer rows.Close()
+
+	var pages []Page
+	for rows.Next() {
+		var page Page
+		if err := rows.Scan(&page.ObjectID, &page.Index, &page.ETag, &page.Epoch, &page.Size, &page.Path); err != nil {
+			return nil, fmt.Errorf("scan page: %w", err)
+		}
+		pages = append(pages, page)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list pages: %w", err)
+	}
 	return pages, nil
 }
 

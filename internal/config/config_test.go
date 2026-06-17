@@ -78,6 +78,58 @@ upstream:
 	if cfg.Peer.ForwardTimeout != 10*time.Minute {
 		t.Fatalf("Peer.ForwardTimeout = %s, want 10m", cfg.Peer.ForwardTimeout)
 	}
+	if cfg.Peer.ReadSharding != "auto" {
+		t.Fatalf("Peer.ReadSharding = %q, want auto", cfg.Peer.ReadSharding)
+	}
+	if cfg.Peer.PageShardingMinPages != 2 {
+		t.Fatalf("Peer.PageShardingMinPages = %d, want 2", cfg.Peer.PageShardingMinPages)
+	}
+	if cfg.Peer.MaxFillConcurrency != 32 {
+		t.Fatalf("Peer.MaxFillConcurrency = %d, want 32", cfg.Peer.MaxFillConcurrency)
+	}
+	if cfg.Peer.MaxObjectFillConcurrency != 4 {
+		t.Fatalf("Peer.MaxObjectFillConcurrency = %d, want 4", cfg.Peer.MaxObjectFillConcurrency)
+	}
+	if !cfg.Logging.AccessLog {
+		t.Fatal("Logging.AccessLog = false, want true")
+	}
+	if cfg.Logging.InternalPeerAccessLog {
+		t.Fatal("Logging.InternalPeerAccessLog = true, want false")
+	}
+	if cfg.Logging.InternalPeerSuccessLog {
+		t.Fatal("Logging.InternalPeerSuccessLog = true, want false")
+	}
+	if cfg.Operator.Enabled {
+		t.Fatal("Operator.Enabled = true, want false")
+	}
+	if cfg.Operator.Path != "/debug/peer" {
+		t.Fatalf("Operator.Path = %q, want /debug/peer", cfg.Operator.Path)
+	}
+}
+
+func TestLoadSingleModeDoesNotRequirePeerConfig(t *testing.T) {
+	path := writeConfig(t, `
+upstream:
+  endpoint: http://rustfs:9000
+  access_key: test-access
+  secret_key: test-secret
+peer:
+  mode: single
+`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Peer.Mode != "single" {
+		t.Fatalf("Peer.Mode = %q, want single", cfg.Peer.Mode)
+	}
+	if cfg.Peer.LocalID != "" {
+		t.Fatalf("Peer.LocalID = %q, want empty", cfg.Peer.LocalID)
+	}
+	if len(cfg.Peer.Peers) != 0 {
+		t.Fatalf("len(Peer.Peers) = %d, want 0", len(cfg.Peer.Peers))
+	}
 }
 
 func TestLoadParsesConfiguredValues(t *testing.T) {
@@ -111,12 +163,25 @@ upload:
 peer:
   mode: peer
   local_id: cache-0
+  auth_secret: configured-peer-secret
+  read_sharding: page
+  page_sharding_min_pages: 4
+  max_peer_fill_concurrency: 16
+  max_peer_object_fill_concurrency: 3
   forward_timeout: 2m
   peers:
     - id: cache-0
       url: http://cache-0.cache-peers:8080
     - id: cache-1
       url: http://cache-1.cache-peers:8080
+logging:
+  access_log: false
+  internal_peer_access_log: true
+  internal_peer_success_log: true
+operator:
+  enabled: true
+  path: /debug/cache-peer
+  bearer_token: configured-token
 `)
 
 	cfg, err := Load(path)
@@ -196,46 +261,44 @@ peer:
 	if cfg.Peer.LocalID != "cache-0" {
 		t.Fatalf("Peer.LocalID = %q", cfg.Peer.LocalID)
 	}
+	if cfg.Peer.AuthSecret != "configured-peer-secret" {
+		t.Fatalf("Peer.AuthSecret = %q", cfg.Peer.AuthSecret)
+	}
 	if cfg.Peer.ForwardTimeout != 2*time.Minute {
 		t.Fatalf("Peer.ForwardTimeout = %s", cfg.Peer.ForwardTimeout)
+	}
+	if cfg.Peer.ReadSharding != "page" {
+		t.Fatalf("Peer.ReadSharding = %q, want page", cfg.Peer.ReadSharding)
+	}
+	if cfg.Peer.PageShardingMinPages != 4 {
+		t.Fatalf("Peer.PageShardingMinPages = %d, want 4", cfg.Peer.PageShardingMinPages)
+	}
+	if cfg.Peer.MaxFillConcurrency != 16 {
+		t.Fatalf("Peer.MaxFillConcurrency = %d, want 16", cfg.Peer.MaxFillConcurrency)
+	}
+	if cfg.Peer.MaxObjectFillConcurrency != 3 {
+		t.Fatalf("Peer.MaxObjectFillConcurrency = %d, want 3", cfg.Peer.MaxObjectFillConcurrency)
 	}
 	if len(cfg.Peer.Peers) != 2 {
 		t.Fatalf("len(Peer.Peers) = %d, want 2", len(cfg.Peer.Peers))
 	}
-}
-
-func TestLoadGatewayRequiresOnlyHTTPAndPeerConfig(t *testing.T) {
-	path := writeConfig(t, `
-listen: "127.0.0.1:8082"
-http:
-  read_header_timeout: 2s
-peer:
-  mode: peer
-  peers:
-    - id: cache-1
-      url: http://cache-1.cache-peers:8080
-    - id: cache-0
-      url: http://cache-0.cache-peers:8080
-`)
-
-	cfg, err := LoadGateway(path)
-	if err != nil {
-		t.Fatalf("LoadGateway() error = %v", err)
+	if cfg.Logging.AccessLog {
+		t.Fatal("Logging.AccessLog = true, want false")
 	}
-	if cfg.Listen != "127.0.0.1:8082" {
-		t.Fatalf("Listen = %q, want configured gateway listen", cfg.Listen)
+	if !cfg.Logging.InternalPeerAccessLog {
+		t.Fatal("Logging.InternalPeerAccessLog = false, want true")
 	}
-	if cfg.HTTP.ReadHeaderTimeout != 2*time.Second {
-		t.Fatalf("HTTP.ReadHeaderTimeout = %s, want 2s", cfg.HTTP.ReadHeaderTimeout)
+	if !cfg.Logging.InternalPeerSuccessLog {
+		t.Fatal("Logging.InternalPeerSuccessLog = false, want true")
 	}
-	if cfg.Peer.Mode != "peer" {
-		t.Fatalf("Peer.Mode = %q, want peer", cfg.Peer.Mode)
+	if !cfg.Operator.Enabled {
+		t.Fatal("Operator.Enabled = false, want true")
 	}
-	if cfg.Peer.LocalID != "" {
-		t.Fatalf("Peer.LocalID = %q, want empty for gateway", cfg.Peer.LocalID)
+	if cfg.Operator.Path != "/debug/cache-peer" {
+		t.Fatalf("Operator.Path = %q", cfg.Operator.Path)
 	}
-	if len(cfg.Peer.Peers) != 2 {
-		t.Fatalf("Peer.Peers len = %d, want 2", len(cfg.Peer.Peers))
+	if cfg.Operator.BearerToken != "configured-token" {
+		t.Fatalf("Operator.BearerToken = %q", cfg.Operator.BearerToken)
 	}
 }
 
@@ -503,6 +566,22 @@ peer:
 			wantError: "peer.peers must include peer.local_id",
 		},
 		{
+			name: "peer mode missing auth secret",
+			config: `
+upstream:
+  endpoint: http://rustfs:9000
+  access_key: test-access
+  secret_key: test-secret
+peer:
+  mode: peer
+  local_id: cache-0
+  peers:
+    - id: cache-0
+      url: http://cache-0:8080
+`,
+			wantError: "peer.auth_secret",
+		},
+		{
 			name: "duplicate peer id",
 			config: `
 upstream:
@@ -535,6 +614,40 @@ peer:
       url: ftp://cache-0:8080
 `,
 			wantError: "must use http or https",
+		},
+		{
+			name: "invalid read sharding",
+			config: `
+upstream:
+  endpoint: http://rustfs:9000
+  access_key: test-access
+  secret_key: test-secret
+peer:
+  mode: peer
+  local_id: cache-0
+  read_sharding: random
+  peers:
+    - id: cache-0
+      url: http://cache-0:8080
+`,
+			wantError: "peer.read_sharding",
+		},
+		{
+			name: "invalid page sharding threshold",
+			config: `
+upstream:
+  endpoint: http://rustfs:9000
+  access_key: test-access
+  secret_key: test-secret
+peer:
+  mode: peer
+  local_id: cache-0
+  page_sharding_min_pages: 0
+  peers:
+    - id: cache-0
+      url: http://cache-0:8080
+`,
+			wantError: "peer.page_sharding_min_pages",
 		},
 	}
 

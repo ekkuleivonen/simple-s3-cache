@@ -1,8 +1,6 @@
 # Supported topologies:
 # - single: one cache pod, no peer routing.
 # - peer: multiple cache peers behind the cache Service.
-# - gateway: same-cluster cache peers plus gateway routing directly to owners.
-# - external-gateway: gateway only, routing to cache peers deployed elsewhere.
 topology: single
 
 replicaCount: 1
@@ -52,16 +50,42 @@ upload:
   maxSpoolSize: 10GiB
 
 peer:
+  authSecret: ""
+  auth:
+    existingSecret: ""
+    key: auth_secret
+  readSharding: auto
+  pageShardingMinPages: 2
+  maxPeerFillConcurrency: 32
+  maxPeerObjectFillConcurrency: 4
   forwardTimeout: 10m
+
+logging:
+  accessLog: true
+  internalPeerAccessLog: false
+  internalPeerSuccessLog: false
+
+operator:
+  enabled: false
+  path: /debug/peer
+  bearerToken: ""
 
 initConfig:
   image:
     repository: busybox
     tag: stable
     pullPolicy: IfNotPresent
+  securityContext:
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+        - ALL
+    readOnlyRootFilesystem: true
+    runAsGroup: 65532
+    runAsNonRoot: true
+    runAsUser: 65532
 
 cacheService:
-  # Defaults to enabled for single and peer topologies, disabled for gateway.
   enabled: null
   type: ClusterIP
   port: 8080
@@ -73,25 +97,14 @@ peerService:
   publishNotReadyAddresses: true
   annotations: {}
 
-gateway:
-  replicaCount: 2
-  # Used by external-gateway topology, and as an optional peer URL override for
-  # gateway topology. IDs must exactly match the cache peers' peer.local_id
-  # values because IDs are part of the rendezvous hash ring.
-  externalPeers: []
-  # - id: simple-s3-cache-0
-  #   url: http://cache-0.storage.example.internal:8080
-  service:
-    type: ClusterIP
-    port: 8080
-    annotations: {}
-    externalTrafficPolicy: ""
-    loadBalancerIP: ""
-  resources: {}
-  podAnnotations: {}
-  nodeSelector: {}
-  tolerations: []
-  affinity: {}
+peerLoadBalancerServices:
+  enabled: false
+  type: LoadBalancer
+  port: 8080
+  annotations: {}
+  externalTrafficPolicy: Local
+  loadBalancerIPs: []
+  loadBalancerSourceRanges: []
 
 persistence:
   enabled: true
@@ -129,22 +142,58 @@ securityContext:
 nodeSelector: {}
 tolerations: []
 affinity: {}
+topologySpreadConstraints: []
+updateStrategy:
+  type: RollingUpdate
 
 podAntiAffinity:
   enabled: false
   required: true
   topologyKey: kubernetes.io/hostname
 
+pdb:
+  enabled: false
+  minAvailable: ""
+  maxUnavailable: 1
+
 serviceMonitor:
   enabled: false
   interval: 30s
   labels: {}
 
+prometheusRule:
+  enabled: false
+  labels: {}
+  rules:
+    - alert: SimpleS3CachePeerDegraded
+      expr: simple_s3_cache_degraded > 0
+      for: 2m
+      labels:
+        severity: critical
+      annotations:
+        summary: simple-s3-cache peer is degraded
+        description: 'Peer {{ $labels.local_id }} is degraded with reason {{ $labels.reason_code }}.'
+    - alert: SimpleS3CacheInvalidationFailures
+      expr: increase(simple_s3_cache_invalidation_broadcasts_total{status="failure"}[5m]) > 0
+      for: 1m
+      labels:
+        severity: critical
+      annotations:
+        summary: simple-s3-cache invalidation broadcast failed
+        description: A cache peer failed to apply an invalidation broadcast.
+    - alert: SimpleS3CachePeerReadFallbacks
+      expr: increase(simple_s3_cache_peer_read_fallbacks_total[10m]) > 0
+      for: 5m
+      labels:
+        severity: warning
+      annotations:
+        summary: simple-s3-cache peer reads are falling back to upstream
+        description: Peer read fallback traffic is present; check peer connectivity and readiness.
+
 networkPolicy:
   enabled: false
   # Restricts client ingress. Empty means namespace-local ingress for single,
-  # peer, and gateway pods. In gateway topology, cache peer ingress is limited to
-  # gateway pods and cache peers from this release.
+  # peer pods.
   ingressFrom: []
   egress:
     allowDNS: true
