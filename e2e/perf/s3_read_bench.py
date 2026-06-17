@@ -445,6 +445,11 @@ def scrape_metrics(url: str | None) -> dict[str, float]:
     except Exception as exc:
         return {"__scrape_error__": 1.0, "__scrape_error_hash__": float(abs(hash(repr(exc))) % 1_000_000)}
 
+    kept_gauges = {
+        "simple_s3_cache_cached_bytes",
+        "simple_s3_cache_cache_max_bytes",
+        "simple_s3_cache_peer_ring_info",
+    }
     metrics: dict[str, float] = {}
     for line in text.splitlines():
         if not line or line.startswith("#"):
@@ -457,14 +462,15 @@ def scrape_metrics(url: str | None) -> dict[str, float]:
             name.endswith("_total")
             or name.endswith("_sum")
             or name.endswith("_count")
-            or name in {"simple_s3_cache_cached_bytes", "simple_s3_cache_cache_max_bytes"}
+            or name in kept_gauges
         ):
             continue
         try:
             value = float(value_text)
         except ValueError:
             continue
-        metrics[name] = metrics.get(name, 0.0) + value
+        key = name_and_labels if name == "simple_s3_cache_peer_ring_info" else name
+        metrics[key] = metrics.get(key, 0.0) + value
     return metrics
 
 
