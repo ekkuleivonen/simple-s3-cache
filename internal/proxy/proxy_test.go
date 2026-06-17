@@ -2598,6 +2598,65 @@ func TestProxyInternalPageReadFillsMissingPage(t *testing.T) {
 	}
 }
 
+func TestProxyInternalPageReadEstablishesMissingMetadataForNonZeroEpoch(t *testing.T) {
+	ctx := context.Background()
+	body := []byte("abcdefghijkl")
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("If-Match"); got != `"etag-epoch"` {
+			t.Fatalf("If-Match = %q, want request ETag", got)
+		}
+		if got := r.Header.Get("Range"); got != "bytes=8-11" {
+			t.Fatalf("Range = %q, want page-aligned range", got)
+		}
+		w.Header().Set("Content-Length", "4")
+		w.Header().Set("Content-Range", "bytes 8-11/12")
+		w.Header().Set("ETag", `"etag-epoch"`)
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(body[8:12])
+	}))
+	defer upstream.Close()
+
+	p := testProxyWithPageSize(t, upstream.URL, 4)
+	router := enablePeerMode(t, p, "cache-0", []peerrouter.Peer{
+		{ID: "cache-0", URL: "http://cache-0.invalid"},
+		{ID: "cache-1", URL: "http://cache-1.invalid"},
+	})
+
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, internalPageReadHTTPRequest(t, router, internalPageReadRequest{
+		Bucket:     "bucket",
+		Key:        "remote-first-contact.bin",
+		ObjectSize: 12,
+		PageSize:   4,
+		ETag:       `"etag-epoch"`,
+		Epoch:      7,
+		Pages:      []int64{2},
+	}))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%q", rec.Code, rec.Body.String())
+	}
+	assertPageFrames(t, rec.Body, []int64{2}, [][]byte{body[8:12]}, 4)
+	obj, ok, err := p.cache.GetObject(ctx, "bucket", "remote-first-contact.bin")
+	if err != nil {
+		t.Fatalf("GetObject() error = %v", err)
+	}
+	if !ok {
+		t.Fatal("GetObject() ok = false, want metadata established")
+	}
+	if obj.Epoch != 7 || obj.ETag != `"etag-epoch"` || obj.Size != 12 || obj.PageSize != 4 {
+		t.Fatalf("object metadata = %#v, want coordinator identity", obj)
+	}
+	page, ok, err := p.cache.OpenPage(ctx, obj.ID, 2, obj.ETag, obj.Epoch)
+	if err != nil {
+		t.Fatalf("OpenPage() error = %v", err)
+	}
+	if !ok {
+		t.Fatal("OpenPage() ok = false, want filled page")
+	}
+	_ = page.Close()
+}
+
 func TestProxyInternalPageReadServesBytesWhenCacheWriteFails(t *testing.T) {
 	body := []byte("abcdefghijkl")
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

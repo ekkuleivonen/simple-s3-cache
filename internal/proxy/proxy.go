@@ -676,14 +676,29 @@ func (p *Proxy) internalPageReadObject(ctx context.Context, req internalPageRead
 		return cache.Object{}, http.StatusInternalServerError, err
 	}
 	if ok {
-		if obj.Epoch != req.Epoch {
+		if obj.Epoch > req.Epoch {
 			return cache.Object{}, http.StatusConflict, fmt.Errorf("object epoch mismatch: local %d request %d", obj.Epoch, req.Epoch)
 		}
-		if obj.ETag == req.ETag && obj.Size == req.ObjectSize && obj.PageSize == req.PageSize {
+		if obj.Epoch == req.Epoch && obj.ETag == req.ETag && obj.Size == req.ObjectSize && obj.PageSize == req.PageSize {
 			return obj, http.StatusOK, nil
 		}
-	} else if req.Epoch != 0 {
-		return cache.Object{}, http.StatusConflict, fmt.Errorf("object metadata missing for epoch %d", req.Epoch)
+		if obj.Epoch < req.Epoch {
+			epoch, err := p.cache.InvalidateObject(ctx, req.Bucket, req.Key, req.Epoch)
+			if err != nil {
+				return cache.Object{}, http.StatusInternalServerError, err
+			}
+			if epoch != req.Epoch {
+				return cache.Object{}, http.StatusConflict, fmt.Errorf("object epoch mismatch: local %d request %d", epoch, req.Epoch)
+			}
+		}
+	} else if req.Epoch > 0 {
+		epoch, err := p.cache.InvalidateObject(ctx, req.Bucket, req.Key, req.Epoch)
+		if err != nil {
+			return cache.Object{}, http.StatusInternalServerError, err
+		}
+		if epoch != req.Epoch {
+			return cache.Object{}, http.StatusConflict, fmt.Errorf("object epoch mismatch: local %d request %d", epoch, req.Epoch)
+		}
 	}
 
 	obj, err = p.cache.PutObject(ctx, cache.ObjectMetadata{
