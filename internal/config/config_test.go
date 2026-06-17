@@ -204,6 +204,41 @@ peer:
 	}
 }
 
+func TestLoadGatewayRequiresOnlyHTTPAndPeerConfig(t *testing.T) {
+	path := writeConfig(t, `
+listen: "127.0.0.1:8082"
+http:
+  read_header_timeout: 2s
+peer:
+  mode: peer
+  peers:
+    - id: cache-1
+      url: http://cache-1.cache-peers:8080
+    - id: cache-0
+      url: http://cache-0.cache-peers:8080
+`)
+
+	cfg, err := LoadGateway(path)
+	if err != nil {
+		t.Fatalf("LoadGateway() error = %v", err)
+	}
+	if cfg.Listen != "127.0.0.1:8082" {
+		t.Fatalf("Listen = %q, want configured gateway listen", cfg.Listen)
+	}
+	if cfg.HTTP.ReadHeaderTimeout != 2*time.Second {
+		t.Fatalf("HTTP.ReadHeaderTimeout = %s, want 2s", cfg.HTTP.ReadHeaderTimeout)
+	}
+	if cfg.Peer.Mode != "peer" {
+		t.Fatalf("Peer.Mode = %q, want peer", cfg.Peer.Mode)
+	}
+	if cfg.Peer.LocalID != "" {
+		t.Fatalf("Peer.LocalID = %q, want empty for gateway", cfg.Peer.LocalID)
+	}
+	if len(cfg.Peer.Peers) != 2 {
+		t.Fatalf("Peer.Peers len = %d, want 2", len(cfg.Peer.Peers))
+	}
+}
+
 func TestLoadParsesBucketCacheOverrides(t *testing.T) {
 	path := writeConfig(t, `
 upstream:

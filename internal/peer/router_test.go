@@ -67,6 +67,31 @@ func TestRouterDistributesObjectsAcrossPeers(t *testing.T) {
 	}
 }
 
+func TestOwnerRouterDoesNotRequireLocalPeer(t *testing.T) {
+	router, err := NewOwnerRouter([]Peer{
+		{ID: "cache-1", URL: "http://cache-1"},
+		{ID: "cache-0", URL: "http://cache-0"},
+	})
+	if err != nil {
+		t.Fatalf("NewOwnerRouter() error = %v", err)
+	}
+
+	if got := router.LocalID(); got != "" {
+		t.Fatalf("LocalID() = %q, want empty", got)
+	}
+	if got := router.Owner("bucket", "key"); got.ID == "" {
+		t.Fatalf("Owner() = %+v, want selected peer", got)
+	}
+	peers := router.Peers()
+	if len(peers) != 2 || peers[0].ID != "cache-0" || peers[1].ID != "cache-1" {
+		t.Fatalf("Peers() = %+v, want sorted copy", peers)
+	}
+	peers[0].ID = "mutated"
+	if got := router.Peers()[0].ID; got != "cache-0" {
+		t.Fatalf("Peers() exposed internal slice, got first ID %q", got)
+	}
+}
+
 func TestRouterRejectsInvalidConfig(t *testing.T) {
 	tests := []struct {
 		name    string

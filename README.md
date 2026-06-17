@@ -244,6 +244,53 @@ If the owner peer is unavailable, remote-owner object requests fail closed
 instead of being served by the wrong local cache. Restarting the owner with an
 empty cache is safe because upstream storage remains the source of truth.
 
+### Owner-Aware Gateway
+
+Peer mode can run directly behind a LoadBalancer, but non-owner requests are
+relayed through the ingress peer before reaching the owner. For high-throughput
+deployments, the same image also includes an optional stateless gateway:
+
+```text
+Client / service
+  ↓
+simple-s3-cache-gateway
+  ↓ direct owner route
+simple-s3-cache peer that owns /bucket/key
+  ↓
+S3-compatible storage
+```
+
+Run it with:
+
+```bash
+simple-s3-cache-gateway -config /etc/simple-s3-cache/gateway.yaml
+```
+
+The gateway uses the same `peer.peers` list and the same rendezvous hash logic as
+peer mode. It does not need `upstream`, `cache`, `upload`, or `peer.local_id`
+configuration. See `simple-s3-cache-gateway.example.yaml`.
+
+Deploy the gateway near the clients or compute services that generate S3
+traffic, not as a sidecar on the cache pods. Cache peers should remain a
+StatefulSet with stable IDs and a headless Service; the gateway should be a
+stateless Deployment that forwards to those stable peer DNS names.
+
+Object-scoped operations are routed by destination `bucket/key`, including
+reads, writes, deletes, COPY destinations, and multipart completion or abort.
+Bucket-level requests and requests without a single object owner go to a
+deterministic default peer and pass through from there. `DeleteObjects`
+(`POST /bucket?delete`) is rejected by the gateway because one request can name
+many independently-owned keys; send individual `DELETE Object` requests through
+the gateway or send multi-object deletes directly to a cache peer/upstream path
+that matches your invalidation policy.
+
+The gateway preserves the original `Host` and AWS signing headers when
+forwarding to a peer, while dialing the peer URL from the configured ring. For
+object-scoped routes it stamps the same internal peer coordination headers used
+by peer forwarding, so a peer-list mismatch fails closed before local cache state
+is touched. Client-supplied peer coordination headers are stripped at the gateway
+boundary.
+
 If the cache instance fails, it can be restarted with an empty cache. No object
 data is lost because upstream S3-compatible storage remains the source of truth.
 

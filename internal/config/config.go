@@ -112,6 +112,31 @@ type Peer struct {
 
 // Load reads a YAML config file, applies defaults, and validates required fields.
 func Load(path string) (Config, error) {
+	cfg, err := readConfig(path)
+	if err != nil {
+		return Config{}, err
+	}
+	if err := cfg.Validate(); err != nil {
+		return Config{}, err
+	}
+
+	return cfg, nil
+}
+
+// LoadGateway reads a YAML config file for the owner-aware gateway.
+func LoadGateway(path string) (Config, error) {
+	cfg, err := readConfig(path)
+	if err != nil {
+		return Config{}, err
+	}
+	if err := cfg.ValidateGateway(); err != nil {
+		return Config{}, err
+	}
+
+	return cfg, nil
+}
+
+func readConfig(path string) (Config, error) {
 	cfg := Default()
 
 	data, err := os.ReadFile(path)
@@ -127,9 +152,6 @@ func Load(path string) (Config, error) {
 		return Config{}, err
 	}
 	if err := cfg.applyParsedDurations(); err != nil {
-		return Config{}, err
-	}
-	if err := cfg.Validate(); err != nil {
 		return Config{}, err
 	}
 
@@ -341,23 +363,49 @@ func (cfg Config) Validate() error {
 	if cfg.Upload.MaxSpoolSize <= 0 {
 		errs = append(errs, errors.New("upload.max_spool_size must be greater than zero"))
 	}
-	errs = append(errs, cfg.validatePeer()...)
+	errs = append(errs, cfg.validatePeer(true)...)
 
 	return errors.Join(errs...)
 }
 
-func (cfg Config) validatePeer() []error {
+func (cfg Config) ValidateGateway() error {
+	var errs []error
+
+	if strings.TrimSpace(cfg.Listen) == "" {
+		errs = append(errs, errors.New("listen is required"))
+	} else if _, _, err := net.SplitHostPort(cfg.Listen); err != nil {
+		errs = append(errs, fmt.Errorf("listen must be host:port or :port: %w", err))
+	}
+	if cfg.HTTP.ReadHeaderTimeout <= 0 {
+		errs = append(errs, errors.New("http.read_header_timeout must be greater than zero"))
+	}
+	if cfg.HTTP.ReadTimeout <= 0 {
+		errs = append(errs, errors.New("http.read_timeout must be greater than zero"))
+	}
+	if cfg.HTTP.WriteTimeout <= 0 {
+		errs = append(errs, errors.New("http.write_timeout must be greater than zero"))
+	}
+	if cfg.HTTP.IdleTimeout <= 0 {
+		errs = append(errs, errors.New("http.idle_timeout must be greater than zero"))
+	}
+	errs = append(errs, cfg.validatePeer(false)...)
+
+	return errors.Join(errs...)
+}
+
+func (cfg Config) validatePeer(requireLocal bool) []error {
 	var errs []error
 	mode := strings.TrimSpace(cfg.Peer.Mode)
 	switch mode {
-	case "", "single":
-		return nil
 	case "peer":
 	default:
-		return []error{fmt.Errorf("peer.mode must be single or peer")}
+		if requireLocal && (mode == "" || mode == "single") {
+			return nil
+		}
+		return []error{fmt.Errorf("peer.mode must be peer")}
 	}
 
-	if strings.TrimSpace(cfg.Peer.LocalID) == "" {
+	if requireLocal && strings.TrimSpace(cfg.Peer.LocalID) == "" {
 		errs = append(errs, errors.New("peer.local_id is required in peer mode"))
 	}
 	if cfg.Peer.ForwardTimeout <= 0 {
@@ -378,7 +426,7 @@ func (cfg Config) validatePeer() []error {
 				errs = append(errs, fmt.Errorf("peer.peers id %q is duplicated", id))
 			}
 			seen[id] = struct{}{}
-			if id == cfg.Peer.LocalID {
+			if requireLocal && id == cfg.Peer.LocalID {
 				hasLocal = true
 			}
 		}
@@ -396,7 +444,7 @@ func (cfg Config) validatePeer() []error {
 			errs = append(errs, fmt.Errorf("peer.peers[%d].url must include a host", i))
 		}
 	}
-	if len(cfg.Peer.Peers) > 0 && !hasLocal {
+	if requireLocal && len(cfg.Peer.Peers) > 0 && !hasLocal {
 		errs = append(errs, errors.New("peer.peers must include peer.local_id"))
 	}
 	return errs

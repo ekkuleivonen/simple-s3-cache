@@ -31,9 +31,9 @@ import (
 const unsignedPayload = "UNSIGNED-PAYLOAD"
 
 const (
-	peerForwardedHeader = "X-Simple-S3-Cache-Peer-Forwarded"
-	peerOwnerHeader     = "X-Simple-S3-Cache-Peer-Owner"
-	peerFromHeader      = "X-Simple-S3-Cache-Peer-From"
+	peerForwardedHeader = peerrouter.ForwardedHeader
+	peerOwnerHeader     = peerrouter.OwnerHeader
+	peerFromHeader      = peerrouter.FromHeader
 )
 
 const (

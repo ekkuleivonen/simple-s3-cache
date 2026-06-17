@@ -22,6 +22,9 @@ func TestRecorderRendersGlobalAndBucketMetrics(t *testing.T) {
 	recorder.RecordPeerForward("photos", "cache-1", http.MethodGet, "2xx")
 	recorder.RecordPeerForwardFailure("photos", "cache-1", "request_failed")
 	recorder.RecordPeerForwardResponseBytes("photos", "cache-1", 13)
+	recorder.RecordGatewayRequest("photos", "owner", "cache-1", http.MethodGet, "2xx")
+	recorder.RecordGatewayForwardFailure("photos", "cache-1", "request_failed")
+	recorder.RecordGatewayResponseBytes("photos", "cache-1", 21)
 	recorder.RecordBytesServedFromCache("photos", 3)
 	recorder.RecordBytesServedFromUpstream("photos", 5)
 	recorder.RecordUpstreamFillBytes("photos", 8)
@@ -38,6 +41,11 @@ func TestRecorderRendersGlobalAndBucketMetrics(t *testing.T) {
 	recorder.ObservePeerResponseCopyDuration("photos", "cache-1", "2xx", 3*time.Millisecond)
 	recorder.ObservePeerResponseBodyReadDuration("photos", "cache-1", "2xx", time.Millisecond)
 	recorder.ObservePeerDownstreamWriteDuration("photos", "cache-1", "2xx", 2*time.Millisecond)
+	recorder.ObserveGatewayForwardDuration("photos", "owner", "cache-1", "2xx", time.Millisecond)
+	recorder.ObserveGatewayResponseHeaderDuration("photos", "owner", "cache-1", "2xx", 2*time.Millisecond)
+	recorder.ObserveGatewayResponseCopyDuration("photos", "owner", "cache-1", "2xx", 3*time.Millisecond)
+	recorder.ObserveGatewayResponseBodyReadDuration("photos", "owner", "cache-1", "2xx", time.Millisecond)
+	recorder.ObserveGatewayDownstreamWriteDuration("photos", "owner", "cache-1", "2xx", 2*time.Millisecond)
 	recorder.SetCachedBytes(64, map[string]int64{"photos": 64})
 
 	body := renderMetrics(t, recorder)
@@ -54,6 +62,9 @@ func TestRecorderRendersGlobalAndBucketMetrics(t *testing.T) {
 		`simple_s3_cache_peer_forwarded_requests_total{bucket="photos",peer_id="cache-1",method="GET",status_class="2xx"} 1`,
 		`simple_s3_cache_peer_forward_failures_total{bucket="photos",peer_id="cache-1",reason="request_failed"} 1`,
 		`simple_s3_cache_peer_forward_response_bytes_total{bucket="photos",peer_id="cache-1"} 13`,
+		`simple_s3_cache_gateway_requests_total{bucket="photos",route="owner",peer_id="cache-1",method="GET",status_class="2xx"} 1`,
+		`simple_s3_cache_gateway_forward_failures_total{bucket="photos",peer_id="cache-1",reason="request_failed"} 1`,
+		`simple_s3_cache_gateway_response_bytes_total{bucket="photos",peer_id="cache-1"} 21`,
 		`simple_s3_cache_bytes_served_from_cache_total{bucket="photos"} 3`,
 		`simple_s3_cache_bytes_served_from_upstream_total{bucket="photos"} 5`,
 		`simple_s3_cache_upstream_fill_bytes_total{bucket="photos"} 8`,
@@ -71,6 +82,11 @@ func TestRecorderRendersGlobalAndBucketMetrics(t *testing.T) {
 		`simple_s3_cache_peer_response_copy_duration_seconds_count{bucket="photos",peer_id="cache-1",status_class="2xx"} 1`,
 		`simple_s3_cache_peer_response_body_read_duration_seconds_count{bucket="photos",peer_id="cache-1",status_class="2xx"} 1`,
 		`simple_s3_cache_peer_downstream_write_duration_seconds_count{bucket="photos",peer_id="cache-1",status_class="2xx"} 1`,
+		`simple_s3_cache_gateway_forward_duration_seconds_count{bucket="photos",route="owner",peer_id="cache-1",status_class="2xx"} 1`,
+		`simple_s3_cache_gateway_response_header_duration_seconds_count{bucket="photos",route="owner",peer_id="cache-1",status_class="2xx"} 1`,
+		`simple_s3_cache_gateway_response_copy_duration_seconds_count{bucket="photos",route="owner",peer_id="cache-1",status_class="2xx"} 1`,
+		`simple_s3_cache_gateway_response_body_read_duration_seconds_count{bucket="photos",route="owner",peer_id="cache-1",status_class="2xx"} 1`,
+		`simple_s3_cache_gateway_downstream_write_duration_seconds_count{bucket="photos",route="owner",peer_id="cache-1",status_class="2xx"} 1`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("metrics body missing %q:\n%s", want, body)

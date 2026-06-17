@@ -9,6 +9,12 @@ import (
 	"strings"
 )
 
+const (
+	ForwardedHeader = "X-Simple-S3-Cache-Peer-Forwarded"
+	OwnerHeader     = "X-Simple-S3-Cache-Peer-Owner"
+	FromHeader      = "X-Simple-S3-Cache-Peer-From"
+)
+
 type Peer struct {
 	ID  string
 	URL string
@@ -21,8 +27,16 @@ type Router struct {
 }
 
 func NewRouter(localID string, peers []Peer) (*Router, error) {
+	return newRouter(localID, peers, true)
+}
+
+func NewOwnerRouter(peers []Peer) (*Router, error) {
+	return newRouter("", peers, false)
+}
+
+func newRouter(localID string, peers []Peer, requireLocal bool) (*Router, error) {
 	localID = strings.TrimSpace(localID)
-	if localID == "" {
+	if requireLocal && localID == "" {
 		return nil, errors.New("local peer id is required")
 	}
 	if len(peers) == 0 {
@@ -49,8 +63,14 @@ func NewRouter(localID string, peers []Peer) (*Router, error) {
 	sort.Slice(copied, func(i, j int) bool {
 		return copied[i].ID < copied[j].ID
 	})
-	if _, ok := byID[localID]; !ok {
-		return nil, fmt.Errorf("local peer id %q is not in peer list", localID)
+	if requireLocal {
+		if _, ok := byID[localID]; !ok {
+			return nil, fmt.Errorf("local peer id %q is not in peer list", localID)
+		}
+	} else if localID != "" {
+		if _, ok := byID[localID]; !ok {
+			return nil, fmt.Errorf("local peer id %q is not in peer list", localID)
+		}
 	}
 
 	return &Router{
@@ -62,6 +82,12 @@ func NewRouter(localID string, peers []Peer) (*Router, error) {
 
 func (r *Router) LocalID() string {
 	return r.localID
+}
+
+func (r *Router) Peers() []Peer {
+	peers := make([]Peer, len(r.peers))
+	copy(peers, r.peers)
+	return peers
 }
 
 func (r *Router) Owner(bucket, key string) Peer {
@@ -79,7 +105,7 @@ func (r *Router) Owner(bucket, key string) Peer {
 }
 
 func (r *Router) IsLocalOwner(bucket, key string) bool {
-	return r.Owner(bucket, key).ID == r.localID
+	return r.localID != "" && r.Owner(bucket, key).ID == r.localID
 }
 
 func (r *Router) PeerByID(id string) (Peer, bool) {
