@@ -142,6 +142,8 @@ spec:
               {{ else }}
                 mode: peer
                 local_id: ${HOSTNAME}
+                read_sharding: {{ .Values.peer.readSharding }}
+                page_sharding_min_pages: {{ .Values.peer.pageShardingMinPages }}
                 forward_timeout: {{ .Values.peer.forwardTimeout }}
                 peers:
               {{ $replicas := int (include "simple-s3-cache.cacheReplicas" .) }}

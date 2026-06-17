@@ -19,6 +19,7 @@ func TestRecorderRendersGlobalAndBucketMetrics(t *testing.T) {
 	recorder.RecordEviction("photos")
 	recorder.RecordUpstreamFailure("photos", "fill")
 	recorder.RecordPeerDecision("photos", "remote", "cache-1")
+	recorder.RecordReadStrategy("photos", "page")
 	recorder.RecordPeerForward("photos", "cache-1", http.MethodGet, "2xx")
 	recorder.RecordPeerForwardFailure("photos", "cache-1", "request_failed")
 	recorder.RecordPeerForwardResponseBytes("photos", "cache-1", 13)
@@ -60,6 +61,7 @@ func TestRecorderRendersGlobalAndBucketMetrics(t *testing.T) {
 		`simple_s3_cache_evictions_total{bucket="photos"} 1`,
 		`simple_s3_cache_upstream_request_failures_total{bucket="photos",operation="fill"} 1`,
 		`simple_s3_cache_peer_owner_decisions_total{bucket="photos",decision="remote",owner_id="cache-1"} 1`,
+		`simple_s3_cache_read_strategy_selected_total{bucket="photos",strategy="page"} 1`,
 		`simple_s3_cache_peer_forwarded_requests_total{bucket="photos",peer_id="cache-1",method="GET",status_class="2xx"} 1`,
 		`simple_s3_cache_peer_forward_failures_total{bucket="photos",peer_id="cache-1",reason="request_failed"} 1`,
 		`simple_s3_cache_peer_forward_response_bytes_total{bucket="photos",peer_id="cache-1"} 13`,

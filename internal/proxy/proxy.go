@@ -31,6 +31,12 @@ import (
 const unsignedPayload = "UNSIGNED-PAYLOAD"
 
 const (
+	readShardingObject = "object"
+	readShardingPage   = "page"
+	readShardingAuto   = "auto"
+)
+
+const (
 	peerForwardedHeader = peerrouter.ForwardedHeader
 	peerOwnerHeader     = peerrouter.OwnerHeader
 	peerFromHeader      = peerrouter.FromHeader
@@ -87,8 +93,17 @@ type Proxy struct {
 	peerRouter       *peerrouter.Router
 	peerClient       *http.Client
 	peerTimeout      time.Duration
+	readSharding     string
+	pageShardMin     int64
 	pageFillMu       sync.Mutex
 	pageFills        map[pageFillKey]*pageFillCall
+}
+
+type readStrategySelection struct {
+	configuredStrategy string
+	strategy           string
+	effectivePageSize  int64
+	pageCount          int64
 }
 
 type pageFillKey struct {
@@ -137,6 +152,10 @@ type requestStats struct {
 	peerDownstreamWriteDuration  time.Duration
 	peerResponseBodyReadChunks   int64
 	peerResponseBytes            int64
+	configuredReadSharding       string
+	readStrategy                 string
+	effectivePageSize            int64
+	objectPageCount              int64
 }
 
 func New(ctx context.Context, cfg appconfig.Config, logger *slog.Logger) (*Proxy, error) {
@@ -196,10 +215,12 @@ func New(ctx context.Context, cfg appconfig.Config, logger *slog.Logger) (*Proxy
 			spoolPath:    cfg.Upload.SpoolPath,
 			maxSpoolSize: cfg.Upload.MaxSpoolSize,
 		},
-		metrics:     recorder,
-		peerRouter:  router,
-		peerClient:  newPeerHTTPClient(cfg.Peer.ForwardTimeout),
-		peerTimeout: cfg.Peer.ForwardTimeout,
+		metrics:      recorder,
+		peerRouter:   router,
+		peerClient:   newPeerHTTPClient(cfg.Peer.ForwardTimeout),
+		peerTimeout:  cfg.Peer.ForwardTimeout,
+		readSharding: strings.TrimSpace(cfg.Peer.ReadSharding),
+		pageShardMin: cfg.Peer.PageShardingMinPages,
 	}, nil
 }
 
@@ -332,6 +353,14 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		slog.Int64("cache_response_bytes", stats.cacheResponseBytes),
 		slog.Int64("request_duration_ms", time.Since(start).Milliseconds()),
 		slog.Int64("upstream_bytes", stats.bytesFetchedUpstream),
+	}
+	if stats.readStrategy != "" {
+		attrs = append(attrs,
+			slog.String("read_strategy", stats.readStrategy),
+			slog.String("configured_read_sharding", stats.configuredReadSharding),
+			slog.Int64("effective_page_size", stats.effectivePageSize),
+			slog.Int64("object_page_count", stats.objectPageCount),
+		)
 	}
 	if stats.peerMode != "" {
 		attrs = append(attrs,
@@ -931,6 +960,13 @@ func (s *requestStats) finishCachedResult() {
 	}
 }
 
+func (s *requestStats) setReadStrategy(selection readStrategySelection) {
+	s.configuredReadSharding = selection.configuredStrategy
+	s.readStrategy = selection.strategy
+	s.effectivePageSize = selection.effectivePageSize
+	s.objectPageCount = selection.pageCount
+}
+
 func (p *Proxy) recordMetrics(stats *requestStats) {
 	if p.metrics == nil {
 		return
@@ -949,6 +985,9 @@ func (p *Proxy) recordMetrics(stats *requestStats) {
 	if stats.bytesRequested > 0 {
 		p.metrics.ObserveRequestedBytes(stats.bucket, stats.bytesRequested)
 		p.metrics.ObserveReadAmplification(stats.bucket, stats.readAmplification())
+	}
+	if stats.readStrategy != "" {
+		p.metrics.RecordReadStrategy(stats.bucket, stats.readStrategy)
 	}
 	if stats.pagesRequested > 0 {
 		p.metrics.ObservePagesTouched(stats.bucket, stats.pagesRequested)
@@ -1075,6 +1114,9 @@ func (p *Proxy) serveCachedRange(w http.ResponseWriter, r *http.Request, target 
 		stats.cacheResult = "fallback"
 		return p.forward(w, r, stats)
 	}
+	if p.peerRouter != nil {
+		stats.setReadStrategy(p.selectReadStrategy(target.Bucket, obj.Size))
+	}
 	if status, ok, err := cachedConditionalStatus(r, obj); err != nil {
 		stats.cacheResult = "fallback"
 		return p.forward(w, r, stats)
@@ -1136,6 +1178,9 @@ func (p *Proxy) serveCachedFullObject(w http.ResponseWriter, r *http.Request, ta
 	if !ok {
 		stats.cacheResult = "fallback"
 		return p.forward(w, r, stats)
+	}
+	if p.peerRouter != nil {
+		stats.setReadStrategy(p.selectReadStrategy(target.Bucket, obj.Size))
 	}
 	if status, ok, err := cachedConditionalStatus(r, obj); err != nil {
 		stats.cacheResult = "fallback"
@@ -1442,6 +1487,40 @@ func (p *Proxy) pageSizeForBucket(bucket string) int64 {
 		}
 	}
 	return p.pageSize
+}
+
+func (p *Proxy) selectReadStrategy(bucket string, objectSize int64) readStrategySelection {
+	configured := p.readSharding
+	if configured == "" {
+		configured = readShardingAuto
+	}
+	pageSize := p.pageSizeForBucket(bucket)
+	pageCount := pageCountForObject(objectSize, pageSize)
+	strategy := configured
+	if strategy == readShardingAuto {
+		minPages := p.pageShardMin
+		if minPages <= 0 {
+			minPages = 2
+		}
+		if pageCount >= minPages {
+			strategy = readShardingPage
+		} else {
+			strategy = readShardingObject
+		}
+	}
+	return readStrategySelection{
+		configuredStrategy: configured,
+		strategy:           strategy,
+		effectivePageSize:  pageSize,
+		pageCount:          pageCount,
+	}
+}
+
+func pageCountForObject(objectSize, pageSize int64) int64 {
+	if objectSize <= 0 || pageSize <= 0 {
+		return 0
+	}
+	return (objectSize + pageSize - 1) / pageSize
 }
 
 func (p *Proxy) prepareFirstPage(r *http.Request, target s3request.Target, obj cache.Object, byteRange cacheplan.ByteRange, stats *requestStats) ([]cacheplan.PageSpan, io.ReadCloser, error) {

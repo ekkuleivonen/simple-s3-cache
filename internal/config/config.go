@@ -32,6 +32,8 @@ const (
 	defaultMaxSpoolSize                  = int64(10 << 30) // 10 GiB
 	defaultPeerMode                      = "single"
 	defaultPeerForwardTimeout            = 10 * time.Minute
+	defaultPeerReadSharding              = "auto"
+	defaultPeerPageShardingMinPages      = 2
 )
 
 // Config is the process configuration loaded from YAML.
@@ -98,11 +100,13 @@ type UploadConfig struct {
 }
 
 type PeerConfig struct {
-	Mode               string        `yaml:"mode"`
-	LocalID            string        `yaml:"local_id"`
-	Peers              []Peer        `yaml:"peers"`
-	ForwardTimeout     time.Duration `yaml:"-"`
-	ForwardTimeoutText string        `yaml:"forward_timeout"`
+	Mode                 string        `yaml:"mode"`
+	LocalID              string        `yaml:"local_id"`
+	Peers                []Peer        `yaml:"peers"`
+	ReadSharding         string        `yaml:"read_sharding"`
+	PageShardingMinPages int64         `yaml:"page_sharding_min_pages"`
+	ForwardTimeout       time.Duration `yaml:"-"`
+	ForwardTimeoutText   string        `yaml:"forward_timeout"`
 }
 
 type Peer struct {
@@ -185,8 +189,10 @@ func Default() Config {
 			MaxSpoolSize: defaultMaxSpoolSize,
 		},
 		Peer: PeerConfig{
-			Mode:           defaultPeerMode,
-			ForwardTimeout: defaultPeerForwardTimeout,
+			Mode:                 defaultPeerMode,
+			ReadSharding:         defaultPeerReadSharding,
+			PageShardingMinPages: defaultPeerPageShardingMinPages,
+			ForwardTimeout:       defaultPeerForwardTimeout,
 		},
 	}
 }
@@ -410,6 +416,14 @@ func (cfg Config) validatePeer(requireLocal bool) []error {
 	}
 	if cfg.Peer.ForwardTimeout <= 0 {
 		errs = append(errs, errors.New("peer.forward_timeout must be greater than zero"))
+	}
+	switch strings.TrimSpace(cfg.Peer.ReadSharding) {
+	case "object", "page", "auto":
+	default:
+		errs = append(errs, errors.New("peer.read_sharding must be object, page, or auto"))
+	}
+	if cfg.Peer.PageShardingMinPages <= 0 {
+		errs = append(errs, errors.New("peer.page_sharding_min_pages must be greater than zero"))
 	}
 	if len(cfg.Peer.Peers) == 0 {
 		errs = append(errs, errors.New("peer.peers must contain at least one peer in peer mode"))

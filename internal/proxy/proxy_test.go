@@ -636,6 +636,99 @@ func TestProxyUsesBucketSpecificPageSizeForRangeFetch(t *testing.T) {
 	}
 }
 
+func TestProxySelectReadStrategyUsesGlobalAndBucketPageSizes(t *testing.T) {
+	p := &Proxy{
+		pageSize:     4,
+		readSharding: readShardingAuto,
+		pageShardMin: 3,
+		pageSizeByBucket: map[string]int64{
+			"small-pages": 2,
+			"large-pages": 8,
+		},
+	}
+
+	tests := []struct {
+		name            string
+		bucket          string
+		objectSize      int64
+		readSharding    string
+		wantStrategy    string
+		wantPageSize    int64
+		wantObjectPages int64
+	}{
+		{
+			name:            "global one page auto object",
+			bucket:          "default",
+			objectSize:      4,
+			wantStrategy:    readShardingObject,
+			wantPageSize:    4,
+			wantObjectPages: 1,
+		},
+		{
+			name:            "global threshold auto page",
+			bucket:          "default",
+			objectSize:      9,
+			wantStrategy:    readShardingPage,
+			wantPageSize:    4,
+			wantObjectPages: 3,
+		},
+		{
+			name:            "bucket small page size crosses threshold",
+			bucket:          "small-pages",
+			objectSize:      5,
+			wantStrategy:    readShardingPage,
+			wantPageSize:    2,
+			wantObjectPages: 3,
+		},
+		{
+			name:            "bucket large page size stays object",
+			bucket:          "large-pages",
+			objectSize:      12,
+			wantStrategy:    readShardingObject,
+			wantPageSize:    8,
+			wantObjectPages: 2,
+		},
+		{
+			name:            "forced object",
+			bucket:          "small-pages",
+			objectSize:      12,
+			readSharding:    readShardingObject,
+			wantStrategy:    readShardingObject,
+			wantPageSize:    2,
+			wantObjectPages: 6,
+		},
+		{
+			name:            "forced page",
+			bucket:          "large-pages",
+			objectSize:      1,
+			readSharding:    readShardingPage,
+			wantStrategy:    readShardingPage,
+			wantPageSize:    8,
+			wantObjectPages: 1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p.readSharding = readShardingAuto
+			if tt.readSharding != "" {
+				p.readSharding = tt.readSharding
+			}
+
+			got := p.selectReadStrategy(tt.bucket, tt.objectSize)
+			if got.strategy != tt.wantStrategy {
+				t.Fatalf("strategy = %q, want %q", got.strategy, tt.wantStrategy)
+			}
+			if got.effectivePageSize != tt.wantPageSize {
+				t.Fatalf("effectivePageSize = %d, want %d", got.effectivePageSize, tt.wantPageSize)
+			}
+			if got.pageCount != tt.wantObjectPages {
+				t.Fatalf("pageCount = %d, want %d", got.pageCount, tt.wantObjectPages)
+			}
+		})
+	}
+}
+
 func TestProxyServesConditionalNotModifiedFromCachedMetadata(t *testing.T) {
 	body := []byte("abcdefghijkl")
 	var upstreamRequests int
@@ -1017,6 +1110,7 @@ func TestProxyRecordsRangeMetricsAndStructuredLogFields(t *testing.T) {
 
 	var logs bytes.Buffer
 	p := testProxyWithPageSize(t, upstream.URL, 4)
+	p.peerRouter = testPeerRouter(t)
 	p.logger = slog.New(slog.NewJSONHandler(&logs, nil))
 	p.metrics = metrics.NewRecorder(1 << 20)
 
@@ -1035,18 +1129,22 @@ func TestProxyRecordsRangeMetricsAndStructuredLogFields(t *testing.T) {
 		t.Fatalf("decode log entry: %v\nlog: %s", err, logs.String())
 	}
 	for key, want := range map[string]any{
-		"method":                 http.MethodGet,
-		"bucket":                 "photos",
-		"key":                    "object.bin",
-		"cache_result":           "miss",
-		"requested_range":        "bytes=2-7",
-		"bytes_requested":        float64(6),
-		"pages_requested":        float64(2),
-		"pages_hit":              float64(0),
-		"pages_missed":           float64(2),
-		"status":                 float64(http.StatusPartialContent),
-		"bytes_sent":             float64(6),
-		"bytes_fetched_upstream": float64(8),
+		"method":                   http.MethodGet,
+		"bucket":                   "photos",
+		"key":                      "object.bin",
+		"cache_result":             "miss",
+		"requested_range":          "bytes=2-7",
+		"bytes_requested":          float64(6),
+		"pages_requested":          float64(2),
+		"pages_hit":                float64(0),
+		"pages_missed":             float64(2),
+		"status":                   float64(http.StatusPartialContent),
+		"bytes_sent":               float64(6),
+		"bytes_fetched_upstream":   float64(8),
+		"read_strategy":            "page",
+		"configured_read_sharding": "auto",
+		"effective_page_size":      float64(4),
+		"object_page_count":        float64(3),
 	} {
 		if entry[key] != want {
 			t.Fatalf("log field %s = %#v, want %#v\nentry=%#v", key, entry[key], want, entry)
@@ -1063,6 +1161,7 @@ func TestProxyRecordsRangeMetricsAndStructuredLogFields(t *testing.T) {
 		`simple_s3_cache_requested_bytes_sum{bucket="photos"} 6`,
 		`simple_s3_cache_pages_touched_sum{bucket="photos"} 2`,
 		`simple_s3_cache_read_amplification_sum{bucket="photos"} 1.333`,
+		`simple_s3_cache_read_strategy_selected_total{bucket="photos",strategy="page"} 1`,
 	} {
 		if !bytes.Contains([]byte(metricsBody), []byte(want)) {
 			t.Fatalf("metrics body missing %q:\n%s", want, metricsBody)
@@ -2231,8 +2330,22 @@ func testProxyWithPageSize(t *testing.T, endpoint string, pageSize int64) *Proxy
 		upload: uploadOptions{
 			maxSpoolSize: 10 << 30,
 		},
-		metrics: recorder,
+		metrics:      recorder,
+		readSharding: readShardingAuto,
+		pageShardMin: 2,
 	}
+}
+
+func testPeerRouter(t *testing.T) *peerrouter.Router {
+	t.Helper()
+
+	router, err := peerrouter.NewRouter("cache-0", []peerrouter.Peer{
+		{ID: "cache-0", URL: "http://cache-0:8080"},
+	})
+	if err != nil {
+		t.Fatalf("NewRouter() error = %v", err)
+	}
+	return router
 }
 
 func testProxyWithBucketPageSizes(t *testing.T, endpoint string, pageSize int64, pageSizeByBucket map[string]int64) *Proxy {

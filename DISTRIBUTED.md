@@ -573,14 +573,14 @@ Defaults should be boring:
 
 ### Milestone 3: Read Strategy Selection
 
-- [ ] Add `peer.read_sharding: object | page | auto`.
-- [ ] Add `peer.page_sharding_min_pages`.
-- [ ] Compute effective page size from bucket override or global page size.
-- [ ] Implement `auto` strategy:
-  - [ ] one-page objects use `object`;
-  - [ ] objects at or above `page_sharding_min_pages` use `page`.
-- [ ] Add tests for global and bucket-specific page-size decisions.
-- [ ] Add metrics/log fields for selected read strategy.
+- [x] Add `peer.read_sharding: object | page | auto`.
+- [x] Add `peer.page_sharding_min_pages`.
+- [x] Compute effective page size from bucket override or global page size.
+- [x] Implement `auto` strategy:
+  - [x] one-page objects use `object`;
+  - [x] objects at or above `page_sharding_min_pages` use `page`.
+- [x] Add tests for global and bucket-specific page-size decisions.
+- [x] Add metrics/log fields for selected read strategy.
 
 ### Milestone 4: Internal Peer API Boundary
 

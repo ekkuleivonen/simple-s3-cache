@@ -78,6 +78,12 @@ upstream:
 	if cfg.Peer.ForwardTimeout != 10*time.Minute {
 		t.Fatalf("Peer.ForwardTimeout = %s, want 10m", cfg.Peer.ForwardTimeout)
 	}
+	if cfg.Peer.ReadSharding != "auto" {
+		t.Fatalf("Peer.ReadSharding = %q, want auto", cfg.Peer.ReadSharding)
+	}
+	if cfg.Peer.PageShardingMinPages != 2 {
+		t.Fatalf("Peer.PageShardingMinPages = %d, want 2", cfg.Peer.PageShardingMinPages)
+	}
 }
 
 func TestLoadSingleModeDoesNotRequirePeerConfig(t *testing.T) {
@@ -136,6 +142,8 @@ upload:
 peer:
   mode: peer
   local_id: cache-0
+  read_sharding: page
+  page_sharding_min_pages: 4
   forward_timeout: 2m
   peers:
     - id: cache-0
@@ -223,6 +231,12 @@ peer:
 	}
 	if cfg.Peer.ForwardTimeout != 2*time.Minute {
 		t.Fatalf("Peer.ForwardTimeout = %s", cfg.Peer.ForwardTimeout)
+	}
+	if cfg.Peer.ReadSharding != "page" {
+		t.Fatalf("Peer.ReadSharding = %q, want page", cfg.Peer.ReadSharding)
+	}
+	if cfg.Peer.PageShardingMinPages != 4 {
+		t.Fatalf("Peer.PageShardingMinPages = %d, want 4", cfg.Peer.PageShardingMinPages)
 	}
 	if len(cfg.Peer.Peers) != 2 {
 		t.Fatalf("len(Peer.Peers) = %d, want 2", len(cfg.Peer.Peers))
@@ -560,6 +574,40 @@ peer:
       url: ftp://cache-0:8080
 `,
 			wantError: "must use http or https",
+		},
+		{
+			name: "invalid read sharding",
+			config: `
+upstream:
+  endpoint: http://rustfs:9000
+  access_key: test-access
+  secret_key: test-secret
+peer:
+  mode: peer
+  local_id: cache-0
+  read_sharding: random
+  peers:
+    - id: cache-0
+      url: http://cache-0:8080
+`,
+			wantError: "peer.read_sharding",
+		},
+		{
+			name: "invalid page sharding threshold",
+			config: `
+upstream:
+  endpoint: http://rustfs:9000
+  access_key: test-access
+  secret_key: test-secret
+peer:
+  mode: peer
+  local_id: cache-0
+  page_sharding_min_pages: 0
+  peers:
+    - id: cache-0
+      url: http://cache-0:8080
+`,
+			wantError: "peer.page_sharding_min_pages",
 		},
 	}
 

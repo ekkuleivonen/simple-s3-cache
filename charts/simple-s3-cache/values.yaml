@@ -52,6 +52,8 @@ upload:
   maxSpoolSize: 10GiB
 
 peer:
+  readSharding: auto
+  pageShardingMinPages: 2
   forwardTimeout: 10m
 
 initConfig:

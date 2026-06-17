@@ -101,6 +101,10 @@ func (r *Recorder) RecordPeerDecision(bucket, decision, ownerID string) {
 	r.inc("simple_s3_cache_peer_owner_decisions_total", labels(label{"bucket", bucket}, label{"decision", decision}, label{"owner_id", ownerID}), 1)
 }
 
+func (r *Recorder) RecordReadStrategy(bucket, strategy string) {
+	r.inc("simple_s3_cache_read_strategy_selected_total", labels(label{"bucket", bucket}, label{"strategy", strategy}), 1)
+}
+
 func (r *Recorder) RecordPeerForward(bucket, peerID, method, statusClass string) {
 	r.inc("simple_s3_cache_peer_forwarded_requests_total", labels(label{"bucket", bucket}, label{"peer_id", peerID}, label{"method", method}, label{"status_class", statusClass}), 1)
 }
