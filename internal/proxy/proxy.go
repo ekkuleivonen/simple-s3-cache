@@ -45,6 +45,7 @@ const (
 	upstreamIdleConnTimeout       = 90 * time.Second
 	upstreamMaxIdleConns          = 100
 	upstreamMaxIdleConnsPerHost   = 100
+	upstreamErrorBodyLogLimit     = 4096
 )
 
 var (
@@ -1698,6 +1699,24 @@ func (p *Proxy) fetchAndStorePage(ctx context.Context, r *http.Request, target s
 	if resp.StatusCode != http.StatusPartialContent {
 		stats.upstreamDuration += time.Since(start)
 		p.recordUpstreamFailure(target.Bucket, "fill")
+		bodySample, readErr := readCappedBody(resp.Body, upstreamErrorBodyLogLimit)
+		attrs := []slog.Attr{
+			slog.String("method", req.Method),
+			slog.String("bucket", target.Bucket),
+			slog.String("key", target.Key),
+			slog.String("upstream_path", req.URL.EscapedPath()),
+			slog.String("upstream_host", req.Host),
+			slog.String("upstream_url_host", req.URL.Host),
+			slog.String("range", rangeHeader),
+			slog.String("if_match", obj.ETag),
+			slog.Int64("page_index", index),
+			slog.Int("status", resp.StatusCode),
+			slog.String("response_body", bodySample),
+		}
+		if readErr != nil {
+			attrs = append(attrs, slog.String("response_body_read_error", readErr.Error()))
+		}
+		p.logger.LogAttrs(ctx, slog.LevelWarn, "upstream page fill returned non-206", attrs...)
 		return nil, fmt.Errorf("fetch page %d: upstream status %d", index, resp.StatusCode)
 	}
 	writer, err := p.beginCachePageWriter(ctx, target, obj, index, stats)
@@ -1906,6 +1925,17 @@ func responseSize(resp *http.Response) (int64, error) {
 		return 0, fmt.Errorf("parse Content-Length: %w", err)
 	}
 	return size, nil
+}
+
+func readCappedBody(body io.Reader, limit int64) (string, error) {
+	if body == nil || limit <= 0 {
+		return "", nil
+	}
+	data, err := io.ReadAll(io.LimitReader(body, limit))
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
 }
 
 func writeCachedObjectHeaders(dst http.Header, obj cache.Object, rangeResponse bool) {
