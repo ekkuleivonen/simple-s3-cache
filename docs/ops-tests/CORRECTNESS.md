@@ -14,7 +14,7 @@ The key claim to validate:
 
 ## Setup
 
-Deploy peer mode with image/tag `v.0.0.2`:
+Deploy peer mode with image/tag `v0.0.2`:
 
 ```yaml
 peer:

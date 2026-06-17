@@ -1,7 +1,7 @@
-# OPS Test Pack For v.0.0.2
+# OPS Test Pack For v0.0.2
 
 These notes are for validating the v2 distributed peer mode from image/tag
-`v.0.0.2` in a storage-cluster deployment.
+`v0.0.2` in a storage-cluster deployment.
 
 The goal is not to prove every unit-level invariant. The goal is to confirm that
 the deployed system behaves correctly under realistic compute-cluster traffic,
@@ -39,7 +39,7 @@ large cacheable reads should use page ownership across peers when
 
 Use four cache peers to match the four RustFS/storage nodes.
 
-Recommended v.0.0.2 read strategy:
+Recommended v0.0.2 read strategy:
 
 ```yaml
 peer:
