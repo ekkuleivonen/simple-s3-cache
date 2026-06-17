@@ -155,6 +155,7 @@ type coordinatorPageBatch struct {
 	pages  []int64
 	body   io.Closer
 	reader *peerrouter.PageFrameReader
+	cancel context.CancelFunc
 }
 
 type coordinatorPageReader struct {
@@ -2314,13 +2315,15 @@ func (p *Proxy) openRemoteCoordinatorPageBatch(r *http.Request, target s3request
 
 	peerURL := strings.TrimRight(batch.owner.URL, "/") + "/internal/v1/pages/read"
 	ctx := r.Context()
+	var cancel context.CancelFunc
 	if p.peerTimeout > 0 {
-		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, p.peerTimeout)
-		defer cancel()
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, peerURL, bytes.NewReader(data))
 	if err != nil {
+		if cancel != nil {
+			cancel()
+		}
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
@@ -2331,12 +2334,18 @@ func (p *Proxy) openRemoteCoordinatorPageBatch(r *http.Request, target s3request
 	resp, err := p.peerClient.Do(req)
 	stats.peerResponseHeaderDuration += time.Since(headerStart)
 	if err != nil {
+		if cancel != nil {
+			cancel()
+		}
 		p.recordPeerReadFallback(r.Context(), target, batch.owner.ID, "request_failed", err)
 		stats.fallbackReason = "peer_request_failed"
 		return err
 	}
 	if resp.StatusCode != http.StatusOK {
 		defer resp.Body.Close()
+		if cancel != nil {
+			defer cancel()
+		}
 		err := fmt.Errorf("peer %s page read returned status %d", batch.owner.ID, resp.StatusCode)
 		p.recordPeerReadFallback(r.Context(), target, batch.owner.ID, "status", err)
 		stats.fallbackReason = "peer_status"
@@ -2344,6 +2353,9 @@ func (p *Proxy) openRemoteCoordinatorPageBatch(r *http.Request, target s3request
 	}
 	if got := resp.Header.Get("Content-Type"); !strings.HasPrefix(got, peerrouter.PageFrameContentType) {
 		defer resp.Body.Close()
+		if cancel != nil {
+			defer cancel()
+		}
 		err := fmt.Errorf("peer %s page read content type %q", batch.owner.ID, got)
 		p.recordPeerReadFallback(r.Context(), target, batch.owner.ID, "content_type", err)
 		stats.fallbackReason = "peer_content_type"
@@ -2352,12 +2364,16 @@ func (p *Proxy) openRemoteCoordinatorPageBatch(r *http.Request, target s3request
 	reader, err := peerrouter.NewPageFrameReader(resp.Body, batch.pages, obj.PageSize)
 	if err != nil {
 		defer resp.Body.Close()
+		if cancel != nil {
+			defer cancel()
+		}
 		p.recordPeerReadFallback(r.Context(), target, batch.owner.ID, "frame", err)
 		stats.fallbackReason = "peer_frame"
 		return err
 	}
 	batch.body = resp.Body
 	batch.reader = reader
+	batch.cancel = cancel
 	return nil
 }
 
@@ -2378,6 +2394,9 @@ func closeCoordinatorPageBatches(batches map[string]*coordinatorPageBatch) {
 	for _, batch := range batches {
 		if batch.body != nil {
 			_ = batch.body.Close()
+		}
+		if batch.cancel != nil {
+			batch.cancel()
 		}
 	}
 }

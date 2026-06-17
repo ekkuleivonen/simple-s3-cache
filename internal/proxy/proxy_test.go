@@ -2983,6 +2983,92 @@ func TestProxyCoordinatorPageReadServesSingleRemotePage(t *testing.T) {
 	}
 }
 
+func TestProxyCoordinatorPageReadKeepsRemoteStreamContextAlive(t *testing.T) {
+	body := []byte("abcd")
+	headerReady := make(chan struct{})
+	releasePage := make(chan struct{})
+	peerErr := make(chan error, 1)
+	peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = decodeInternalPageReadRequest(t, r)
+		w.Header().Set("Content-Type", peerrouter.PageFrameContentType)
+		w.WriteHeader(http.StatusOK)
+		writer, err := peerrouter.NewPageFrameWriter(w)
+		if err != nil {
+			peerErr <- fmt.Errorf("NewPageFrameWriter: %w", err)
+			return
+		}
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		close(headerReady)
+		select {
+		case <-releasePage:
+		case <-r.Context().Done():
+			peerErr <- r.Context().Err()
+			return
+		}
+		if err := writer.WritePage(0, body); err != nil {
+			peerErr <- fmt.Errorf("WritePage: %w", err)
+			return
+		}
+		if err := writer.WriteEnd(); err != nil {
+			peerErr <- fmt.Errorf("WriteEnd: %w", err)
+			return
+		}
+		peerErr <- nil
+	}))
+	defer peer.Close()
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodHead {
+			t.Fatalf("upstream method = %q, want HEAD only", r.Method)
+		}
+		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+		w.Header().Set("ETag", `"etag-delayed-page"`)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	p := testProxyWithPageSize(t, upstream.URL, 4)
+	p.readSharding = readShardingPage
+	router := enablePeerMode(t, p, "cache-0", []peerrouter.Peer{
+		{ID: "cache-0", URL: "http://cache-0.invalid"},
+		{ID: "cache-1", URL: peer.URL},
+	})
+	key := keyWithPageOwners(t, router, "bucket", []string{"cache-1"})
+	req := httptest.NewRequest(http.MethodGet, "/bucket/"+key, nil)
+	rec := httptest.NewRecorder()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		p.ServeHTTP(rec, req)
+	}()
+
+	select {
+	case <-headerReady:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for peer frame header")
+	}
+	time.Sleep(50 * time.Millisecond)
+	close(releasePage)
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for coordinator response")
+	}
+	if err := <-peerErr; err != nil {
+		t.Fatalf("peer stream error = %v", err)
+	}
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%q", rec.Code, rec.Body.String())
+	}
+	if got := rec.Body.Bytes(); !bytes.Equal(got, body) {
+		t.Fatalf("body = %q, want %q", got, body)
+	}
+}
+
 func TestProxyCoordinatorPageReadBatchesByOwnerAndStreamsInOrder(t *testing.T) {
 	body := []byte("abcdefghijkl")
 	peerBodies := map[string]map[int64][]byte{
