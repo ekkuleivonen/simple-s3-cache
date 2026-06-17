@@ -191,6 +191,61 @@ func TestNewUpstreamHTTPClientUsesProductionTimeouts(t *testing.T) {
 	}
 }
 
+func TestNewSingleModeDoesNotRequirePeerConfig(t *testing.T) {
+	var gotHeader http.Header
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHeader = r.Header.Clone()
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("single mode upstream"))
+	}))
+	defer upstream.Close()
+
+	root := t.TempDir()
+	cfg := appconfig.Default()
+	cfg.Upstream.Endpoint = upstream.URL
+	cfg.Upstream.AccessKey = "test-access-key"
+	cfg.Upstream.SecretKey = "test-secret-key"
+	cfg.Cache.CachePath = filepath.Join(root, "cache-bytes")
+	cfg.Cache.MetaPath = filepath.Join(root, "cache-meta")
+	cfg.Peer.Mode = "single"
+	cfg.Peer.LocalID = ""
+	cfg.Peer.Peers = nil
+
+	p, err := New(context.Background(), cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	defer p.Close()
+
+	if p.peerRouter != nil {
+		t.Fatal("peerRouter is configured in single mode, want nil")
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/bucket/key?tagging=", nil)
+	req.Header.Set(peerForwardedHeader, "1")
+	req.Header.Set(peerOwnerHeader, "other-peer")
+	req.Header.Set(peerRingHeader, "mismatched-ring")
+	rec := httptest.NewRecorder()
+
+	p.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%q", rec.Code, rec.Body.String())
+	}
+	if got := rec.Body.String(); got != "single mode upstream" {
+		t.Fatalf("body = %q, want single mode upstream", got)
+	}
+	if got := gotHeader.Get(peerForwardedHeader); got != "" {
+		t.Fatalf("upstream peer forwarded header = %q, want empty", got)
+	}
+	if got := gotHeader.Get(peerOwnerHeader); got != "" {
+		t.Fatalf("upstream peer owner header = %q, want empty", got)
+	}
+	if got := gotHeader.Get(peerRingHeader); got != "" {
+		t.Fatalf("upstream peer ring header = %q, want empty", got)
+	}
+}
+
 func TestProxyReSignsInsteadOfForwardingClientSigV4Headers(t *testing.T) {
 	var gotHeader http.Header
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

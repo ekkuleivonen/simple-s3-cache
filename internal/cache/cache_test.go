@@ -38,6 +38,110 @@ func TestObjectKeyIsStableAndPathSafe(t *testing.T) {
 	}
 }
 
+func TestLocalCacheReadInvalidationAndEvictionStaySingleNode(t *testing.T) {
+	ctx := context.Background()
+	c := openTestCacheWithMaxSize(t, 6)
+
+	obj, err := c.PutObject(ctx, ObjectMetadata{
+		Bucket:   "bucket",
+		Key:      "single-mode.bin",
+		ETag:     `"etag-1"`,
+		Size:     8,
+		PageSize: 4,
+		Headers:  http.Header{"Content-Type": []string{"application/octet-stream"}},
+	})
+	if err != nil {
+		t.Fatalf("PutObject() error = %v", err)
+	}
+
+	page, err := c.StorePage(ctx, PageWrite{
+		ObjectID:      obj.ID,
+		Index:         0,
+		ETag:          obj.ETag,
+		ExpectedEpoch: obj.Epoch,
+		Size:          4,
+		Source:        bytes.NewReader([]byte("abcd")),
+	})
+	if err != nil {
+		t.Fatalf("StorePage() error = %v", err)
+	}
+	if want := c.pagePathForVersion(obj.ID, 0, obj.ETag, obj.Epoch); page.Path != want {
+		t.Fatalf("page path = %q, want %q", page.Path, want)
+	}
+
+	body, ok, err := c.OpenPage(ctx, obj.ID, 0, obj.ETag, obj.Epoch)
+	if err != nil {
+		t.Fatalf("OpenPage() error = %v", err)
+	}
+	if !ok {
+		t.Fatal("OpenPage() ok = false, want true")
+	}
+	got, err := io.ReadAll(body)
+	_ = body.Close()
+	if err != nil {
+		t.Fatalf("ReadAll(page) error = %v", err)
+	}
+	if !bytes.Equal(got, []byte("abcd")) {
+		t.Fatalf("page body = %q, want abcd", got)
+	}
+
+	if err := c.DeleteObject(ctx, "bucket", "single-mode.bin"); err != nil {
+		t.Fatalf("DeleteObject() error = %v", err)
+	}
+	if _, ok, err := c.GetObject(ctx, "bucket", "single-mode.bin"); err != nil {
+		t.Fatalf("GetObject(after delete) error = %v", err)
+	} else if ok {
+		t.Fatal("GetObject(after delete) ok = true, want false")
+	}
+	assertPagePresent(t, c, obj, 0, false)
+
+	obj, err = c.PutObject(ctx, ObjectMetadata{
+		Bucket:   "bucket",
+		Key:      "single-mode.bin",
+		ETag:     `"etag-2"`,
+		Size:     8,
+		PageSize: 4,
+		Headers:  http.Header{"Content-Type": []string{"application/octet-stream"}},
+	})
+	if err != nil {
+		t.Fatalf("PutObject(new) error = %v", err)
+	}
+	if _, err := c.StorePage(ctx, PageWrite{
+		ObjectID:      obj.ID,
+		Index:         0,
+		ETag:          obj.ETag,
+		ExpectedEpoch: obj.Epoch,
+		Size:          4,
+		Source:        bytes.NewReader([]byte("efgh")),
+	}); err != nil {
+		t.Fatalf("StorePage(new page 0) error = %v", err)
+	}
+	if _, err := c.StorePage(ctx, PageWrite{
+		ObjectID:      obj.ID,
+		Index:         1,
+		ETag:          obj.ETag,
+		ExpectedEpoch: obj.Epoch,
+		Size:          4,
+		Source:        bytes.NewReader([]byte("ijkl")),
+	}); err != nil {
+		t.Fatalf("StorePage(new page 1) error = %v", err)
+	}
+
+	if err := c.Evict(ctx); err != nil {
+		t.Fatalf("Evict() error = %v", err)
+	}
+	pages, err := c.ListPages(ctx, obj.ID)
+	if err != nil {
+		t.Fatalf("ListPages(after eviction) error = %v", err)
+	}
+	if len(pages) != 1 {
+		t.Fatalf("pages after eviction = %d, want 1", len(pages))
+	}
+	if pages[0].Index != 1 {
+		t.Fatalf("remaining page index = %d, want newest page 1", pages[0].Index)
+	}
+}
+
 func TestIndexStoresObjectMetadataAndPages(t *testing.T) {
 	ctx := context.Background()
 	c := openTestCache(t)

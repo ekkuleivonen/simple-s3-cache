@@ -556,10 +556,10 @@ Defaults should be boring:
 
 ### Milestone 1: Preserve Single Mode
 
-- [ ] Keep `peer.mode: single` behavior unchanged.
-- [ ] Add regression tests proving single mode does not require peer config.
-- [ ] Keep existing local cache metadata/page storage paths compatible.
-- [ ] Keep existing single-node read, write, invalidation, and eviction behavior.
+- [x] Keep `peer.mode: single` behavior unchanged.
+- [x] Add regression tests proving single mode does not require peer config.
+- [x] Keep existing local cache metadata/page storage paths compatible.
+- [x] Keep existing single-node read, write, invalidation, and eviction behavior.
 
 ### Milestone 2: Peer Ring And Page Ownership
 

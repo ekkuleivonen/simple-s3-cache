@@ -80,6 +80,31 @@ upstream:
 	}
 }
 
+func TestLoadSingleModeDoesNotRequirePeerConfig(t *testing.T) {
+	path := writeConfig(t, `
+upstream:
+  endpoint: http://rustfs:9000
+  access_key: test-access
+  secret_key: test-secret
+peer:
+  mode: single
+`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Peer.Mode != "single" {
+		t.Fatalf("Peer.Mode = %q, want single", cfg.Peer.Mode)
+	}
+	if cfg.Peer.LocalID != "" {
+		t.Fatalf("Peer.LocalID = %q, want empty", cfg.Peer.LocalID)
+	}
+	if len(cfg.Peer.Peers) != 0 {
+		t.Fatalf("len(Peer.Peers) = %d, want 0", len(cfg.Peer.Peers))
+	}
+}
+
 func TestLoadParsesConfiguredValues(t *testing.T) {
 	path := writeConfig(t, `
 listen: "127.0.0.1:8081"
