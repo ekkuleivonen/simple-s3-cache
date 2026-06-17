@@ -246,6 +246,45 @@ func TestNewSingleModeDoesNotRequirePeerConfig(t *testing.T) {
 	}
 }
 
+func TestProxyPublicBoundaryStripsSpoofedPeerHeaders(t *testing.T) {
+	var gotHeader http.Header
+	var upstreamRequests int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamRequests++
+		gotHeader = r.Header.Clone()
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("public request"))
+	}))
+	defer upstream.Close()
+
+	p := testProxy(t, upstream.URL)
+	router := enablePeerMode(t, p, "cache-0", []peerrouter.Peer{
+		{ID: "cache-0", URL: "http://cache-0.invalid"},
+		{ID: "cache-1", URL: "http://cache-1.invalid"},
+	})
+	key := keyOwnedBy(t, router, "bucket", "cache-0")
+	req := httptest.NewRequest(http.MethodPut, "/bucket/"+key, strings.NewReader("body"))
+	req.Header.Set(peerForwardedHeader, "1")
+	req.Header.Set(peerOwnerHeader, "cache-1")
+	req.Header.Set(peerFromHeader, "cache-1")
+	req.Header.Set(peerRingHeader, "spoofed-ring")
+	rec := httptest.NewRecorder()
+
+	p.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%q", rec.Code, rec.Body.String())
+	}
+	if upstreamRequests != 1 {
+		t.Fatalf("upstream requests = %d, want 1", upstreamRequests)
+	}
+	for _, header := range []string{peerForwardedHeader, peerOwnerHeader, peerFromHeader, peerRingHeader} {
+		if got := gotHeader.Get(header); got != "" {
+			t.Fatalf("upstream %s = %q, want stripped", header, got)
+		}
+	}
+}
+
 func TestProxyReSignsInsteadOfForwardingClientSigV4Headers(t *testing.T) {
 	var gotHeader http.Header
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1919,6 +1958,9 @@ func TestProxyPeerModeForwardsRemoteOwnerRequest(t *testing.T) {
 	var peerRequests int
 	peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		peerRequests++
+		if got := r.URL.EscapedPath(); !strings.HasPrefix(got, internalObjectRoutePrefix+"/bucket/") {
+			t.Fatalf("peer path = %q, want internal object route", got)
+		}
 		if got := r.Header.Get(peerForwardedHeader); got != "1" {
 			t.Fatalf("peer forwarded header = %q, want 1", got)
 		}
@@ -1953,6 +1995,10 @@ func TestProxyPeerModeForwardsRemoteOwnerRequest(t *testing.T) {
 	key := keyOwnedBy(t, router, "bucket", "cache-1")
 	req := httptest.NewRequest(http.MethodGet, "/bucket/"+key, nil)
 	req.Header.Set("Authorization", "client-signature")
+	req.Header.Set(peerForwardedHeader, "spoofed")
+	req.Header.Set(peerOwnerHeader, "cache-0")
+	req.Header.Set(peerFromHeader, "client")
+	req.Header.Set(peerRingHeader, "spoofed-ring")
 	rec := httptest.NewRecorder()
 
 	p.ServeHTTP(rec, req)
@@ -2095,6 +2141,125 @@ func TestProxyPeerModeForwardedWriteInvalidatesOnOwner(t *testing.T) {
 	}
 }
 
+func TestInternalObjectRequestPreservesEscapedS3Path(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, internalObjectRoutePrefix+"/bucket/path%20with%20spaces/plus+and%2525.txt?versionId=123", nil)
+
+	got := internalObjectRequest(req)
+
+	if got.URL.EscapedPath() != "/bucket/path%20with%20spaces/plus+and%2525.txt" {
+		t.Fatalf("EscapedPath() = %q, want original escaped S3 path", got.URL.EscapedPath())
+	}
+	target, ok := s3request.ParsePathStyle(got.URL.EscapedPath())
+	if !ok {
+		t.Fatal("ParsePathStyle() ok = false")
+	}
+	if target.Bucket != "bucket" || target.Key != "path with spaces/plus+and%25.txt" {
+		t.Fatalf("target = %+v, want decoded bucket/key", target)
+	}
+}
+
+func TestProxyInternalRoutesRequirePeerHeaders(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Fatal("upstream should not receive invalid internal request")
+	}))
+	defer upstream.Close()
+
+	tests := []struct {
+		name       string
+		headers    http.Header
+		wantStatus int
+	}{
+		{
+			name: "missing peer identity",
+			headers: http.Header{
+				peerForwardedHeader: []string{"1"},
+				peerOwnerHeader:     []string{"cache-0"},
+				peerRingHeader:      []string{"valid"},
+			},
+			wantStatus: http.StatusUnauthorized,
+		},
+		{
+			name: "unknown peer identity",
+			headers: http.Header{
+				peerForwardedHeader: []string{"1"},
+				peerOwnerHeader:     []string{"cache-0"},
+				peerFromHeader:      []string{"cache-9"},
+				peerRingHeader:      []string{"valid"},
+			},
+			wantStatus: http.StatusForbidden,
+		},
+		{
+			name: "missing ring",
+			headers: http.Header{
+				peerForwardedHeader: []string{"1"},
+				peerOwnerHeader:     []string{"cache-0"},
+				peerFromHeader:      []string{"cache-1"},
+			},
+			wantStatus: http.StatusBadGateway,
+		},
+		{
+			name: "mismatched ring",
+			headers: http.Header{
+				peerForwardedHeader: []string{"1"},
+				peerOwnerHeader:     []string{"cache-0"},
+				peerFromHeader:      []string{"cache-1"},
+				peerRingHeader:      []string{"different-ring"},
+			},
+			wantStatus: http.StatusBadGateway,
+		},
+		{
+			name: "missing forwarded header",
+			headers: http.Header{
+				peerOwnerHeader: []string{"cache-0"},
+				peerFromHeader:  []string{"cache-1"},
+				peerRingHeader:  []string{"valid"},
+			},
+			wantStatus: http.StatusUnauthorized,
+		},
+		{
+			name: "missing owner header",
+			headers: http.Header{
+				peerForwardedHeader: []string{"1"},
+				peerFromHeader:      []string{"cache-1"},
+				peerRingHeader:      []string{"valid"},
+			},
+			wantStatus: http.StatusUnauthorized,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := testProxy(t, upstream.URL)
+			router := enablePeerMode(t, p, "cache-0", []peerrouter.Peer{
+				{ID: "cache-0", URL: "http://cache-0.invalid"},
+				{ID: "cache-1", URL: "http://cache-1.invalid"},
+			})
+			var cacheTouches atomic.Int32
+			p.cache = &cacheTouchCountingCache{cacheStore: p.cache, calls: &cacheTouches}
+			key := keyOwnedBy(t, router, "bucket", "cache-0")
+			req := httptest.NewRequest(http.MethodGet, internalObjectRoutePrefix+"/bucket/"+key, nil)
+			for header, values := range tt.headers {
+				for _, value := range values {
+					if value == "valid" {
+						value = router.RingID()
+					}
+					req.Header.Add(header, value)
+				}
+			}
+			rec := httptest.NewRecorder()
+
+			p.ServeHTTP(rec, req)
+
+			if rec.Code != tt.wantStatus {
+				t.Fatalf("status = %d, want %d; body=%q", rec.Code, tt.wantStatus, rec.Body.String())
+			}
+			if got := cacheTouches.Load(); got != 0 {
+				t.Fatalf("cache touches = %d, want 0 before internal request validation succeeds", got)
+			}
+		})
+	}
+}
+
 func TestProxyPeerModeRejectsForwardingLoop(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
 		t.Fatal("upstream should not receive looped peer request")
@@ -2107,8 +2272,9 @@ func TestProxyPeerModeRejectsForwardingLoop(t *testing.T) {
 		{ID: "cache-1", URL: "http://cache-1.invalid"},
 	})
 	key := keyOwnedBy(t, router, "bucket", "cache-1")
-	req := httptest.NewRequest(http.MethodGet, "/bucket/"+key, nil)
+	req := httptest.NewRequest(http.MethodGet, internalObjectRoutePrefix+"/bucket/"+key, nil)
 	req.Header.Set(peerForwardedHeader, "1")
+	req.Header.Set(peerOwnerHeader, "cache-1")
 	req.Header.Set(peerFromHeader, "cache-1")
 	req.Header.Set(peerRingHeader, router.RingID())
 	rec := httptest.NewRecorder()
@@ -2136,10 +2302,10 @@ func TestProxyPeerModeRejectsForwardedRingMismatch(t *testing.T) {
 		{ID: "cache-1", URL: "http://cache-1.invalid"},
 	})
 	key := keyOwnedBy(t, router, "bucket", "cache-0")
-	req := httptest.NewRequest(http.MethodGet, "/bucket/"+key, nil)
+	req := httptest.NewRequest(http.MethodGet, internalObjectRoutePrefix+"/bucket/"+key, nil)
 	req.Header.Set(peerForwardedHeader, "1")
 	req.Header.Set(peerOwnerHeader, "cache-0")
-	req.Header.Set(peerFromHeader, "gateway")
+	req.Header.Set(peerFromHeader, "cache-1")
 	req.Header.Set(peerRingHeader, "different-ring")
 	rec := httptest.NewRecorder()
 
@@ -2147,10 +2313,6 @@ func TestProxyPeerModeRejectsForwardedRingMismatch(t *testing.T) {
 
 	if rec.Code != http.StatusBadGateway {
 		t.Fatalf("status = %d, want 502; body=%q", rec.Code, rec.Body.String())
-	}
-	metricsBody := renderProxyMetrics(t, p.metrics)
-	if !strings.Contains(metricsBody, `simple_s3_cache_peer_forward_failures_total{bucket="bucket",peer_id="cache-0",reason="ring_mismatch"} 1`) {
-		t.Fatalf("metrics missing ring mismatch failure:\n%s", metricsBody)
 	}
 }
 
@@ -2166,20 +2328,16 @@ func TestProxyPeerModeRejectsForwardedMissingRing(t *testing.T) {
 		{ID: "cache-1", URL: "http://cache-1.invalid"},
 	})
 	key := keyOwnedBy(t, router, "bucket", "cache-0")
-	req := httptest.NewRequest(http.MethodGet, "/bucket/"+key, nil)
+	req := httptest.NewRequest(http.MethodGet, internalObjectRoutePrefix+"/bucket/"+key, nil)
 	req.Header.Set(peerForwardedHeader, "1")
 	req.Header.Set(peerOwnerHeader, "cache-0")
-	req.Header.Set(peerFromHeader, "gateway")
+	req.Header.Set(peerFromHeader, "cache-1")
 	rec := httptest.NewRecorder()
 
 	p.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusBadGateway {
 		t.Fatalf("status = %d, want 502; body=%q", rec.Code, rec.Body.String())
-	}
-	metricsBody := renderProxyMetrics(t, p.metrics)
-	if !strings.Contains(metricsBody, `simple_s3_cache_peer_forward_failures_total{bucket="bucket",peer_id="cache-0",reason="ring_mismatch"} 1`) {
-		t.Fatalf("metrics missing ring mismatch failure:\n%s", metricsBody)
 	}
 }
 
@@ -2195,10 +2353,10 @@ func TestProxyPeerModeRejectsForwardedOwnerMismatch(t *testing.T) {
 		{ID: "cache-1", URL: "http://cache-1.invalid"},
 	})
 	key := keyOwnedBy(t, router, "bucket", "cache-0")
-	req := httptest.NewRequest(http.MethodGet, "/bucket/"+key, nil)
+	req := httptest.NewRequest(http.MethodGet, internalObjectRoutePrefix+"/bucket/"+key, nil)
 	req.Header.Set(peerForwardedHeader, "1")
 	req.Header.Set(peerOwnerHeader, "cache-1")
-	req.Header.Set(peerFromHeader, "gateway")
+	req.Header.Set(peerFromHeader, "cache-1")
 	req.Header.Set(peerRingHeader, router.RingID())
 	rec := httptest.NewRecorder()
 
@@ -2410,6 +2568,46 @@ type invalidationFailingCache struct {
 
 func (c invalidationFailingCache) DeleteObject(context.Context, string, string) error {
 	return errors.New("invalidation failed")
+}
+
+type cacheTouchCountingCache struct {
+	cacheStore
+	calls *atomic.Int32
+}
+
+func (c *cacheTouchCountingCache) PutObject(ctx context.Context, metadata cache.ObjectMetadata) (cache.Object, error) {
+	c.calls.Add(1)
+	return c.cacheStore.PutObject(ctx, metadata)
+}
+
+func (c *cacheTouchCountingCache) GetObject(ctx context.Context, bucket, key string) (cache.Object, bool, error) {
+	c.calls.Add(1)
+	return c.cacheStore.GetObject(ctx, bucket, key)
+}
+
+func (c *cacheTouchCountingCache) DeleteObject(ctx context.Context, bucket, key string) error {
+	c.calls.Add(1)
+	return c.cacheStore.DeleteObject(ctx, bucket, key)
+}
+
+func (c *cacheTouchCountingCache) StorePage(ctx context.Context, write cache.PageWrite) (cache.Page, error) {
+	c.calls.Add(1)
+	return c.cacheStore.StorePage(ctx, write)
+}
+
+func (c *cacheTouchCountingCache) BeginPageWrite(ctx context.Context, opts cache.PageWriteOptions) (*cache.PageWriter, error) {
+	c.calls.Add(1)
+	return c.cacheStore.BeginPageWrite(ctx, opts)
+}
+
+func (c *cacheTouchCountingCache) ListPages(ctx context.Context, objectID string) ([]cache.Page, error) {
+	c.calls.Add(1)
+	return c.cacheStore.ListPages(ctx, objectID)
+}
+
+func (c *cacheTouchCountingCache) OpenPage(ctx context.Context, objectID string, index int64, expectedETag string, expectedEpoch int64) (io.ReadCloser, bool, error) {
+	c.calls.Add(1)
+	return c.cacheStore.OpenPage(ctx, objectID, index, expectedETag, expectedEpoch)
 }
 
 type missingPageSignalCache struct {

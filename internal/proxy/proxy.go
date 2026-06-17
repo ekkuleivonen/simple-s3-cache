@@ -44,6 +44,11 @@ const (
 )
 
 const (
+	internalV1Prefix          = "/internal/v1/"
+	internalObjectRoutePrefix = "/internal/v1/objects"
+)
+
+const (
 	upstreamDialTimeout           = 10 * time.Second
 	upstreamKeepAlive             = 30 * time.Second
 	upstreamTLSHandshakeTimeout   = 10 * time.Second
@@ -303,6 +308,81 @@ func (p *Proxy) Close() error {
 }
 
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if isInternalRoute(r.URL.Path) {
+		p.serveInternalHTTP(w, r)
+		return
+	}
+
+	stripPeerHeaders(r.Header)
+	p.serveS3HTTP(w, r)
+}
+
+func (p *Proxy) serveInternalHTTP(w http.ResponseWriter, r *http.Request) {
+	if p.peerRouter == nil {
+		http.NotFound(w, r)
+		return
+	}
+	if !p.validateInternalPeerHeaders(w, r) {
+		return
+	}
+
+	switch {
+	case strings.HasPrefix(r.URL.Path, internalObjectRoutePrefix+"/"):
+		if r.Header.Get(peerForwardedHeader) == "" {
+			http.Error(w, "missing peer forwarded header", http.StatusUnauthorized)
+			return
+		}
+		if r.Header.Get(peerOwnerHeader) == "" {
+			http.Error(w, "missing peer owner header", http.StatusUnauthorized)
+			return
+		}
+		p.serveS3HTTP(w, internalObjectRequest(r))
+	case r.URL.Path == "/internal/v1/pages/read", r.URL.Path == "/internal/v1/invalidate":
+		http.Error(w, "internal route not implemented", http.StatusNotImplemented)
+	default:
+		http.NotFound(w, r)
+	}
+}
+
+func (p *Proxy) validateInternalPeerHeaders(w http.ResponseWriter, r *http.Request) bool {
+	from := strings.TrimSpace(r.Header.Get(peerFromHeader))
+	if from == "" {
+		http.Error(w, "missing peer identity", http.StatusUnauthorized)
+		return false
+	}
+	if _, ok := p.peerRouter.PeerByID(from); !ok {
+		http.Error(w, "unknown peer identity", http.StatusForbidden)
+		return false
+	}
+
+	ringID := strings.TrimSpace(r.Header.Get(peerRingHeader))
+	if ringID == "" || ringID != p.peerRouter.RingID() {
+		http.Error(w, "peer ring mismatch", http.StatusBadGateway)
+		return false
+	}
+	return true
+}
+
+func internalObjectRequest(r *http.Request) *http.Request {
+	cloned := r.Clone(r.Context())
+	urlCopy := *r.URL
+	urlCopy.Path = strings.TrimPrefix(r.URL.Path, internalObjectRoutePrefix)
+	if urlCopy.Path == "" {
+		urlCopy.Path = "/"
+	}
+	urlCopy.RawPath = strings.TrimPrefix(r.URL.EscapedPath(), internalObjectRoutePrefix)
+	if urlCopy.RawPath == "" {
+		urlCopy.RawPath = "/"
+	}
+	cloned.URL = &urlCopy
+	return cloned
+}
+
+func isInternalRoute(path string) bool {
+	return path == strings.TrimSuffix(internalV1Prefix, "/") || strings.HasPrefix(path, internalV1Prefix)
+}
+
+func (p *Proxy) serveS3HTTP(w http.ResponseWriter, r *http.Request) {
 	target, ok := s3request.ParsePathStyle(r.URL.EscapedPath())
 	if !ok {
 		http.NotFound(w, r)
@@ -581,7 +661,7 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, stats *requestSt
 }
 
 func (p *Proxy) forwardToPeer(w http.ResponseWriter, r *http.Request, owner peerrouter.Peer, stats *requestStats) (int, int64, error) {
-	peerURL := strings.TrimRight(owner.URL, "/") + r.URL.RequestURI()
+	peerURL := strings.TrimRight(owner.URL, "/") + internalObjectRoutePrefix + r.URL.RequestURI()
 	ctx := r.Context()
 	if p.peerTimeout > 0 {
 		var cancel context.CancelFunc
@@ -2151,6 +2231,14 @@ func isPeerHeader(key string) bool {
 		strings.EqualFold(key, peerOwnerHeader) ||
 		strings.EqualFold(key, peerFromHeader) ||
 		strings.EqualFold(key, peerRingHeader)
+}
+
+func stripPeerHeaders(header http.Header) {
+	for key := range header {
+		if isPeerHeader(key) {
+			header.Del(key)
+		}
+	}
 }
 
 func isClientSigningHeader(key string) bool {

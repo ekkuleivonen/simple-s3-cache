@@ -584,13 +584,13 @@ Defaults should be boring:
 
 ### Milestone 4: Internal Peer API Boundary
 
-- [ ] Add internal route namespace, for example `/internal/v1/*`.
-- [ ] Strip client-supplied peer/internal headers at public boundaries.
-- [ ] Require peer identity and ring fingerprint on internal routes.
-- [ ] Fail closed on ring mismatch before touching local cache state.
-- [ ] Decide whether internal routes share the public listener or use a separate
+- [x] Add internal route namespace, for example `/internal/v1/*`.
+- [x] Strip client-supplied peer/internal headers at public boundaries.
+- [x] Require peer identity and ring fingerprint on internal routes.
+- [x] Fail closed on ring mismatch before touching local cache state.
+- [x] Decide whether internal routes share the public listener or use a separate
   listener.
-- [ ] Add tests for missing, spoofed, and mismatched internal headers.
+- [x] Add tests for missing, spoofed, and mismatched internal headers.
 
 ### Milestone 5: Versioned Page Frame Protocol
 
