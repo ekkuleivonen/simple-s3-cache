@@ -2055,6 +2055,35 @@ func TestProxyPeerModeRejectsForwardedRingMismatch(t *testing.T) {
 	}
 }
 
+func TestProxyPeerModeRejectsForwardedMissingRing(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Fatal("upstream should not receive request with missing peer ring")
+	}))
+	defer upstream.Close()
+
+	p := testProxy(t, upstream.URL)
+	router := enablePeerMode(t, p, "cache-0", []peerrouter.Peer{
+		{ID: "cache-0", URL: "http://cache-0.invalid"},
+		{ID: "cache-1", URL: "http://cache-1.invalid"},
+	})
+	key := keyOwnedBy(t, router, "bucket", "cache-0")
+	req := httptest.NewRequest(http.MethodGet, "/bucket/"+key, nil)
+	req.Header.Set(peerForwardedHeader, "1")
+	req.Header.Set(peerOwnerHeader, "cache-0")
+	req.Header.Set(peerFromHeader, "gateway")
+	rec := httptest.NewRecorder()
+
+	p.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502; body=%q", rec.Code, rec.Body.String())
+	}
+	metricsBody := renderProxyMetrics(t, p.metrics)
+	if !strings.Contains(metricsBody, `simple_s3_cache_peer_forward_failures_total{bucket="bucket",peer_id="cache-0",reason="ring_mismatch"} 1`) {
+		t.Fatalf("metrics missing ring mismatch failure:\n%s", metricsBody)
+	}
+}
+
 func TestProxyPeerModeRejectsForwardedOwnerMismatch(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
 		t.Fatal("upstream should not receive request with peer owner mismatch")

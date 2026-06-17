@@ -563,13 +563,13 @@ Defaults should be boring:
 
 ### Milestone 2: Peer Ring And Page Ownership
 
-- [ ] Add `PageOwner(bucket, key, pageIndex)` to the peer router.
-- [ ] Centralize the page-owner hash key format.
-- [ ] Add stable ownership tests for representative buckets, keys, and page
+- [x] Add `PageOwner(bucket, key, pageIndex)` to the peer router.
+- [x] Centralize the page-owner hash key format.
+- [x] Add stable ownership tests for representative buckets, keys, and page
   indexes.
-- [ ] Add distribution tests showing large objects spread pages across peers.
-- [ ] Keep ring fingerprint behavior deterministic.
-- [ ] Reject internal requests with missing or mismatched ring fingerprints.
+- [x] Add distribution tests showing large objects spread pages across peers.
+- [x] Keep ring fingerprint behavior deterministic.
+- [x] Reject internal requests with missing or mismatched ring fingerprints.
 
 ### Milestone 3: Read Strategy Selection
 

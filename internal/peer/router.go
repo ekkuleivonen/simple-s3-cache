@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -100,6 +101,21 @@ func (r *Router) RingID() string {
 
 func (r *Router) Owner(bucket, key string) Peer {
 	routingKey := bucket + "/" + key
+	return r.ownerForRoutingKey(routingKey)
+}
+
+func PageOwnerKey(bucket, key string, pageIndex int64) string {
+	return bucket + "/" + key + "\x00page\x00" + strconv.FormatInt(pageIndex, 10)
+}
+
+func (r *Router) PageOwner(bucket, key string, pageIndex int64) Peer {
+	if pageIndex < 0 {
+		return Peer{}
+	}
+	return r.ownerForRoutingKey(PageOwnerKey(bucket, key, pageIndex))
+}
+
+func (r *Router) ownerForRoutingKey(routingKey string) Peer {
 	var owner Peer
 	var bestScore uint64
 	for i, p := range r.peers {
@@ -114,6 +130,10 @@ func (r *Router) Owner(bucket, key string) Peer {
 
 func (r *Router) IsLocalOwner(bucket, key string) bool {
 	return r.localID != "" && r.Owner(bucket, key).ID == r.localID
+}
+
+func (r *Router) IsLocalPageOwner(bucket, key string, pageIndex int64) bool {
+	return r.localID != "" && r.PageOwner(bucket, key, pageIndex).ID == r.localID
 }
 
 func (r *Router) PeerByID(id string) (Peer, bool) {
