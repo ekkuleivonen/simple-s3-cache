@@ -61,7 +61,10 @@ type Cache struct {
 	evictionCh               chan struct{}
 	touchCh                  chan pageRef
 	metricsCh                chan struct{}
+	evictionMu               sync.Mutex
 	writeMu                  sync.Mutex
+	timestampMu              sync.Mutex
+	lastTimestamp            int64
 	cancelWorker             context.CancelFunc
 	workerWG                 sync.WaitGroup
 	metrics                  *metrics.Recorder
@@ -285,6 +288,17 @@ func (c *Cache) beginWriteTx(ctx context.Context) (*sql.Tx, func(), error) {
 	return tx, c.writeMu.Unlock, nil
 }
 
+func (c *Cache) timestamp() int64 {
+	now := time.Now().UnixNano()
+	c.timestampMu.Lock()
+	defer c.timestampMu.Unlock()
+	if now <= c.lastTimestamp {
+		now = c.lastTimestamp + 1
+	}
+	c.lastTimestamp = now
+	return now
+}
+
 func ObjectKey(bucket, key string) string {
 	sum := sha256.Sum256([]byte(bucket + "\x00" + key))
 	return hex.EncodeToString(sum[:])
@@ -312,6 +326,7 @@ func (c *Cache) PutObject(ctx context.Context, meta ObjectMetadata) (Object, err
 	if err != nil {
 		return Object{}, err
 	}
+	now := c.timestamp()
 
 	if err := c.ensureGeneration(ctx, id); err != nil {
 		return Object{}, err
@@ -333,7 +348,7 @@ ON CONFLICT(id) DO UPDATE SET
 	headers_json = excluded.headers_json,
 	epoch = excluded.epoch,
 	updated_at = excluded.updated_at
-`, id, meta.Bucket, meta.Key, meta.ETag, meta.Size, meta.PageSize, headersJSON, epoch, time.Now().UnixNano())
+`, id, meta.Bucket, meta.Key, meta.ETag, meta.Size, meta.PageSize, headersJSON, epoch, now)
 	if err != nil {
 		return Object{}, fmt.Errorf("put object: %w", err)
 	}
@@ -386,7 +401,7 @@ func (c *Cache) DeleteObject(ctx context.Context, bucket, key string) error {
 		return err
 	}
 
-	now := time.Now().UnixNano()
+	now := c.timestamp()
 	tx, unlock, err := c.beginWriteTx(ctx)
 	if err != nil {
 		return fmt.Errorf("begin delete object: %w", err)
@@ -432,6 +447,7 @@ func (c *Cache) PutPage(ctx context.Context, page Page) error {
 	if err != nil {
 		return err
 	}
+	now := c.timestamp()
 	_, err = c.execWrite(ctx, `
 INSERT INTO pages (object_id, page_index, etag, epoch, size, path, created_at, last_accessed_at)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -441,7 +457,7 @@ ON CONFLICT(object_id, page_index) DO UPDATE SET
 	size = excluded.size,
 	path = excluded.path,
 	last_accessed_at = excluded.last_accessed_at
-`, page.ObjectID, page.Index, page.ETag, page.Epoch, page.Size, page.Path, time.Now().UnixNano(), time.Now().UnixNano())
+`, page.ObjectID, page.Index, page.ETag, page.Epoch, page.Size, page.Path, now, now)
 	if err != nil {
 		return fmt.Errorf("put page: %w", err)
 	}
@@ -820,6 +836,9 @@ func pagesSize(pages []Page) int64 {
 }
 
 func (c *Cache) Evict(ctx context.Context) error {
+	c.evictionMu.Lock()
+	defer c.evictionMu.Unlock()
+
 	if err := c.evictBuckets(ctx); err != nil {
 		return err
 	}
@@ -1130,7 +1149,7 @@ func (c *Cache) ensureGeneration(ctx context.Context, objectID string) error {
 INSERT INTO object_generations (id, epoch, updated_at)
 VALUES (?, 0, ?)
 ON CONFLICT(id) DO NOTHING
-`, objectID, time.Now().UnixNano())
+`, objectID, c.timestamp())
 	if err != nil {
 		return fmt.Errorf("ensure object generation: %w", err)
 	}
@@ -1214,6 +1233,7 @@ WHERE object_id = ? AND page_index = ?
 		_ = tx.Rollback()
 		return "", 0, fmt.Errorf("read previous page size: %w", err)
 	}
+	now := c.timestamp()
 	_, err = tx.ExecContext(ctx, `
 INSERT INTO pages (object_id, page_index, etag, epoch, size, path, created_at, last_accessed_at)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -1223,7 +1243,7 @@ ON CONFLICT(object_id, page_index) DO UPDATE SET
 	size = excluded.size,
 	path = excluded.path,
 	last_accessed_at = excluded.last_accessed_at
-`, page.ObjectID, page.Index, page.ETag, page.Epoch, page.Size, page.Path, time.Now().UnixNano(), time.Now().UnixNano())
+`, page.ObjectID, page.Index, page.ETag, page.Epoch, page.Size, page.Path, now, now)
 	if err != nil {
 		_ = tx.Rollback()
 		return "", 0, fmt.Errorf("put page: %w", err)
@@ -1439,7 +1459,7 @@ func (c *Cache) flushTouches(ctx context.Context, pending map[pageRef]struct{}) 
 		return nil
 	}
 
-	now := time.Now().UnixNano()
+	now := c.timestamp()
 	for ref := range pending {
 		if err := c.touchPage(ctx, ref.objectID, ref.index, now); err != nil {
 			return err
