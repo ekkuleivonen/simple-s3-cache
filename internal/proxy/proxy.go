@@ -1221,6 +1221,9 @@ func (p *Proxy) serveColdFullObject(w http.ResponseWriter, r *http.Request, targ
 	}
 	req.Header.Del("Range")
 	req.Header.Set("If-Match", obj.ETag)
+	if err := p.sign(req); err != nil {
+		return 0, 0, err
+	}
 
 	pages, err := cacheplan.PagesForRange(cacheplan.ByteRange{Start: 0, End: obj.Size - 1}, obj.PageSize)
 	if err != nil {
@@ -1392,6 +1395,9 @@ func (p *Proxy) fetchMetadata(ctx context.Context, r *http.Request, target s3req
 		return cache.Object{}, 0, nil, false, err
 	}
 	req.Header.Del("Range")
+	if err := p.sign(req); err != nil {
+		return cache.Object{}, 0, nil, false, err
+	}
 
 	start := time.Now()
 	resp, err := p.client.Do(req)
@@ -1682,6 +1688,9 @@ func (p *Proxy) fetchAndStorePage(ctx context.Context, r *http.Request, target s
 	}
 	req.Header.Set("Range", rangeHeader)
 	req.Header.Set("If-Match", obj.ETag)
+	if err := p.sign(req); err != nil {
+		return nil, err
+	}
 
 	start := time.Now()
 	resp, err := p.client.Do(req)
@@ -1872,9 +1881,6 @@ func (p *Proxy) newUpstreamRequest(ctx context.Context, r *http.Request, method 
 		req.ContentLength = 0
 	}
 	p.applyUpstreamHost(req)
-	if err := p.sign(req); err != nil {
-		return nil, err
-	}
 	return req, nil
 }
 

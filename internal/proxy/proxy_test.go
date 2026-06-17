@@ -754,6 +754,48 @@ func TestProxyPassesThroughDateConditionalWhenCachedMetadataIsInsufficient(t *te
 	}
 }
 
+func TestProxySignsPageFillWithFinalRangeHeaders(t *testing.T) {
+	body := []byte("abcdefghijkl")
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Accept-Ranges", "bytes")
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("ETag", `"etag-signed-page"`)
+		if r.Method == http.MethodHead {
+			w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+			assertRequestSignatureMatchesFinalHeaders(t, r)
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		if got := r.Header.Get("Range"); got != "bytes=4-7" {
+			t.Fatalf("upstream Range = %q, want page fill range", got)
+		}
+		if got := r.Header.Get("If-Match"); got != `"etag-signed-page"` {
+			t.Fatalf("upstream If-Match = %q, want cached ETag", got)
+		}
+		assertRequestSignatureMatchesFinalHeaders(t, r)
+		w.Header().Set("Content-Length", "4")
+		w.Header().Set("Content-Range", "bytes 4-7/12")
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(body[4:8])
+	}))
+	defer upstream.Close()
+
+	p := testProxyWithPageSize(t, upstream.URL, 4)
+	req := httptest.NewRequest(http.MethodGet, "/bucket/object.bin", nil)
+	req.Header.Set("Range", "bytes=5-5")
+	rec := httptest.NewRecorder()
+
+	p.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusPartialContent {
+		t.Fatalf("status = %d, want 206; body=%q", rec.Code, rec.Body.String())
+	}
+	if got := rec.Body.String(); got != "f" {
+		t.Fatalf("body = %q, want %q", got, "f")
+	}
+}
+
 func TestProxyCachesSinglePageRangeRead(t *testing.T) {
 	body := []byte("abcdefghijkl")
 	var upstreamRequests []string
@@ -2015,6 +2057,48 @@ func keyOwnedBy(t *testing.T, router *peerrouter.Router, bucket, ownerID string)
 	}
 	t.Fatalf("could not find key owned by %s", ownerID)
 	return ""
+}
+
+func assertRequestSignatureMatchesFinalHeaders(t *testing.T, r *http.Request) {
+	t.Helper()
+
+	signingTime, err := time.Parse("20060102T150405Z", r.Header.Get("X-Amz-Date"))
+	if err != nil {
+		t.Fatalf("parse X-Amz-Date: %v", err)
+	}
+	replayURL := &url.URL{
+		Scheme:   "http",
+		Host:     r.Host,
+		Path:     r.URL.Path,
+		RawPath:  r.URL.RawPath,
+		RawQuery: r.URL.RawQuery,
+	}
+	replay, err := http.NewRequestWithContext(context.Background(), r.Method, replayURL.String(), nil)
+	if err != nil {
+		t.Fatalf("build replay request: %v", err)
+	}
+	replay.Host = r.Host
+	for key, values := range r.Header {
+		if strings.EqualFold(key, "Authorization") {
+			continue
+		}
+		for _, value := range values {
+			replay.Header.Add(key, value)
+		}
+	}
+	credentials := aws.Credentials{
+		AccessKeyID:     "test-access-key",
+		SecretAccessKey: "test-secret-key",
+		Source:          "test",
+	}
+	if err := v4.NewSigner().SignHTTP(context.Background(), credentials, replay, unsignedPayload, "s3", "us-east-1", signingTime, func(options *v4.SignerOptions) {
+		options.DisableURIPathEscaping = true
+	}); err != nil {
+		t.Fatalf("sign replay request: %v", err)
+	}
+	if got, want := r.Header.Get("Authorization"), replay.Header.Get("Authorization"); got != want {
+		t.Fatalf("Authorization does not match final headers\ngot:  %s\nwant: %s", got, want)
+	}
 }
 
 func testProxy(t *testing.T, endpoint string) *Proxy {
