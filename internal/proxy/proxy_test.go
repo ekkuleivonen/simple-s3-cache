@@ -1133,6 +1133,50 @@ func TestProxyCachesSinglePageRangeRead(t *testing.T) {
 	}
 }
 
+func TestProxyCachesGetObjectWithBenignSDKQuery(t *testing.T) {
+	body := []byte("abcdefghijkl")
+	var upstreamRequests []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamRequests = append(upstreamRequests, fmt.Sprintf("%s range=%q query=%q", r.Method, r.Header.Get("Range"), r.URL.RawQuery))
+		writeObjectResponse(t, w, r, body, `"etag-x-id"`)
+	}))
+	defer upstream.Close()
+
+	p := testProxyWithPageSize(t, upstream.URL, 4)
+	for i := 0; i < 2; i++ {
+		req := httptest.NewRequest(http.MethodGet, "/bucket/object.bin?x-id=GetObject", nil)
+		req.Header.Set("Range", "bytes=1-3")
+		rec := httptest.NewRecorder()
+
+		p.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusPartialContent {
+			t.Fatalf("GET range %d status = %d, want 206; body=%q", i+1, rec.Code, rec.Body.String())
+		}
+		if got := rec.Body.Bytes(); !bytes.Equal(got, body[1:4]) {
+			t.Fatalf("GET range %d body = %q, want %q", i+1, got, body[1:4])
+		}
+	}
+
+	wantRequests := []string{`HEAD range="" query=""`, `GET range="bytes=0-3" query=""`}
+	if !equalStringSlices(upstreamRequests, wantRequests) {
+		t.Fatalf("upstream requests = %q, want %q", upstreamRequests, wantRequests)
+	}
+
+	metricsBody := renderProxyMetrics(t, p.metrics)
+	for _, want := range []string{
+		`simple_s3_cache_page_misses_total{bucket="bucket"} 1`,
+		`simple_s3_cache_page_hits_total{bucket="bucket"} 1`,
+	} {
+		if !strings.Contains(metricsBody, want) {
+			t.Fatalf("metrics body missing %q:\n%s", want, metricsBody)
+		}
+	}
+	if strings.Contains(metricsBody, `simple_s3_cache_pass_through_requests_total{bucket="bucket",method="GET"}`) {
+		t.Fatalf("metrics include pass-through GET for benign query:\n%s", metricsBody)
+	}
+}
+
 func TestProxyCoalescesConcurrentFetchesForSameMissingPage(t *testing.T) {
 	body := []byte("abcdefghijkl")
 	firstFillStarted := make(chan struct{})

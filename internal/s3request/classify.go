@@ -2,6 +2,7 @@ package s3request
 
 import (
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 )
@@ -27,6 +28,21 @@ type Classification struct {
 	Reason      string
 }
 
+type benignObjectReadQuery struct {
+	Method string
+	Name   string
+	Value  string
+}
+
+// benignObjectReadQueryAllowlist contains query parameters that are SDK
+// operation markers, not S3 object subresources, response overrides, auth
+// material, or object identity selectors. Add to this list only when the
+// parameter is response-neutral and safe to collapse into the plain bucket/key
+// cache entry.
+var benignObjectReadQueryAllowlist = []benignObjectReadQuery{
+	{Method: http.MethodGet, Name: "x-id", Value: "GetObject"},
+}
+
 func Classify(req Request) Classification {
 	if !req.Target.IsObject() {
 		return passThrough("not_object")
@@ -36,7 +52,7 @@ func Classify(req Request) Classification {
 		return passThrough("sse_c")
 	}
 
-	if req.RawQuery != "" {
+	if req.RawQuery != "" && !IsBenignObjectReadQuery(req.Method, req.RawQuery) {
 		return passThrough("query")
 	}
 
@@ -58,6 +74,32 @@ func Classify(req Request) Classification {
 	default:
 		return passThrough("method")
 	}
+}
+
+func IsBenignObjectReadQuery(method, rawQuery string) bool {
+	if rawQuery == "" {
+		return false
+	}
+
+	values, err := url.ParseQuery(rawQuery)
+	if err != nil {
+		return false
+	}
+	if len(values) != 1 {
+		return false
+	}
+
+	for _, allowed := range benignObjectReadQueryAllowlist {
+		if method != allowed.Method {
+			continue
+		}
+		got := values[allowed.Name]
+		if len(got) == 1 && got[0] == allowed.Value {
+			return true
+		}
+	}
+
+	return false
 }
 
 func passThrough(reason string) Classification {

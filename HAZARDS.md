@@ -46,10 +46,13 @@ test. Until then, treat it as load-bearing.
 * **Why it matters:** Correctness bug that is easy to ship because the request
   superficially matches the cached GET path.
 * **Mitigation:** Classification must pass through any GET that carries a
-  subresource or query parameter that changes the response semantics. Pass
-  through `?versionId` reads; do not cache versioned reads. Pass through
-  response override parameters such as `response-content-type`,
-  `response-content-disposition`, and related `response-*` parameters.
+  subresource or query parameter that changes the response semantics. Only
+  explicitly allow-listed, response-neutral SDK operation markers such as
+  `?x-id=GetObject` may enter the cache path, and they are stripped from
+  cache-internal upstream reads. Pass through `?versionId` reads; do not cache
+  versioned reads. Pass through response override parameters such as
+  `response-content-type`, `response-content-disposition`, and related
+  `response-*` parameters.
 * **Watch:** Request classifier treating "has bucket + key" as sufficient to
   cache.
 

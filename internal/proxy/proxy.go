@@ -1322,11 +1322,11 @@ func (p *Proxy) handle(w http.ResponseWriter, r *http.Request, target s3request.
 
 	switch classification.Disposition {
 	case s3request.CacheableHeadObject:
-		return p.serveCachedHead(w, r, target, stats)
+		return p.serveCachedHead(w, cacheInternalReadRequest(r, classification), target, stats)
 	case s3request.CacheableRangeObject:
-		return p.serveCachedRange(w, r, target, stats)
+		return p.serveCachedRange(w, cacheInternalReadRequest(r, classification), target, stats)
 	case s3request.CacheableFullObject:
-		return p.serveCachedFullObject(w, r, target, stats)
+		return p.serveCachedFullObject(w, cacheInternalReadRequest(r, classification), target, stats)
 	default:
 		stats.cacheResult = "pass_through"
 		status, bytesWritten, err := p.forward(w, r, stats)
@@ -1342,6 +1342,24 @@ func (p *Proxy) handle(w http.ResponseWriter, r *http.Request, target s3request.
 		}
 		return status, bytesWritten, err
 	}
+}
+
+func cacheInternalReadRequest(r *http.Request, classification s3request.Classification) *http.Request {
+	if r.URL.RawQuery == "" || !s3request.IsBenignObjectReadQuery(r.Method, r.URL.RawQuery) {
+		return r
+	}
+	if classification.Disposition != s3request.CacheableHeadObject &&
+		classification.Disposition != s3request.CacheableRangeObject &&
+		classification.Disposition != s3request.CacheableFullObject {
+		return r
+	}
+
+	cloned := new(http.Request)
+	*cloned = *r
+	urlCopy := *r.URL
+	urlCopy.RawQuery = ""
+	cloned.URL = &urlCopy
+	return cloned
 }
 
 func (p *Proxy) invalidateObject(ctx context.Context, target s3request.Target) (int64, error) {

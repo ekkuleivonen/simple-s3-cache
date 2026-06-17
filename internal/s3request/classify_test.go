@@ -31,6 +31,25 @@ func TestClassifyCacheableObjectReads(t *testing.T) {
 			want: CacheableRangeObject,
 		},
 		{
+			name: "aws sdk get object operation marker",
+			req: Request{
+				Method:   http.MethodGet,
+				Target:   Target{Bucket: "bucket", Key: "key"},
+				RawQuery: "x-id=GetObject",
+			},
+			want: CacheableFullObject,
+		},
+		{
+			name: "aws sdk range get object operation marker",
+			req: Request{
+				Method:   http.MethodGet,
+				Target:   Target{Bucket: "bucket", Key: "key"},
+				RawQuery: "x-id=GetObject",
+				Header:   http.Header{"Range": []string{"bytes=0-99"}},
+			},
+			want: CacheableRangeObject,
+		},
+		{
 			name: "conditional get object",
 			req: Request{
 				Method: http.MethodGet,
@@ -101,6 +120,51 @@ func TestClassifyPassThroughRequests(t *testing.T) {
 				Method:   http.MethodGet,
 				Target:   Target{Bucket: "bucket", Key: "key"},
 				RawQuery: "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=abc",
+			},
+			wantReason: "query",
+		},
+		{
+			name: "aws sdk marker mixed with versioned read",
+			req: Request{
+				Method:   http.MethodGet,
+				Target:   Target{Bucket: "bucket", Key: "key"},
+				RawQuery: "x-id=GetObject&versionId=123",
+			},
+			wantReason: "query",
+		},
+		{
+			name: "aws sdk marker mixed with response override",
+			req: Request{
+				Method:   http.MethodGet,
+				Target:   Target{Bucket: "bucket", Key: "key"},
+				RawQuery: "x-id=GetObject&response-content-type=text/plain",
+			},
+			wantReason: "query",
+		},
+		{
+			name: "wrong aws sdk marker value",
+			req: Request{
+				Method:   http.MethodGet,
+				Target:   Target{Bucket: "bucket", Key: "key"},
+				RawQuery: "x-id=HeadObject",
+			},
+			wantReason: "query",
+		},
+		{
+			name: "head with aws sdk marker is not allow-listed",
+			req: Request{
+				Method:   http.MethodHead,
+				Target:   Target{Bucket: "bucket", Key: "key"},
+				RawQuery: "x-id=HeadObject",
+			},
+			wantReason: "query",
+		},
+		{
+			name: "repeated aws sdk marker",
+			req: Request{
+				Method:   http.MethodGet,
+				Target:   Target{Bucket: "bucket", Key: "key"},
+				RawQuery: "x-id=GetObject&x-id=GetObject",
 			},
 			wantReason: "query",
 		},

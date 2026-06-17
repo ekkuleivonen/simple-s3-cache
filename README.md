@@ -292,6 +292,7 @@ data is lost because upstream S3-compatible storage remains the source of truth.
 | Plain `GET Object` | Cached as pages |
 | Plain `HEAD Object` | Cached as object metadata; pass through if cached metadata cannot answer transparently |
 | Single-range `GET Object` | Cached as pages |
+| `GET Object ?x-id=GetObject` | Cached like the equivalent plain object read; `x-id=GetObject` is treated as AWS SDK operation-marker noise |
 | `PUT Object`, `DELETE Object`, `COPY Object` | Pass-through; invalidate affected cached object on success |
 | Multipart upload operations | Pass-through; invalidate target on successful completion or abort |
 | Bucket operations | Pass-through |

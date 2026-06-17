@@ -102,9 +102,12 @@ All writes and all bucket-level operations pass through to upstream.
 
 Successful writes invalidate cached data for the affected object.
 
-Only "plain" object reads are cached. A `GET` or `HEAD` that carries a
-subresource or response-shaping query parameter is passed through, never
-cached as object data. Examples that must pass through:
+Only "plain" object reads are cached. A `GET` may also carry an explicitly
+allow-listed, response-neutral AWS SDK operation marker such as
+`?x-id=GetObject`; this is treated as equivalent to the plain object read. A
+`GET` or `HEAD` that carries any subresource, response-shaping query parameter,
+auth query parameter, version selector, or unknown query parameter is passed
+through, never cached as object data. Examples that must pass through:
 
 - `?versionId` (versioned reads are not cached)
 - `?acl`, `?tagging`, `?attributes`, `?retention`, `?legal-hold`, `?torrent`
