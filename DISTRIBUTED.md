@@ -645,24 +645,24 @@ Defaults should be boring:
 
 ### Milestone 8: Distributed Invalidation And Epochs
 
-- [ ] Define object epoch storage and update rules.
-- [ ] Advance epoch on every mutating path:
-  - [ ] PUT object;
-  - [ ] DELETE object;
-  - [ ] COPY destination;
-  - [ ] multipart complete;
-  - [ ] multipart abort where needed;
-  - [ ] overwrite;
-  - [ ] conditional write success.
-- [ ] Broadcast invalidation/epoch advance to every peer, including self.
-- [ ] Make invalidation idempotent.
-- [ ] Delete or mark local metadata and pages stale on invalidation.
-- [ ] Ensure every peer either applies the invalidation/epoch advance or becomes
+- [x] Define object epoch storage and update rules.
+- [x] Advance epoch on every mutating path:
+  - [x] PUT object;
+  - [x] DELETE object;
+  - [x] COPY destination;
+  - [x] multipart complete;
+  - [x] multipart abort where needed;
+  - [x] overwrite;
+  - [x] conditional write success.
+- [x] Broadcast invalidation/epoch advance to every peer, including self.
+- [x] Make invalidation idempotent.
+- [x] Delete or mark local metadata and pages stale on invalidation.
+- [x] Ensure every peer either applies the invalidation/epoch advance or becomes
   not-ready.
-- [ ] Ensure coordinators do not plan reads using an older known epoch.
-- [ ] Surface write success plus invalidation failure visibly where possible.
-- [ ] Add tests proving no stale page after each mutating path.
-- [ ] Add tests for partial invalidation failure and readiness failure.
+- [x] Ensure coordinators do not plan reads using an older known epoch.
+- [x] Surface write success plus invalidation failure visibly where possible.
+- [x] Add tests proving no stale page after each mutating path.
+- [x] Add tests for partial invalidation failure and readiness failure.
 
 ### Milestone 9: Readiness, Health, And Self-Quarantine
 

@@ -17,10 +17,18 @@ type Server struct {
 	httpServer *http.Server
 }
 
+type readinessChecker interface {
+	Readiness() (bool, string)
+}
+
 func New(cfg config.Config, logger *slog.Logger, handlers ...http.Handler) *Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", healthz)
-	mux.HandleFunc("GET /readyz", readyz)
+	var readiness readinessChecker
+	if len(handlers) > 0 {
+		readiness, _ = handlers[0].(readinessChecker)
+	}
+	mux.HandleFunc("GET /readyz", readyz(readiness))
 	if len(handlers) > 1 && handlers[1] != nil {
 		mux.Handle("GET /metrics", handlers[1])
 	}
@@ -56,10 +64,19 @@ func healthz(w http.ResponseWriter, _ *http.Request) {
 	_, _ = w.Write([]byte(`{"status":"ok"}` + "\n"))
 }
 
-func readyz(w http.ResponseWriter, _ *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte(`{"status":"ready"}` + "\n"))
+func readyz(checker readinessChecker) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if checker != nil {
+			if ok, reason := checker.Readiness(); !ok {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_, _ = w.Write([]byte(`{"status":"not_ready","reason":` + strconv.Quote(reason) + `}` + "\n"))
+				return
+			}
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"ready"}` + "\n"))
+	}
 }
 
 type loggingResponseWriter struct {

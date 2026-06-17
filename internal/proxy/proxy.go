@@ -79,6 +79,7 @@ type cacheStore interface {
 	PutObject(context.Context, cache.ObjectMetadata) (cache.Object, error)
 	GetObject(context.Context, string, string) (cache.Object, bool, error)
 	DeleteObject(context.Context, string, string) error
+	InvalidateObject(context.Context, string, string, int64) (int64, error)
 	StorePage(context.Context, cache.PageWrite) (cache.Page, error)
 	BeginPageWrite(context.Context, cache.PageWriteOptions) (*cache.PageWriter, error)
 	ListPages(context.Context, string) ([]cache.Page, error)
@@ -110,6 +111,8 @@ type Proxy struct {
 	objectFillMu     sync.Mutex
 	objectFillSems   map[string]chan struct{}
 	objectFillLimit  int
+	degradedMu       sync.RWMutex
+	degradedReason   string
 }
 
 type readStrategySelection struct {
@@ -139,6 +142,12 @@ type internalPageReadRequest struct {
 	ETag       string  `json:"etag"`
 	Epoch      int64   `json:"epoch"`
 	Pages      []int64 `json:"pages"`
+}
+
+type internalInvalidateRequest struct {
+	Bucket string `json:"bucket"`
+	Key    string `json:"key"`
+	Epoch  int64  `json:"epoch"`
 }
 
 type coordinatorPageBatch struct {
@@ -341,6 +350,27 @@ func (p *Proxy) Close() error {
 	return p.cache.Close()
 }
 
+func (p *Proxy) Readiness() (bool, string) {
+	p.degradedMu.RLock()
+	defer p.degradedMu.RUnlock()
+	if p.degradedReason != "" {
+		return false, p.degradedReason
+	}
+	return true, ""
+}
+
+func (p *Proxy) markDegraded(reason string) {
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "degraded"
+	}
+	p.degradedMu.Lock()
+	if p.degradedReason == "" {
+		p.degradedReason = reason
+	}
+	p.degradedMu.Unlock()
+}
+
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if isInternalRoute(r.URL.Path) {
 		p.serveInternalHTTP(w, r)
@@ -374,10 +404,47 @@ func (p *Proxy) serveInternalHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.URL.Path == "/internal/v1/pages/read":
 		p.serveInternalPageRead(w, r)
 	case r.URL.Path == "/internal/v1/invalidate":
-		http.Error(w, "internal route not implemented", http.StatusNotImplemented)
+		p.serveInternalInvalidate(w, r)
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+func (p *Proxy) serveInternalInvalidate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req internalInvalidateRequest
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&req); err != nil {
+		http.Error(w, "invalid invalidate request", http.StatusBadRequest)
+		return
+	}
+	if err := validateInternalInvalidateRequest(req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	epoch, err := p.cache.InvalidateObject(r.Context(), req.Bucket, req.Key, req.Epoch)
+	if err != nil {
+		p.markDegraded("local invalidation failed")
+		p.logger.ErrorContext(r.Context(), "internal invalidation failed",
+			slog.String("bucket", req.Bucket),
+			slog.String("key", req.Key),
+			slog.Int64("epoch", req.Epoch),
+			slog.String("error", err.Error()),
+		)
+		http.Error(w, "apply invalidation", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = fmt.Fprintf(w, `{"status":"ok","epoch":%d}`+"\n", epoch)
 }
 
 func (p *Proxy) serveInternalPageRead(w http.ResponseWriter, r *http.Request) {
@@ -418,7 +485,7 @@ func (p *Proxy) serveInternalPageRead(w http.ResponseWriter, r *http.Request) {
 		if !ok {
 			data, err := p.fillMissingPageBytes(r.Context(), p.internalPageReadUpstreamRequest(r, req), target, obj, pageIndex, stats)
 			if errors.Is(err, errObjectChanged) {
-				if deleteErr := p.cache.DeleteObject(r.Context(), req.Bucket, req.Key); deleteErr != nil {
+				if _, deleteErr := p.invalidateObject(r.Context(), s3request.Target{Bucket: req.Bucket, Key: req.Key}); deleteErr != nil {
 					p.logger.WarnContext(r.Context(), "invalidate stale internal page identity failed",
 						slog.String("bucket", req.Bucket),
 						slog.String("key", req.Key),
@@ -511,6 +578,19 @@ func validateInternalPageReadRequest(req internalPageReadRequest) error {
 		if _, err := cacheplan.PageBounds(pageIndex, req.PageSize, req.ObjectSize); err != nil {
 			return fmt.Errorf("invalid page %d: %w", pageIndex, err)
 		}
+	}
+	return nil
+}
+
+func validateInternalInvalidateRequest(req internalInvalidateRequest) error {
+	if strings.TrimSpace(req.Bucket) == "" {
+		return errors.New("bucket is required")
+	}
+	if req.Key == "" {
+		return errors.New("key is required")
+	}
+	if req.Epoch <= 0 {
+		return errors.New("epoch must be greater than zero")
 	}
 	return nil
 }
@@ -814,18 +894,96 @@ func (p *Proxy) handle(w http.ResponseWriter, r *http.Request, target s3request.
 		stats.cacheResult = "pass_through"
 		status, bytesWritten, err := p.forward(w, r, stats)
 		if err == nil && isSuccessfulStatus(status) && shouldInvalidateAfterWrite(r, target) {
-			if deleteErr := p.cache.DeleteObject(r.Context(), target.Bucket, target.Key); deleteErr != nil {
-				p.logger.WarnContext(r.Context(), "cache invalidation failed after successful write",
+			if _, deleteErr := p.invalidateObject(r.Context(), target); deleteErr != nil {
+				p.markDegraded("write invalidation failed")
+				p.logger.ErrorContext(r.Context(), "cache invalidation failed after successful write",
 					slog.String("bucket", target.Bucket),
 					slog.String("key", target.Key),
 					slog.String("error", deleteErr.Error()),
 				)
-			} else if p.metrics != nil {
-				p.metrics.RecordInvalidation(target.Bucket)
 			}
 		}
 		return status, bytesWritten, err
 	}
+}
+
+func (p *Proxy) invalidateObject(ctx context.Context, target s3request.Target) (int64, error) {
+	epoch, err := p.cache.InvalidateObject(ctx, target.Bucket, target.Key, 0)
+	if err != nil {
+		return 0, err
+	}
+	if p.metrics != nil {
+		p.metrics.RecordInvalidation(target.Bucket)
+	}
+	if p.peerRouter == nil {
+		return epoch, nil
+	}
+	if err := p.broadcastInvalidation(ctx, target, epoch); err != nil {
+		p.markDegraded("peer invalidation failed")
+		return epoch, err
+	}
+	return epoch, nil
+}
+
+func (p *Proxy) broadcastInvalidation(ctx context.Context, target s3request.Target, epoch int64) error {
+	var failures []error
+	for _, peer := range p.peerRouter.Peers() {
+		if peer.ID == p.peerRouter.LocalID() {
+			continue
+		}
+		if err := p.sendPeerInvalidation(ctx, peer, target, epoch); err != nil {
+			p.logger.ErrorContext(ctx, "peer invalidation failed",
+				slog.String("bucket", target.Bucket),
+				slog.String("key", target.Key),
+				slog.Int64("epoch", epoch),
+				slog.String("peer_id", peer.ID),
+				slog.String("error", err.Error()),
+			)
+			failures = append(failures, err)
+		}
+	}
+	if len(failures) > 0 {
+		return errors.Join(failures...)
+	}
+	return nil
+}
+
+func (p *Proxy) sendPeerInvalidation(ctx context.Context, peer peerrouter.Peer, target s3request.Target, epoch int64) error {
+	body := internalInvalidateRequest{
+		Bucket: target.Bucket,
+		Key:    target.Key,
+		Epoch:  epoch,
+	}
+	data, err := json.Marshal(body)
+	if err != nil {
+		return err
+	}
+	if p.peerTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, p.peerTimeout)
+		defer cancel()
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(peer.URL, "/")+"/internal/v1/invalidate", bytes.NewReader(data))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(peerFromHeader, p.peerRouter.LocalID())
+	req.Header.Set(peerRingHeader, p.peerRouter.RingID())
+
+	client := p.peerClient
+	if client == nil {
+		client = http.DefaultClient
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return fmt.Errorf("peer %s invalidation returned status %d", peer.ID, resp.StatusCode)
+	}
+	return nil
 }
 
 func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, stats *requestStats) (int, int64, error) {
@@ -1588,13 +1746,10 @@ func (p *Proxy) serveCachedFullObject(w http.ResponseWriter, r *http.Request, ta
 	if !ok {
 		status, bytesWritten, err := p.serveColdFullObject(w, r, target, obj, stats)
 		if errors.Is(err, errObjectChanged) {
-			if deleteErr := p.cache.DeleteObject(r.Context(), target.Bucket, target.Key); deleteErr != nil {
+			if _, deleteErr := p.invalidateObject(r.Context(), target); deleteErr != nil {
 				stats.cacheResult = "error"
 				http.Error(w, "invalidate changed object", http.StatusInternalServerError)
 				return 0, 0, deleteErr
-			}
-			if p.metrics != nil {
-				p.metrics.RecordInvalidation(target.Bucket)
 			}
 			refetched, ok, fetchErr := p.ensureObjectMetadata(r.Context(), r, target, stats)
 			if fetchErr != nil {
@@ -1915,11 +2070,8 @@ func (p *Proxy) prepareFirstPage(r *http.Request, target s3request.Target, obj c
 }
 
 func (p *Proxy) refetchAfterObjectChanged(r *http.Request, target s3request.Target, requestedRange cacheplan.ByteRange, stats *requestStats) (cache.Object, cacheplan.ByteRange, []cacheplan.PageSpan, io.ReadCloser, error) {
-	if err := p.cache.DeleteObject(r.Context(), target.Bucket, target.Key); err != nil {
+	if _, err := p.invalidateObject(r.Context(), target); err != nil {
 		return cache.Object{}, cacheplan.ByteRange{}, nil, nil, err
-	}
-	if p.metrics != nil {
-		p.metrics.RecordInvalidation(target.Bucket)
 	}
 	obj, ok, err := p.ensureObjectMetadata(r.Context(), r, target, stats)
 	if err != nil {

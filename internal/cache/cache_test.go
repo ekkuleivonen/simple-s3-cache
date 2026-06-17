@@ -447,6 +447,129 @@ func TestDeleteObjectRemovesMetadataRowsAndPageFiles(t *testing.T) {
 	}
 }
 
+func TestInvalidateObjectAdvancesEpochWhenObjectIsMissing(t *testing.T) {
+	ctx := context.Background()
+	c := openTestCache(t)
+
+	epoch, err := c.InvalidateObject(ctx, "bucket", "missing.bin", 0)
+	if err != nil {
+		t.Fatalf("InvalidateObject() error = %v", err)
+	}
+	if epoch != 1 {
+		t.Fatalf("epoch = %d, want 1", epoch)
+	}
+
+	obj, err := c.PutObject(ctx, ObjectMetadata{
+		Bucket:   "bucket",
+		Key:      "missing.bin",
+		ETag:     `"etag-1"`,
+		Size:     1024,
+		PageSize: 128,
+		Headers:  http.Header{"Content-Type": []string{"application/octet-stream"}},
+	})
+	if err != nil {
+		t.Fatalf("PutObject() error = %v", err)
+	}
+	if obj.Epoch != epoch {
+		t.Fatalf("object epoch = %d, want %d", obj.Epoch, epoch)
+	}
+}
+
+func TestInvalidateObjectWithMinimumEpochIsIdempotent(t *testing.T) {
+	ctx := context.Background()
+	c := openTestCache(t)
+	obj := putTestObject(t, c, "bucket", "idempotent.bin")
+	if _, err := c.StorePage(ctx, PageWrite{
+		ObjectID:      obj.ID,
+		Index:         0,
+		ETag:          obj.ETag,
+		ExpectedEpoch: obj.Epoch,
+		Size:          int64(len("cached page")),
+		Source:        bytes.NewReader([]byte("cached page")),
+	}); err != nil {
+		t.Fatalf("StorePage() error = %v", err)
+	}
+
+	epoch, err := c.InvalidateObject(ctx, "bucket", "idempotent.bin", 7)
+	if err != nil {
+		t.Fatalf("InvalidateObject(first) error = %v", err)
+	}
+	if epoch != 7 {
+		t.Fatalf("first epoch = %d, want 7", epoch)
+	}
+	epoch, err = c.InvalidateObject(ctx, "bucket", "idempotent.bin", 7)
+	if err != nil {
+		t.Fatalf("InvalidateObject(second) error = %v", err)
+	}
+	if epoch != 7 {
+		t.Fatalf("second epoch = %d, want idempotent 7", epoch)
+	}
+
+	refreshed, err := c.PutObject(ctx, ObjectMetadata{
+		Bucket:   "bucket",
+		Key:      "idempotent.bin",
+		ETag:     `"etag-2"`,
+		Size:     1024,
+		PageSize: 128,
+		Headers:  http.Header{"Content-Type": []string{"application/octet-stream"}},
+	})
+	if err != nil {
+		t.Fatalf("PutObject(refreshed) error = %v", err)
+	}
+	if refreshed.Epoch != 7 {
+		t.Fatalf("refreshed epoch = %d, want 7", refreshed.Epoch)
+	}
+}
+
+func TestOlderInvalidateObjectDoesNotDeleteNewerObject(t *testing.T) {
+	ctx := context.Background()
+	c := openTestCache(t)
+	obj := putTestObject(t, c, "bucket", "newer.bin")
+
+	epoch, err := c.InvalidateObject(ctx, "bucket", "newer.bin", 5)
+	if err != nil {
+		t.Fatalf("InvalidateObject(first) error = %v", err)
+	}
+	if epoch != 5 {
+		t.Fatalf("first epoch = %d, want 5", epoch)
+	}
+	newer, err := c.PutObject(ctx, ObjectMetadata{
+		Bucket:   "bucket",
+		Key:      "newer.bin",
+		ETag:     `"etag-2"`,
+		Size:     1024,
+		PageSize: 128,
+		Headers:  http.Header{"Content-Type": []string{"application/octet-stream"}},
+	})
+	if err != nil {
+		t.Fatalf("PutObject(newer) error = %v", err)
+	}
+	if newer.Epoch != epoch {
+		t.Fatalf("newer epoch = %d, want %d", newer.Epoch, epoch)
+	}
+	epoch, err = c.InvalidateObject(ctx, "bucket", "newer.bin", 3)
+	if err != nil {
+		t.Fatalf("InvalidateObject(older) error = %v", err)
+	}
+	if epoch != 5 {
+		t.Fatalf("older invalidation returned epoch = %d, want current 5", epoch)
+	}
+
+	got, ok, err := c.GetObject(ctx, "bucket", "newer.bin")
+	if err != nil {
+		t.Fatalf("GetObject() error = %v", err)
+	}
+	if !ok {
+		t.Fatal("GetObject() ok = false, want newer object preserved")
+	}
+	if got.ETag != `"etag-2"` {
+		t.Fatalf("ETag = %q, want newer etag", got.ETag)
+	}
+	if obj.ID != newer.ID {
+		t.Fatalf("object IDs differ: %q != %q", obj.ID, newer.ID)
+	}
+}
+
 func TestStorePageRejectsStaleObjectEpochAfterInvalidation(t *testing.T) {
 	ctx := context.Background()
 	c := openTestCache(t)

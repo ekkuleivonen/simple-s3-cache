@@ -1875,6 +1875,166 @@ func TestProxyDoesNotFailSuccessfulWriteWhenInvalidationFails(t *testing.T) {
 	if bytesWritten == 0 {
 		t.Fatal("bytesWritten = 0, want upstream response bytes copied")
 	}
+	if ready, reason := p.Readiness(); ready || reason == "" {
+		t.Fatalf("Readiness() = (%v, %q), want degraded reason", ready, reason)
+	}
+}
+
+func TestProxyBroadcastsInvalidationAfterSuccessfulWrite(t *testing.T) {
+	ctx := context.Background()
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut {
+			t.Fatalf("upstream method = %q, want PUT", r.Method)
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("write ok"))
+	}))
+	defer upstream.Close()
+
+	owner := testProxyWithPageSize(t, upstream.URL, 4)
+	ownerServer := httptest.NewServer(owner)
+	defer ownerServer.Close()
+
+	peers := []peerrouter.Peer{
+		{ID: "cache-0", URL: "http://cache-0.invalid"},
+		{ID: "cache-1", URL: ownerServer.URL},
+	}
+	ownerRouter, err := peerrouter.NewRouter("cache-1", peers)
+	if err != nil {
+		t.Fatalf("NewRouter(owner) error = %v", err)
+	}
+	owner.peerRouter = ownerRouter
+
+	key := "write-broadcast.bin"
+	oldObj, err := owner.cache.PutObject(ctx, cache.ObjectMetadata{
+		Bucket:   "bucket",
+		Key:      key,
+		ETag:     `"old"`,
+		Size:     4,
+		PageSize: 4,
+		Headers:  http.Header{"Content-Type": []string{"application/octet-stream"}},
+	})
+	if err != nil {
+		t.Fatalf("owner PutObject() error = %v", err)
+	}
+	if _, err := owner.cache.StorePage(ctx, cache.PageWrite{
+		ObjectID:      oldObj.ID,
+		Index:         0,
+		ETag:          oldObj.ETag,
+		ExpectedEpoch: oldObj.Epoch,
+		Size:          int64(len("old!")),
+		Source:        strings.NewReader("old!"),
+	}); err != nil {
+		t.Fatalf("owner StorePage() error = %v", err)
+	}
+
+	coordinator := testProxyWithPageSize(t, upstream.URL, 4)
+	enablePeerMode(t, coordinator, "cache-0", peers)
+	req := httptest.NewRequest(http.MethodPut, "/bucket/"+key, strings.NewReader("new!"))
+	rec := httptest.NewRecorder()
+
+	coordinator.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%q", rec.Code, rec.Body.String())
+	}
+	if _, ok, err := owner.cache.GetObject(ctx, "bucket", key); err != nil {
+		t.Fatalf("owner GetObject() error = %v", err)
+	} else if ok {
+		t.Fatal("owner object still cached after invalidation")
+	}
+	if body, ok, err := owner.cache.OpenPage(ctx, oldObj.ID, 0, oldObj.ETag, oldObj.Epoch); err != nil {
+		t.Fatalf("owner OpenPage() error = %v", err)
+	} else if ok {
+		_ = body.Close()
+		t.Fatal("owner stale page still opens after invalidation")
+	}
+	refreshed, err := owner.cache.PutObject(ctx, cache.ObjectMetadata{
+		Bucket:   "bucket",
+		Key:      key,
+		ETag:     `"new"`,
+		Size:     4,
+		PageSize: 4,
+		Headers:  http.Header{"Content-Type": []string{"application/octet-stream"}},
+	})
+	if err != nil {
+		t.Fatalf("owner PutObject(new) error = %v", err)
+	}
+	if refreshed.Epoch <= oldObj.Epoch {
+		t.Fatalf("refreshed epoch = %d, want greater than old epoch %d", refreshed.Epoch, oldObj.Epoch)
+	}
+}
+
+func TestProxyMarksNotReadyWhenPeerInvalidationFails(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("write ok"))
+	}))
+	defer upstream.Close()
+
+	failingPeer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/internal/v1/invalidate" {
+			t.Fatalf("peer path = %q, want /internal/v1/invalidate", r.URL.Path)
+		}
+		http.Error(w, "nope", http.StatusInternalServerError)
+	}))
+	defer failingPeer.Close()
+
+	p := testProxy(t, upstream.URL)
+	enablePeerMode(t, p, "cache-0", []peerrouter.Peer{
+		{ID: "cache-0", URL: "http://cache-0.invalid"},
+		{ID: "cache-1", URL: failingPeer.URL},
+	})
+	req := httptest.NewRequest(http.MethodPut, "/bucket/object.bin", strings.NewReader("new body"))
+	rec := httptest.NewRecorder()
+
+	p.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want upstream 200; body=%q", rec.Code, rec.Body.String())
+	}
+	if ready, reason := p.Readiness(); ready || !strings.Contains(reason, "peer invalidation") {
+		t.Fatalf("Readiness() = (%v, %q), want peer invalidation degradation", ready, reason)
+	}
+}
+
+func TestProxyBroadcastsInvalidationToAllPeersAfterFailure(t *testing.T) {
+	var successfulInvalidations int
+	successfulPeer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/internal/v1/invalidate" {
+			t.Fatalf("successful peer path = %q, want /internal/v1/invalidate", r.URL.Path)
+		}
+		successfulInvalidations++
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer successfulPeer.Close()
+
+	failingPeer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/internal/v1/invalidate" {
+			t.Fatalf("failing peer path = %q, want /internal/v1/invalidate", r.URL.Path)
+		}
+		http.Error(w, "nope", http.StatusInternalServerError)
+	}))
+	defer failingPeer.Close()
+
+	p := testProxy(t, "http://upstream.invalid")
+	enablePeerMode(t, p, "cache-0", []peerrouter.Peer{
+		{ID: "cache-0", URL: "http://cache-0.invalid"},
+		{ID: "cache-1", URL: failingPeer.URL},
+		{ID: "cache-2", URL: successfulPeer.URL},
+	})
+
+	_, err := p.invalidateObject(context.Background(), s3request.Target{Bucket: "bucket", Key: "object.bin"})
+
+	if err == nil {
+		t.Fatal("invalidateObject() error = nil, want failed peer error")
+	}
+	if successfulInvalidations != 1 {
+		t.Fatalf("successful peer invalidations = %d, want 1", successfulInvalidations)
+	}
+	if ready, reason := p.Readiness(); ready || !strings.Contains(reason, "peer invalidation") {
+		t.Fatalf("Readiness() = (%v, %q), want peer invalidation degradation", ready, reason)
+	}
 }
 
 func TestProxyDoesNotInvalidateCachedObjectAfterFailedWrite(t *testing.T) {
@@ -2035,8 +2195,9 @@ func TestProxyPeerModeForwardsRemoteOwnerRequest(t *testing.T) {
 }
 
 func TestProxyPeerModeHandlesLocalOwnerRequestLocally(t *testing.T) {
+	var invalidations int
 	peer := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
-		t.Fatal("peer should not receive locally owned request")
+		invalidations++
 	}))
 	defer peer.Close()
 
@@ -2066,6 +2227,9 @@ func TestProxyPeerModeHandlesLocalOwnerRequestLocally(t *testing.T) {
 	}
 	if upstreamRequests != 1 {
 		t.Fatalf("upstream requests = %d, want 1", upstreamRequests)
+	}
+	if invalidations != 1 {
+		t.Fatalf("peer invalidations = %d, want 1", invalidations)
 	}
 	metricsBody := renderProxyMetrics(t, p.metrics)
 	if !strings.Contains(metricsBody, `simple_s3_cache_peer_owner_decisions_total{bucket="bucket",decision="local",owner_id="cache-0"} 1`) {
@@ -3207,6 +3371,7 @@ func testProxyWithPageSize(t *testing.T, endpoint string, pageSize int64) *Proxy
 			maxSpoolSize: 10 << 30,
 		},
 		metrics:      recorder,
+		peerClient:   http.DefaultClient,
 		readSharding: readShardingAuto,
 		pageShardMin: 2,
 	}
@@ -3288,6 +3453,10 @@ func (c invalidationFailingCache) DeleteObject(context.Context, string, string) 
 	return errors.New("invalidation failed")
 }
 
+func (c invalidationFailingCache) InvalidateObject(context.Context, string, string, int64) (int64, error) {
+	return 0, errors.New("invalidation failed")
+}
+
 type beginPageWriteFailingCache struct {
 	cacheStore
 }
@@ -3314,6 +3483,11 @@ func (c *cacheTouchCountingCache) GetObject(ctx context.Context, bucket, key str
 func (c *cacheTouchCountingCache) DeleteObject(ctx context.Context, bucket, key string) error {
 	c.calls.Add(1)
 	return c.cacheStore.DeleteObject(ctx, bucket, key)
+}
+
+func (c *cacheTouchCountingCache) InvalidateObject(ctx context.Context, bucket, key string, minEpoch int64) (int64, error) {
+	c.calls.Add(1)
+	return c.cacheStore.InvalidateObject(ctx, bucket, key, minEpoch)
 }
 
 func (c *cacheTouchCountingCache) StorePage(ctx context.Context, write cache.PageWrite) (cache.Page, error) {
