@@ -523,17 +523,21 @@ protect it with Kubernetes networking controls appropriate for the cluster.
 
 ## Kubernetes / Helm
 
-A Helm chart is available at `charts/simple-s3-cache`. It supports all three
+A Helm chart is available at `charts/simple-s3-cache`. It supports these
 deployment topologies:
 
 * `topology: single` for the default one-pod cache deployment.
 * `topology: peer` for direct peer mode behind a cache Service.
 * `topology: gateway` for stateless gateway pods routing directly to owner cache
   peers.
+* `topology: external-gateway` for gateway-only deployments that route to cache
+  peers in another cluster.
 
-The chart generates stable StatefulSet peer IDs and DNS names, renders
-`peer.local_id` from each cache pod's `HOSTNAME`, and can use either an existing
-upstream credential Secret or chart-managed test credentials. See
+For cache deployments, the chart generates stable StatefulSet peer IDs and DNS
+names, renders `peer.local_id` from each cache pod's `HOSTNAME`, and can use
+either an existing upstream credential Secret or chart-managed test credentials.
+For external gateway deployments, provide explicit `gateway.externalPeers` with
+peer IDs that exactly match the storage-cluster cache peers. See
 `charts/simple-s3-cache/README.md` and the example values files under
 `charts/simple-s3-cache/examples`.
 

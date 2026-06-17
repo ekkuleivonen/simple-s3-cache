@@ -1,4 +1,4 @@
-{{- if eq (include "simple-s3-cache.topology" .) "gateway" }}
+{{- if eq (include "simple-s3-cache.gatewayEnabled" .) "true" }}
 apiVersion: v1
 kind: Service
 metadata:

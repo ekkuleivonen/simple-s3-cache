@@ -1,4 +1,4 @@
-{{- if eq (include "simple-s3-cache.topology" .) "gateway" }}
+{{- if eq (include "simple-s3-cache.gatewayEnabled" .) "true" }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -20,9 +20,5 @@ data:
       mode: peer
       forward_timeout: {{ .Values.peer.forwardTimeout }}
       peers:
-      {{ $replicas := int (include "simple-s3-cache.cacheReplicas" .) }}
-      {{ range $i := until $replicas }}
-        - id: {{ include "simple-s3-cache.fullname" $ }}-{{ $i }}
-          url: {{ include "simple-s3-cache.peerURL" (list $ $i) }}
-      {{ end }}
+{{ include "simple-s3-cache.gatewayPeerList" . }}
 {{- end }}

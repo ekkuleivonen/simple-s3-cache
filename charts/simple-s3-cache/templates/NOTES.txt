@@ -1,6 +1,6 @@
 simple-s3-cache has been installed in {{ include "simple-s3-cache.topology" . }} topology.
 
-{{- if eq (include "simple-s3-cache.topology" .) "gateway" }}
+{{- if eq (include "simple-s3-cache.gatewayEnabled" .) "true" }}
 Use the gateway Service for client S3 traffic:
   {{ include "simple-s3-cache.fullname" . }}-gateway.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.gateway.service.port }}
 {{- else }}
@@ -8,6 +8,7 @@ Use the cache Service for client S3 traffic:
   {{ include "simple-s3-cache.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.cacheService.port }}
 {{- end }}
 
+{{- if eq (include "simple-s3-cache.cacheEnabled" .) "true" }}
 Peer DNS names are generated from the StatefulSet:
 {{- $replicas := int (include "simple-s3-cache.cacheReplicas" .) }}
 {{- range $i := until $replicas }}
@@ -15,3 +16,11 @@ Peer DNS names are generated from the StatefulSet:
 {{- end }}
 
 Keep peer replica count and peer DNS names stable during peer and gateway rollouts.
+{{- else }}
+External gateway peer URLs:
+{{- range .Values.gateway.externalPeers }}
+  - {{ .id }} -> {{ .url }}
+{{- end }}
+
+Keep gateway.externalPeers aligned with the storage-cluster peer list.
+{{- end }}

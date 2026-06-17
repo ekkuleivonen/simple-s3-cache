@@ -1,7 +1,8 @@
 # Supported topologies:
 # - single: one cache pod, no peer routing.
 # - peer: multiple cache peers behind the cache Service.
-# - gateway: stateless gateway Deployment routing directly to cache owners.
+# - gateway: same-cluster cache peers plus gateway routing directly to owners.
+# - external-gateway: gateway only, routing to cache peers deployed elsewhere.
 topology: single
 
 replicaCount: 1
@@ -74,6 +75,12 @@ peerService:
 
 gateway:
   replicaCount: 2
+  # Used by external-gateway topology, and as an optional peer URL override for
+  # gateway topology. IDs must exactly match the cache peers' peer.local_id
+  # values because IDs are part of the rendezvous hash ring.
+  externalPeers: []
+  # - id: simple-s3-cache-0
+  #   url: http://cache-0.storage.example.internal:8080
   service:
     type: ClusterIP
     port: 8080

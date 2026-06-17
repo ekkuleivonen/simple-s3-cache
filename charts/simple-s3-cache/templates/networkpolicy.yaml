@@ -1,4 +1,5 @@
 {{- if .Values.networkPolicy.enabled }}
+{{- if eq (include "simple-s3-cache.cacheEnabled" .) "true" }}
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -54,8 +55,11 @@ spec:
           port: 53
     {{- end }}
     {{- end }}
+{{- end }}
+{{- if and (eq (include "simple-s3-cache.cacheEnabled" .) "true") (eq (include "simple-s3-cache.gatewayEnabled" .) "true") }}
 ---
-{{- if eq (include "simple-s3-cache.topology" .) "gateway" }}
+{{- end }}
+{{- if eq (include "simple-s3-cache.gatewayEnabled" .) "true" }}
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
