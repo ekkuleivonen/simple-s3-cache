@@ -594,16 +594,16 @@ Defaults should be boring:
 
 ### Milestone 5: Versioned Page Frame Protocol
 
-- [ ] Define page response protocol version.
-- [ ] Define frame fields:
-  - [ ] page index;
-  - [ ] byte length;
-  - [ ] page bytes;
-  - [ ] end-of-stream marker or equivalent.
-- [ ] Define behavior for duplicate, unexpected, truncated, oversized, and
+- [x] Define page response protocol version.
+- [x] Define frame fields:
+  - [x] page index;
+  - [x] byte length;
+  - [x] page bytes;
+  - [x] end-of-stream marker or equivalent.
+- [x] Define behavior for duplicate, unexpected, truncated, oversized, and
   out-of-order frames.
-- [ ] Define cancellation and backpressure behavior.
-- [ ] Add corruption/truncation tests before using the protocol in the read path.
+- [x] Define cancellation and backpressure behavior.
+- [x] Add corruption/truncation tests before using the protocol in the read path.
 
 ### Milestone 6: Page Owner Read Endpoint
 
