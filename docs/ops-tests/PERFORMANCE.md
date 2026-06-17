@@ -15,7 +15,8 @@ The key claim to validate:
 
 ## Setup
 
-Deploy the same cache version, image/tag `v0.0.2`, in these configurations:
+Deploy the same cache version, image tag
+`ghcr.io/ekkuleivonen/simple-s3-cache:0.0.2`, in these configurations:
 
 1. `single` baseline, one cache pod.
 2. `peer` with `peer.read_sharding: object`.

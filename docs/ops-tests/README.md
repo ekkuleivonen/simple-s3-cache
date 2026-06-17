@@ -1,7 +1,8 @@
 # OPS Test Pack For v0.0.2
 
-These notes are for validating the v2 distributed peer mode from image/tag
-`v0.0.2` in a storage-cluster deployment.
+These notes are for validating the v2 distributed peer mode from Git tag
+`v0.0.2` and image tag `ghcr.io/ekkuleivonen/simple-s3-cache:0.0.2` in a
+storage-cluster deployment.
 
 The goal is not to prove every unit-level invariant. The goal is to confirm that
 the deployed system behaves correctly under realistic compute-cluster traffic,

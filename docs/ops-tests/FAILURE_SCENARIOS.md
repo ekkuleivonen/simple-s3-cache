@@ -17,7 +17,8 @@ The key claim to validate:
 
 ## Setup
 
-Deploy peer mode with image/tag `v0.0.2`:
+Deploy peer mode with image tag
+`ghcr.io/ekkuleivonen/simple-s3-cache:0.0.2`:
 
 ```yaml
 peer:
