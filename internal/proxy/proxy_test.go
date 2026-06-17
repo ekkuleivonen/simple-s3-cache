@@ -3431,6 +3431,122 @@ func TestProxyCoordinatorPageReadServesSingleRemotePage(t *testing.T) {
 	}
 }
 
+func TestProxyCoordinatorPageReadLogsPeerStatusBody(t *testing.T) {
+	body := []byte("abcd")
+	peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = decodeInternalPageReadRequest(t, r)
+		http.Error(w, "object epoch mismatch: local 2 request 1", http.StatusConflict)
+	}))
+	defer peer.Close()
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+			w.Header().Set("ETag", `"etag-status-body"`)
+			w.WriteHeader(http.StatusOK)
+		case http.MethodGet:
+			w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+			w.Header().Set("ETag", `"etag-status-body"`)
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(body)
+		default:
+			t.Fatalf("upstream method = %q, want HEAD or GET", r.Method)
+		}
+	}))
+	defer upstream.Close()
+
+	var logs bytes.Buffer
+	p := testProxyWithPageSize(t, upstream.URL, 4)
+	p.logger = slog.New(slog.NewJSONHandler(&logs, nil))
+	p.readSharding = readShardingPage
+	router := enablePeerMode(t, p, "cache-0", []peerrouter.Peer{
+		{ID: "cache-0", URL: "http://cache-0.invalid"},
+		{ID: "cache-1", URL: peer.URL},
+	})
+	key := keyWithPageOwners(t, router, "bucket", []string{"cache-1"})
+	req := httptest.NewRequest(http.MethodGet, "/bucket/"+key, nil)
+	rec := httptest.NewRecorder()
+
+	p.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 fallback; body=%q", rec.Code, rec.Body.String())
+	}
+	for _, want := range []string{
+		`"msg":"distributed page read falling back to upstream pass-through"`,
+		`"peer_status":409`,
+		`"peer_response_body":"object epoch mismatch: local 2 request 1\n"`,
+		`"fallback_reason":"status"`,
+	} {
+		if !strings.Contains(logs.String(), want) {
+			t.Fatalf("logs missing %q:\n%s", want, logs.String())
+		}
+	}
+}
+
+func TestProxyCoordinatorPageReadClassifiesPeerClientCancel(t *testing.T) {
+	body := []byte("abcd")
+	peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = decodeInternalPageReadRequest(t, r)
+		http.Error(w, "context canceled", http.StatusBadGateway)
+	}))
+	defer peer.Close()
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+			w.Header().Set("ETag", `"etag-client-cancel"`)
+			w.WriteHeader(http.StatusOK)
+		case http.MethodGet:
+			w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+			w.Header().Set("ETag", `"etag-client-cancel"`)
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(body)
+		default:
+			t.Fatalf("upstream method = %q, want HEAD or GET", r.Method)
+		}
+	}))
+	defer upstream.Close()
+
+	var logs bytes.Buffer
+	p := testProxyWithPageSize(t, upstream.URL, 4)
+	p.logger = slog.New(slog.NewJSONHandler(&logs, nil))
+	p.readSharding = readShardingPage
+	router := enablePeerMode(t, p, "cache-0", []peerrouter.Peer{
+		{ID: "cache-0", URL: "http://cache-0.invalid"},
+		{ID: "cache-1", URL: peer.URL},
+	})
+	key := keyWithPageOwners(t, router, "bucket", []string{"cache-1"})
+	req := httptest.NewRequest(http.MethodGet, "/bucket/"+key, nil)
+	rec := httptest.NewRecorder()
+
+	p.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 fallback; body=%q", rec.Code, rec.Body.String())
+	}
+	for _, want := range []string{
+		`"level":"INFO"`,
+		`"msg":"distributed page read falling back to upstream pass-through"`,
+		`"fallback_reason":"client_cancel"`,
+		`"peer_status":502`,
+		`"peer_response_body":"context canceled\n"`,
+	} {
+		if !strings.Contains(logs.String(), want) {
+			t.Fatalf("logs missing %q:\n%s", want, logs.String())
+		}
+	}
+	metricsBody := renderProxyMetrics(t, p.metrics)
+	if !strings.Contains(metricsBody, `simple_s3_cache_peer_read_fallbacks_total{bucket="bucket",peer_id="cache-1",reason="client_cancel"} 1`) {
+		t.Fatalf("metrics missing client-cancel fallback:\n%s", metricsBody)
+	}
+	if strings.Contains(metricsBody, `simple_s3_cache_internal_peer_request_failures_total{bucket="bucket",peer_id="cache-1",reason="client_cancel"}`) {
+		t.Fatalf("client cancel counted as peer request failure:\n%s", metricsBody)
+	}
+}
+
 func TestProxyCoordinatorPageReadKeepsRemoteStreamContextAlive(t *testing.T) {
 	body := []byte("abcd")
 	headerReady := make(chan struct{})

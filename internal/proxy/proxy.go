@@ -75,6 +75,8 @@ const (
 
 const internalIdentityMetadataHeader = "X-Simple-S3-Cache-Internal-Identity"
 
+const statusClientClosedRequest = 499
+
 var (
 	errObjectChanged             = errors.New("cached object changed upstream")
 	errMetadataStore             = errors.New("cache metadata store failed")
@@ -674,6 +676,9 @@ func (p *Proxy) serveInternalPageRead(w http.ResponseWriter, r *http.Request) {
 	for _, pageIndex := range req.Pages {
 		if !p.peerRouter.IsLocalPageOwner(req.Bucket, req.Key, pageIndex) {
 			status = http.StatusConflict
+			p.logInternalPageReadFailure(r.Context(), req, status, "page_owner_mismatch", errors.New("page is not owned by local peer"),
+				slog.Int64("page_index", pageIndex),
+			)
 			http.Error(w, "page is not owned by local peer", http.StatusConflict)
 			return
 		}
@@ -682,6 +687,11 @@ func (p *Proxy) serveInternalPageRead(w http.ResponseWriter, r *http.Request) {
 	target := s3request.Target{Bucket: req.Bucket, Key: req.Key}
 	obj, status, err := p.internalPageReadObject(r.Context(), req)
 	if err != nil {
+		reason := "object_identity"
+		if status >= http.StatusInternalServerError {
+			reason = "metadata"
+		}
+		p.logInternalPageReadFailure(r.Context(), req, status, reason, err)
 		http.Error(w, err.Error(), status)
 		return
 	}
@@ -708,8 +718,14 @@ func (p *Proxy) serveInternalPageRead(w http.ResponseWriter, r *http.Request) {
 		body, ok, err := p.openCachedPage(r.Context(), target, obj, pageIndex, stats, true)
 		if err != nil {
 			status = http.StatusInternalServerError
+			if isClientCancelError(err) {
+				status = statusClientClosedRequest
+			}
+			p.logInternalPageReadFailure(r.Context(), req, status, "cache_page_open", err,
+				slog.Int64("page_index", pageIndex),
+			)
 			if !responseCommitted {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
+				http.Error(w, err.Error(), status)
 			}
 			return
 		}
@@ -726,30 +742,33 @@ func (p *Proxy) serveInternalPageRead(w http.ResponseWriter, r *http.Request) {
 			writer, err := ensureFrameWriter()
 			if err != nil {
 				_ = body.Close()
-				p.logger.WarnContext(r.Context(), "write internal page frame header failed",
-					slog.String("bucket", req.Bucket),
-					slog.String("key", req.Key),
-					slog.String("error", err.Error()),
+				status = http.StatusInternalServerError
+				if isClientCancelError(err) {
+					status = statusClientClosedRequest
+				}
+				p.logInternalPageReadFailure(r.Context(), req, status, "frame_header", err,
+					slog.Int64("page_index", pageIndex),
 				)
 				return
 			}
 			if err := writer.WritePageFrom(pageIndex, size, body); err != nil {
 				_ = body.Close()
-				p.logger.WarnContext(r.Context(), "write internal page frame failed",
-					slog.String("bucket", req.Bucket),
-					slog.String("key", req.Key),
+				status = http.StatusInternalServerError
+				if isClientCancelError(err) {
+					status = statusClientClosedRequest
+				}
+				p.logInternalPageReadFailure(r.Context(), req, status, "frame_write", err,
 					slog.Int64("page_index", pageIndex),
-					slog.String("error", err.Error()),
 				)
 				return
 			}
 			if err := body.Close(); err != nil {
 				status = http.StatusInternalServerError
-				p.logger.WarnContext(r.Context(), "close internal cached page failed",
-					slog.String("bucket", req.Bucket),
-					slog.String("key", req.Key),
+				if isClientCancelError(err) {
+					status = statusClientClosedRequest
+				}
+				p.logInternalPageReadFailure(r.Context(), req, status, "cache_page_close", err,
 					slog.Int64("page_index", pageIndex),
-					slog.String("error", err.Error()),
 				)
 				return
 			}
@@ -780,8 +799,21 @@ func (p *Proxy) serveInternalPageRead(w http.ResponseWriter, r *http.Request) {
 				}
 				return
 			}
+			if isClientCancelError(err) {
+				status = statusClientClosedRequest
+				p.logInternalPageReadFailure(r.Context(), req, status, "client_cancel", err,
+					slog.Int64("page_index", pageIndex),
+				)
+				if !responseCommitted {
+					http.Error(w, "client canceled internal page read", statusClientClosedRequest)
+				}
+				return
+			}
 			if err != nil {
 				status = http.StatusBadGateway
+				p.logInternalPageReadFailure(r.Context(), req, status, "page_fill", err,
+					slog.Int64("page_index", pageIndex),
+				)
 				if !responseCommitted {
 					http.Error(w, err.Error(), http.StatusBadGateway)
 				}
@@ -803,20 +835,20 @@ func (p *Proxy) serveInternalPageRead(w http.ResponseWriter, r *http.Request) {
 	}
 	if frameWriter == nil {
 		if _, err := ensureFrameWriter(); err != nil {
-			p.logger.WarnContext(r.Context(), "write internal page frame header failed",
-				slog.String("bucket", req.Bucket),
-				slog.String("key", req.Key),
-				slog.String("error", err.Error()),
-			)
+			status = http.StatusInternalServerError
+			if isClientCancelError(err) {
+				status = statusClientClosedRequest
+			}
+			p.logInternalPageReadFailure(r.Context(), req, status, "frame_header", err)
 			return
 		}
 	}
 	if err := frameWriter.WriteEnd(); err != nil {
-		p.logger.WarnContext(r.Context(), "write internal page frame end failed",
-			slog.String("bucket", req.Bucket),
-			slog.String("key", req.Key),
-			slog.String("error", err.Error()),
-		)
+		status = http.StatusInternalServerError
+		if isClientCancelError(err) {
+			status = statusClientClosedRequest
+		}
+		p.logInternalPageReadFailure(r.Context(), req, status, "frame_end", err)
 	}
 	if p.internalPeerSuccessLog {
 		p.logger.InfoContext(r.Context(), "internal page read served",
@@ -2690,9 +2722,21 @@ func (p *Proxy) openRemoteCoordinatorPageBatch(r *http.Request, target s3request
 		if cancel != nil {
 			defer cancel()
 		}
-		err := fmt.Errorf("peer %s page read returned status %d", batch.owner.ID, resp.StatusCode)
-		p.recordPeerReadFallback(r.Context(), target, batch.owner.ID, "status", err)
-		stats.fallbackReason = "peer_status"
+		bodySample, readErr := readCappedBody(resp.Body, upstreamErrorBodyLogLimit)
+		reason := "status"
+		if resp.StatusCode == statusClientClosedRequest || isClientCancelText(bodySample) {
+			reason = "client_cancel"
+		}
+		err := fmt.Errorf("peer %s page read returned status %d: %s", batch.owner.ID, resp.StatusCode, strings.TrimSpace(bodySample))
+		attrs := []slog.Attr{
+			slog.Int("peer_status", resp.StatusCode),
+			slog.String("peer_response_body", bodySample),
+		}
+		if readErr != nil {
+			attrs = append(attrs, slog.String("peer_response_body_read_error", readErr.Error()))
+		}
+		p.recordPeerReadFallback(r.Context(), target, batch.owner.ID, reason, err, attrs...)
+		stats.fallbackReason = "peer_" + reason
 		return err
 	}
 	if got := resp.Header.Get("Content-Type"); !strings.HasPrefix(got, peerrouter.PageFrameContentType) {
@@ -2721,18 +2765,25 @@ func (p *Proxy) openRemoteCoordinatorPageBatch(r *http.Request, target s3request
 	return nil
 }
 
-func (p *Proxy) recordPeerReadFallback(ctx context.Context, target s3request.Target, peerID, reason string, err error) {
+func (p *Proxy) recordPeerReadFallback(ctx context.Context, target s3request.Target, peerID, reason string, err error, attrs ...slog.Attr) {
 	if p.metrics != nil {
 		p.metrics.RecordPeerReadFallback(target.Bucket, peerID, reason)
-		p.metrics.RecordInternalPeerRequestFailure(target.Bucket, peerID, reason)
+		if reason != "client_cancel" {
+			p.metrics.RecordInternalPeerRequestFailure(target.Bucket, peerID, reason)
+		}
 	}
-	p.logger.WarnContext(ctx, "distributed page read falling back to upstream pass-through",
+	attrs = append([]slog.Attr{
 		slog.String("bucket", target.Bucket),
 		slog.String("key", target.Key),
 		slog.String("peer_id", peerID),
 		slog.String("fallback_reason", reason),
 		slog.String("error", err.Error()),
-	)
+	}, attrs...)
+	level := slog.LevelWarn
+	if reason == "client_cancel" {
+		level = slog.LevelInfo
+	}
+	p.logger.LogAttrs(ctx, level, "distributed page read falling back to upstream pass-through", attrs...)
 }
 
 func closeCoordinatorPageBatches(batches map[string]*coordinatorPageBatch) {
@@ -3686,6 +3737,47 @@ func readCappedBody(body io.Reader, limit int64) (string, error) {
 		return "", err
 	}
 	return string(data), nil
+}
+
+func (p *Proxy) logInternalPageReadFailure(ctx context.Context, req internalPageReadRequest, status int, reason string, err error, attrs ...slog.Attr) {
+	if err == nil {
+		return
+	}
+	attrs = append([]slog.Attr{
+		slog.String("page_owner_id", p.localPeerID()),
+		slog.String("bucket", req.Bucket),
+		slog.String("key", req.Key),
+		slog.Any("page_indexes", req.Pages),
+		slog.String("etag", req.ETag),
+		slog.Int64("epoch", req.Epoch),
+		slog.Int("status", status),
+		slog.String("reason", reason),
+		slog.String("error", err.Error()),
+	}, attrs...)
+	level := slog.LevelWarn
+	if status == statusClientClosedRequest || isClientCancelError(err) {
+		level = slog.LevelInfo
+	}
+	p.logger.LogAttrs(ctx, level, "internal page read failed", attrs...)
+}
+
+func isClientCancelError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, net.ErrClosed) {
+		return true
+	}
+	return isClientCancelText(err.Error())
+}
+
+func isClientCancelText(text string) bool {
+	text = strings.ToLower(text)
+	return strings.Contains(text, "context canceled") ||
+		strings.Contains(text, "broken pipe") ||
+		strings.Contains(text, "connection reset by peer") ||
+		strings.Contains(text, "client disconnected") ||
+		strings.Contains(text, "use of closed network connection")
 }
 
 func writeCachedObjectHeaders(dst http.Header, obj cache.Object, rangeResponse bool) {
