@@ -678,15 +678,15 @@ Defaults should be boring:
 
 ### Milestone 10: Observability
 
-- [ ] Add coordinator request metrics by method, bucket, strategy, and status.
-- [ ] Add page-owner request metrics by bucket, owner peer, and status.
-- [ ] Add page bytes served by page owner.
-- [ ] Add upstream fill bytes by page owner.
-- [ ] Add internal peer requests per client request.
-- [ ] Add page batch size metrics.
-- [ ] Add fill coalescing metrics.
-- [ ] Add invalidation broadcast success/failure metrics by peer.
-- [ ] Add structured logs with coordinator ID, page owner ID, ring ID, bucket,
+- [x] Add coordinator request metrics by method, bucket, strategy, and status.
+- [x] Add page-owner request metrics by bucket, owner peer, and status.
+- [x] Add page bytes served by page owner.
+- [x] Add upstream fill bytes by page owner.
+- [x] Add internal peer requests per client request.
+- [x] Add page batch size metrics.
+- [x] Add fill coalescing metrics.
+- [x] Add invalidation broadcast success/failure metrics by peer.
+- [x] Add structured logs with coordinator ID, page owner ID, ring ID, bucket,
   key, page indexes, ETag, epoch, and fallback/degraded reason.
 
 ### Milestone 11: Performance Proof

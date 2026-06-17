@@ -1184,10 +1184,20 @@ func TestProxyRecordsRangeMetricsAndStructuredLogFields(t *testing.T) {
 		"configured_read_sharding": "auto",
 		"effective_page_size":      float64(4),
 		"object_page_count":        float64(3),
+		"coordinator_id":           "cache-0",
+		"etag":                     `"etag-observe"`,
+		"epoch":                    float64(0),
+		"internal_peer_requests":   float64(0),
 	} {
 		if entry[key] != want {
 			t.Fatalf("log field %s = %#v, want %#v\nentry=%#v", key, entry[key], want, entry)
 		}
+	}
+	if got, ok := entry["page_indexes"].([]any); !ok || len(got) != 2 || got[0] != float64(0) || got[1] != float64(1) {
+		t.Fatalf("page_indexes = %#v, want [0 1]", entry["page_indexes"])
+	}
+	if got, ok := entry["page_owner_ids"].([]any); !ok || len(got) != 2 || got[0] != "cache-0" || got[1] != "cache-0" {
+		t.Fatalf("page_owner_ids = %#v, want [cache-0 cache-0]", entry["page_owner_ids"])
 	}
 	if got, ok := entry["read_amplification"].(float64); !ok || got < 1.33 || got > 1.34 {
 		t.Fatalf("read_amplification = %#v, want about 1.333", entry["read_amplification"])
@@ -1201,6 +1211,9 @@ func TestProxyRecordsRangeMetricsAndStructuredLogFields(t *testing.T) {
 		`simple_s3_cache_pages_touched_sum{bucket="photos"} 2`,
 		`simple_s3_cache_read_amplification_sum{bucket="photos"} 1.333`,
 		`simple_s3_cache_read_strategy_selected_total{bucket="photos",strategy="page"} 1`,
+		`simple_s3_cache_coordinator_requests_total{bucket="photos",method="GET",strategy="page",status_class="2xx"} 1`,
+		`simple_s3_cache_internal_peer_requests_per_client_request_sum{bucket="photos",strategy="page"} 0`,
+		`simple_s3_cache_page_batch_size_sum{bucket="photos",owner_id="cache-0"} 2`,
 	} {
 		if !bytes.Contains([]byte(metricsBody), []byte(want)) {
 			t.Fatalf("metrics body missing %q:\n%s", want, metricsBody)
@@ -1859,6 +1872,9 @@ func TestProxyDoesNotFailSuccessfulWriteWhenInvalidationFails(t *testing.T) {
 
 	p := testProxy(t, upstream.URL)
 	p.cache = invalidationFailingCache{cacheStore: p.cache}
+	enablePeerMode(t, p, "cache-0", []peerrouter.Peer{
+		{ID: "cache-0", URL: "http://cache-0.invalid"},
+	})
 	req := httptest.NewRequest(http.MethodPut, "/bucket/object.bin", bytes.NewReader([]byte("new body")))
 	rec := httptest.NewRecorder()
 
@@ -1881,6 +1897,9 @@ func TestProxyDoesNotFailSuccessfulWriteWhenInvalidationFails(t *testing.T) {
 	metricsBody := renderProxyMetrics(t, p.metrics)
 	if !strings.Contains(metricsBody, `simple_s3_cache_degraded{reason="write invalidation failed"} 1`) {
 		t.Fatalf("metrics missing degraded reason:\n%s", metricsBody)
+	}
+	if !strings.Contains(metricsBody, `simple_s3_cache_invalidation_broadcasts_total{bucket="bucket",peer_id="cache-0",status="failure"} 1`) {
+		t.Fatalf("metrics missing local invalidation failure:\n%s", metricsBody)
 	}
 }
 
@@ -1967,6 +1986,10 @@ func TestProxyBroadcastsInvalidationAfterSuccessfulWrite(t *testing.T) {
 	if refreshed.Epoch <= oldObj.Epoch {
 		t.Fatalf("refreshed epoch = %d, want greater than old epoch %d", refreshed.Epoch, oldObj.Epoch)
 	}
+	metricsBody := renderProxyMetrics(t, owner.metrics)
+	if !strings.Contains(metricsBody, `simple_s3_cache_invalidation_broadcasts_total{bucket="bucket",peer_id="cache-1",status="success"} 1`) {
+		t.Fatalf("metrics missing owner local invalidation success:\n%s", metricsBody)
+	}
 }
 
 func TestProxyMarksNotReadyWhenPeerInvalidationFails(t *testing.T) {
@@ -1999,6 +2022,10 @@ func TestProxyMarksNotReadyWhenPeerInvalidationFails(t *testing.T) {
 	}
 	if ready, reason := p.Readiness(); ready || !strings.Contains(reason, "peer invalidation") {
 		t.Fatalf("Readiness() = (%v, %q), want peer invalidation degradation", ready, reason)
+	}
+	metricsBody := renderProxyMetrics(t, p.metrics)
+	if !strings.Contains(metricsBody, `simple_s3_cache_invalidation_broadcasts_total{bucket="bucket",peer_id="cache-1",status="failure"} 1`) {
+		t.Fatalf("metrics missing failed invalidation broadcast:\n%s", metricsBody)
 	}
 }
 
@@ -2038,6 +2065,16 @@ func TestProxyBroadcastsInvalidationToAllPeersAfterFailure(t *testing.T) {
 	}
 	if ready, reason := p.Readiness(); ready || !strings.Contains(reason, "peer invalidation") {
 		t.Fatalf("Readiness() = (%v, %q), want peer invalidation degradation", ready, reason)
+	}
+	metricsBody := renderProxyMetrics(t, p.metrics)
+	for _, want := range []string{
+		`simple_s3_cache_invalidation_broadcasts_total{bucket="bucket",peer_id="cache-0",status="success"} 1`,
+		`simple_s3_cache_invalidation_broadcasts_total{bucket="bucket",peer_id="cache-1",status="failure"} 1`,
+		`simple_s3_cache_invalidation_broadcasts_total{bucket="bucket",peer_id="cache-2",status="success"} 1`,
+	} {
+		if !strings.Contains(metricsBody, want) {
+			t.Fatalf("metrics missing %q:\n%s", want, metricsBody)
+		}
 	}
 }
 
@@ -2487,6 +2524,15 @@ func TestProxyInternalPageReadServesCachedPages(t *testing.T) {
 		t.Fatalf("Content-Type = %q, want %q", got, peerrouter.PageFrameContentType)
 	}
 	assertPageFrames(t, rec.Body, []int64{0, 1}, [][]byte{[]byte("abcd"), []byte("efgh")}, 4)
+	metricsBody := renderProxyMetrics(t, p.metrics)
+	for _, want := range []string{
+		`simple_s3_cache_page_owner_requests_total{bucket="bucket",owner_id="cache-0",status_class="2xx"} 1`,
+		`simple_s3_cache_page_owner_bytes_served_total{bucket="bucket",owner_id="cache-0"} 8`,
+	} {
+		if !strings.Contains(metricsBody, want) {
+			t.Fatalf("metrics missing %q:\n%s", want, metricsBody)
+		}
+	}
 }
 
 func TestProxyInternalPageReadFillsMissingPage(t *testing.T) {
@@ -2539,6 +2585,16 @@ func TestProxyInternalPageReadFillsMissingPage(t *testing.T) {
 	wantRequests := []string{`GET /bucket/path%20with%20spaces/plus+and%2525.bin bytes=4-7 "etag-fill"`}
 	if !equalStringSlices(upstreamRequests, wantRequests) {
 		t.Fatalf("upstream requests = %q, want %q", upstreamRequests, wantRequests)
+	}
+	metricsBody := renderProxyMetrics(t, p.metrics)
+	for _, want := range []string{
+		`simple_s3_cache_page_owner_requests_total{bucket="bucket",owner_id="cache-0",status_class="2xx"} 1`,
+		`simple_s3_cache_page_owner_bytes_served_total{bucket="bucket",owner_id="cache-0"} 4`,
+		`simple_s3_cache_page_owner_upstream_fill_bytes_total{bucket="bucket",owner_id="cache-0"} 4`,
+	} {
+		if !strings.Contains(metricsBody, want) {
+			t.Fatalf("metrics missing %q:\n%s", want, metricsBody)
+		}
 	}
 }
 
@@ -2752,6 +2808,10 @@ func TestProxyInternalPageReadCoalescesConcurrentMisses(t *testing.T) {
 	if got := fillRequests.Load(); got != 1 {
 		t.Fatalf("upstream fill requests = %d, want 1", got)
 	}
+	metricsBody := renderProxyMetrics(t, p.metrics)
+	if !strings.Contains(metricsBody, `simple_s3_cache_fill_coalesced_total{bucket="bucket",result="hit"} 1`) {
+		t.Fatalf("metrics missing coalesced fill hit:\n%s", metricsBody)
+	}
 }
 
 func TestProxyInternalPageReadReturnsBadGatewayOnUpstreamFailure(t *testing.T) {
@@ -2852,6 +2912,16 @@ func TestProxyCoordinatorPageReadServesSingleRemotePage(t *testing.T) {
 	if got := peerRequests[0].Pages; !equalInt64Slices(got, []int64{0}) {
 		t.Fatalf("peer request pages = %v, want [0]", got)
 	}
+	metricsBody := renderProxyMetrics(t, p.metrics)
+	for _, want := range []string{
+		`simple_s3_cache_coordinator_requests_total{bucket="bucket",method="GET",strategy="page",status_class="2xx"} 1`,
+		`simple_s3_cache_internal_peer_requests_per_client_request_sum{bucket="bucket",strategy="page"} 1`,
+		`simple_s3_cache_page_batch_size_sum{bucket="bucket",owner_id="cache-1"} 1`,
+	} {
+		if !strings.Contains(metricsBody, want) {
+			t.Fatalf("metrics missing %q:\n%s", want, metricsBody)
+		}
+	}
 }
 
 func TestProxyCoordinatorPageReadBatchesByOwnerAndStreamsInOrder(t *testing.T) {
@@ -2921,6 +2991,16 @@ func TestProxyCoordinatorPageReadBatchesByOwnerAndStreamsInOrder(t *testing.T) {
 	}
 	if got := peerRequests["cache-2"]; len(got) != 1 || !equalInt64Slices(got[0].Pages, []int64{1}) {
 		t.Fatalf("cache-2 requests = %+v, want one batch pages [1]", got)
+	}
+	metricsBody := renderProxyMetrics(t, p.metrics)
+	for _, want := range []string{
+		`simple_s3_cache_internal_peer_requests_per_client_request_sum{bucket="bucket",strategy="page"} 2`,
+		`simple_s3_cache_page_batch_size_sum{bucket="bucket",owner_id="cache-1"} 2`,
+		`simple_s3_cache_page_batch_size_sum{bucket="bucket",owner_id="cache-2"} 1`,
+	} {
+		if !strings.Contains(metricsBody, want) {
+			t.Fatalf("metrics missing %q:\n%s", want, metricsBody)
+		}
 	}
 }
 

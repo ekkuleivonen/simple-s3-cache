@@ -22,6 +22,12 @@ func TestRecorderRendersGlobalAndBucketMetrics(t *testing.T) {
 	recorder.RecordReadStrategy("photos", "page")
 	recorder.RecordPeerForward("photos", "cache-1", http.MethodGet, "2xx")
 	recorder.RecordPeerForwardFailure("photos", "cache-1", "request_failed")
+	recorder.RecordCoordinatorRequest("photos", http.MethodGet, "page", "2xx")
+	recorder.RecordPageOwnerRequest("photos", "cache-1", "2xx")
+	recorder.RecordPageOwnerBytesServed("photos", "cache-1", 34)
+	recorder.RecordPageOwnerUpstreamFillBytes("photos", "cache-1", 13)
+	recorder.RecordInvalidationBroadcast("photos", "cache-1", "success")
+	recorder.RecordFillCoalesced("photos", "hit")
 	recorder.RecordPeerForwardResponseBytes("photos", "cache-1", 13)
 	recorder.RecordGatewayRequest("photos", "owner", "cache-1", http.MethodGet, "2xx")
 	recorder.RecordGatewayForwardFailure("photos", "cache-1", "request_failed")
@@ -42,6 +48,8 @@ func TestRecorderRendersGlobalAndBucketMetrics(t *testing.T) {
 	recorder.ObservePeerResponseCopyDuration("photos", "cache-1", "2xx", 3*time.Millisecond)
 	recorder.ObservePeerResponseBodyReadDuration("photos", "cache-1", "2xx", time.Millisecond)
 	recorder.ObservePeerDownstreamWriteDuration("photos", "cache-1", "2xx", 2*time.Millisecond)
+	recorder.ObserveInternalPeerRequestsPerClientRequest("photos", "page", 2)
+	recorder.ObservePageBatchSize("photos", "cache-1", 3)
 	recorder.ObserveGatewayForwardDuration("photos", "owner", "cache-1", "2xx", time.Millisecond)
 	recorder.ObserveGatewayResponseHeaderDuration("photos", "owner", "cache-1", "2xx", 2*time.Millisecond)
 	recorder.ObserveGatewayResponseCopyDuration("photos", "owner", "cache-1", "2xx", 3*time.Millisecond)
@@ -65,6 +73,12 @@ func TestRecorderRendersGlobalAndBucketMetrics(t *testing.T) {
 		`simple_s3_cache_read_strategy_selected_total{bucket="photos",strategy="page"} 1`,
 		`simple_s3_cache_peer_forwarded_requests_total{bucket="photos",peer_id="cache-1",method="GET",status_class="2xx"} 1`,
 		`simple_s3_cache_peer_forward_failures_total{bucket="photos",peer_id="cache-1",reason="request_failed"} 1`,
+		`simple_s3_cache_coordinator_requests_total{bucket="photos",method="GET",strategy="page",status_class="2xx"} 1`,
+		`simple_s3_cache_page_owner_requests_total{bucket="photos",owner_id="cache-1",status_class="2xx"} 1`,
+		`simple_s3_cache_page_owner_bytes_served_total{bucket="photos",owner_id="cache-1"} 34`,
+		`simple_s3_cache_page_owner_upstream_fill_bytes_total{bucket="photos",owner_id="cache-1"} 13`,
+		`simple_s3_cache_invalidation_broadcasts_total{bucket="photos",peer_id="cache-1",status="success"} 1`,
+		`simple_s3_cache_fill_coalesced_total{bucket="photos",result="hit"} 1`,
 		`simple_s3_cache_peer_forward_response_bytes_total{bucket="photos",peer_id="cache-1"} 13`,
 		`simple_s3_cache_gateway_requests_total{bucket="photos",route="owner",peer_id="cache-1",method="GET",status_class="2xx"} 1`,
 		`simple_s3_cache_gateway_forward_failures_total{bucket="photos",peer_id="cache-1",reason="request_failed"} 1`,
@@ -88,6 +102,8 @@ func TestRecorderRendersGlobalAndBucketMetrics(t *testing.T) {
 		`simple_s3_cache_peer_response_copy_duration_seconds_count{bucket="photos",peer_id="cache-1",status_class="2xx"} 1`,
 		`simple_s3_cache_peer_response_body_read_duration_seconds_count{bucket="photos",peer_id="cache-1",status_class="2xx"} 1`,
 		`simple_s3_cache_peer_downstream_write_duration_seconds_count{bucket="photos",peer_id="cache-1",status_class="2xx"} 1`,
+		`simple_s3_cache_internal_peer_requests_per_client_request_count{bucket="photos",strategy="page"} 1`,
+		`simple_s3_cache_page_batch_size_count{bucket="photos",owner_id="cache-1"} 1`,
 		`simple_s3_cache_gateway_forward_duration_seconds_count{bucket="photos",route="owner",peer_id="cache-1",status_class="2xx"} 1`,
 		`simple_s3_cache_gateway_response_header_duration_seconds_count{bucket="photos",route="owner",peer_id="cache-1",status_class="2xx"} 1`,
 		`simple_s3_cache_gateway_response_copy_duration_seconds_count{bucket="photos",route="owner",peer_id="cache-1",status_class="2xx"} 1`,
