@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"strings"
 	"testing"
 )
 
@@ -48,6 +49,64 @@ func TestPageFrameRoundTrip(t *testing.T) {
 	}
 	if _, err := reader.NextPage(); !errors.Is(err, io.EOF) {
 		t.Fatalf("NextPage(after end) error = %v, want EOF", err)
+	}
+}
+
+func TestPageFrameWriterStreamsPageFromReader(t *testing.T) {
+	var buf bytes.Buffer
+	writer, err := NewPageFrameWriter(&buf)
+	if err != nil {
+		t.Fatalf("NewPageFrameWriter() error = %v", err)
+	}
+	if err := writer.WritePageFrom(7, 6, strings.NewReader("stream")); err != nil {
+		t.Fatalf("WritePageFrom() error = %v", err)
+	}
+	if err := writer.WriteEnd(); err != nil {
+		t.Fatalf("WriteEnd() error = %v", err)
+	}
+
+	reader, err := NewPageFrameReader(&buf, []int64{7}, 1024)
+	if err != nil {
+		t.Fatalf("NewPageFrameReader() error = %v", err)
+	}
+	frame, err := reader.NextPage()
+	if err != nil {
+		t.Fatalf("NextPage() error = %v", err)
+	}
+	if frame.Index != 7 || string(frame.Bytes) != "stream" {
+		t.Fatalf("frame = %+v, want streamed page", frame)
+	}
+}
+
+func TestPageFrameReaderStreamsPageBody(t *testing.T) {
+	var buf bytes.Buffer
+	writePageFrameStreamHeader(&buf)
+	writePageFrame(&buf, 3, []byte("abcdef"))
+	writeEndFrame(&buf)
+
+	reader, err := NewPageFrameReader(&buf, []int64{3}, 1024)
+	if err != nil {
+		t.Fatalf("NewPageFrameReader() error = %v", err)
+	}
+	stream, err := reader.NextPageStream()
+	if err != nil {
+		t.Fatalf("NextPageStream() error = %v", err)
+	}
+	if stream.Index != 3 || stream.Size != 6 {
+		t.Fatalf("stream metadata = %+v, want page 3 size 6", stream)
+	}
+	first := make([]byte, 2)
+	if _, err := io.ReadFull(stream.Body, first); err != nil {
+		t.Fatalf("read partial stream body: %v", err)
+	}
+	if string(first) != "ab" {
+		t.Fatalf("first bytes = %q, want ab", first)
+	}
+	if err := stream.Body.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if _, err := reader.NextPageStream(); !errors.Is(err, io.EOF) {
+		t.Fatalf("NextPageStream(end) error = %v, want EOF", err)
 	}
 }
 

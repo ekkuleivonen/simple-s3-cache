@@ -1,6 +1,7 @@
 package peer
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -39,6 +40,12 @@ type PageFrame struct {
 	Bytes []byte
 }
 
+type PageFrameStream struct {
+	Index int64
+	Size  int64
+	Body  io.ReadCloser
+}
+
 type PageFrameWriter struct {
 	w         io.Writer
 	lastIndex int64
@@ -65,11 +72,21 @@ func NewPageFrameWriter(w io.Writer) (*PageFrameWriter, error) {
 }
 
 func (w *PageFrameWriter) WritePage(index int64, data []byte) error {
+	return w.WritePageFrom(index, int64(len(data)), bytes.NewReader(data))
+}
+
+func (w *PageFrameWriter) WritePageFrom(index int64, size int64, src io.Reader) error {
 	if w.closed {
 		return ErrPageFrameWriterClosed
 	}
 	if index < 0 {
 		return fmt.Errorf("%w: negative page index %d", ErrInvalidPageFrame, index)
+	}
+	if size < 0 {
+		return fmt.Errorf("%w: negative page size %d", ErrInvalidPageFrame, size)
+	}
+	if src == nil {
+		return fmt.Errorf("%w: page source is nil", ErrInvalidPageFrame)
 	}
 	if w.wrotePage && index <= w.lastIndex {
 		return fmt.Errorf("%w: page index %d after %d", ErrOutOfOrderPageFrame, index, w.lastIndex)
@@ -78,13 +95,17 @@ func (w *PageFrameWriter) WritePage(index int64, data []byte) error {
 	header := make([]byte, 1+pageFrameMetaSize)
 	header[0] = pageFrameTypePage
 	binary.BigEndian.PutUint64(header[1:9], uint64(index))
-	binary.BigEndian.PutUint64(header[9:17], uint64(len(data)))
+	binary.BigEndian.PutUint64(header[9:17], uint64(size))
 	if err := writePageFrameFull(w.w, header); err != nil {
 		return err
 	}
-	if len(data) > 0 {
-		if err := writePageFrameFull(w.w, data); err != nil {
+	if size > 0 {
+		written, err := io.CopyN(w.w, src, size)
+		if err != nil {
 			return err
+		}
+		if written != size {
+			return io.ErrShortWrite
 		}
 	}
 	w.lastIndex = index
@@ -170,62 +191,115 @@ func NewPageFrameReader(r io.Reader, expectedPages []int64, maxPageBytes int64) 
 }
 
 func (r *PageFrameReader) NextPage() (PageFrame, error) {
+	stream, err := r.NextPageStream()
+	if err != nil {
+		return PageFrame{}, err
+	}
+	defer stream.Body.Close()
+	data, err := io.ReadAll(stream.Body)
+	if err != nil {
+		return PageFrame{}, err
+	}
+	return PageFrame{Index: stream.Index, Bytes: data}, nil
+}
+
+func (r *PageFrameReader) NextPageStream() (PageFrameStream, error) {
 	if r.ended {
-		return PageFrame{}, io.EOF
+		return PageFrameStream{}, io.EOF
 	}
 
 	var frameType [1]byte
 	if _, err := io.ReadFull(r.r, frameType[:]); err != nil {
-		return PageFrame{}, fmt.Errorf("%w: missing end marker: %v", ErrTruncatedPageFrame, err)
+		return PageFrameStream{}, fmt.Errorf("%w: missing end marker: %v", ErrTruncatedPageFrame, err)
 	}
 	switch frameType[0] {
 	case pageFrameTypePage:
-		return r.readPage()
+		return r.readPageStream()
 	case pageFrameTypeEnd:
 		if r.next != len(r.expected) {
-			return PageFrame{}, fmt.Errorf("%w: got %d pages want %d", ErrUnexpectedEndFrame, r.next, len(r.expected))
+			return PageFrameStream{}, fmt.Errorf("%w: got %d pages want %d", ErrUnexpectedEndFrame, r.next, len(r.expected))
 		}
 		r.ended = true
-		return PageFrame{}, io.EOF
+		return PageFrameStream{}, io.EOF
 	default:
-		return PageFrame{}, fmt.Errorf("%w: unknown frame type %d", ErrInvalidPageFrame, frameType[0])
+		return PageFrameStream{}, fmt.Errorf("%w: unknown frame type %d", ErrInvalidPageFrame, frameType[0])
 	}
 }
 
-func (r *PageFrameReader) readPage() (PageFrame, error) {
+func (r *PageFrameReader) readPageStream() (PageFrameStream, error) {
 	meta := make([]byte, pageFrameMetaSize)
 	if _, err := io.ReadFull(r.r, meta); err != nil {
-		return PageFrame{}, fmt.Errorf("%w: page metadata: %v", ErrTruncatedPageFrame, err)
+		return PageFrameStream{}, fmt.Errorf("%w: page metadata: %v", ErrTruncatedPageFrame, err)
 	}
 
 	indexValue := binary.BigEndian.Uint64(meta[:8])
 	if indexValue > uint64(math.MaxInt64) {
-		return PageFrame{}, fmt.Errorf("%w: page index %d overflows int64", ErrInvalidPageFrame, indexValue)
+		return PageFrameStream{}, fmt.Errorf("%w: page index %d overflows int64", ErrInvalidPageFrame, indexValue)
 	}
 	index := int64(indexValue)
 	length := binary.BigEndian.Uint64(meta[8:16])
 	if length > uint64(r.maxPageBytes) || length > uint64(math.MaxInt) {
-		return PageFrame{}, fmt.Errorf("%w: page %d length %d exceeds limit %d", ErrOversizedPageFrame, index, length, r.maxPageBytes)
+		return PageFrameStream{}, fmt.Errorf("%w: page %d length %d exceeds limit %d", ErrOversizedPageFrame, index, length, r.maxPageBytes)
 	}
 	if _, ok := r.seen[index]; ok {
-		return PageFrame{}, fmt.Errorf("%w: page %d", ErrDuplicatePageFrame, index)
+		return PageFrameStream{}, fmt.Errorf("%w: page %d", ErrDuplicatePageFrame, index)
 	}
 	if _, ok := r.expectedSet[index]; !ok {
-		return PageFrame{}, fmt.Errorf("%w: page %d", ErrUnexpectedPageFrame, index)
+		return PageFrameStream{}, fmt.Errorf("%w: page %d", ErrUnexpectedPageFrame, index)
 	}
 	if r.next >= len(r.expected) {
-		return PageFrame{}, fmt.Errorf("%w: got extra page %d", ErrOutOfOrderPageFrame, index)
+		return PageFrameStream{}, fmt.Errorf("%w: got extra page %d", ErrOutOfOrderPageFrame, index)
 	}
 	if index != r.expected[r.next] {
-		return PageFrame{}, fmt.Errorf("%w: got page %d want page %d", ErrOutOfOrderPageFrame, index, r.expected[r.next])
-	}
-
-	data := make([]byte, int(length))
-	if _, err := io.ReadFull(r.r, data); err != nil {
-		return PageFrame{}, fmt.Errorf("%w: page %d bytes: %v", ErrTruncatedPageFrame, index, err)
+		return PageFrameStream{}, fmt.Errorf("%w: got page %d want page %d", ErrOutOfOrderPageFrame, index, r.expected[r.next])
 	}
 
 	r.seen[index] = struct{}{}
 	r.next++
-	return PageFrame{Index: index, Bytes: data}, nil
+	return PageFrameStream{
+		Index: index,
+		Size:  int64(length),
+		Body:  &pageFramePayloadReader{r: r.r, pageIndex: index, remaining: int64(length)},
+	}, nil
+}
+
+type pageFramePayloadReader struct {
+	r         io.Reader
+	pageIndex int64
+	remaining int64
+	closed    bool
+}
+
+func (r *pageFramePayloadReader) Read(data []byte) (int, error) {
+	if r.closed {
+		return 0, io.ErrClosedPipe
+	}
+	if r.remaining == 0 {
+		return 0, io.EOF
+	}
+	if int64(len(data)) > r.remaining {
+		data = data[:int(r.remaining)]
+	}
+	n, err := r.r.Read(data)
+	r.remaining -= int64(n)
+	if err != nil {
+		if errors.Is(err, io.EOF) && r.remaining > 0 {
+			return n, fmt.Errorf("%w: page %d bytes: %v", ErrTruncatedPageFrame, r.pageIndex, err)
+		}
+		return n, err
+	}
+	return n, nil
+}
+
+func (r *pageFramePayloadReader) Close() error {
+	if r.closed {
+		return nil
+	}
+	if r.remaining == 0 {
+		r.closed = true
+		return nil
+	}
+	_, err := io.Copy(io.Discard, r)
+	r.closed = true
+	return err
 }

@@ -173,7 +173,7 @@ type coordinatorPageBatch struct {
 
 type coordinatorPageReader struct {
 	batch  *coordinatorPageBatch
-	frame  peerrouter.PageFrame
+	frame  peerrouter.PageFrameStream
 	loaded bool
 }
 
@@ -552,16 +552,74 @@ func (p *Proxy) serveInternalPageRead(w http.ResponseWriter, r *http.Request) {
 	stats.objectETag = req.ETag
 	stats.objectEpoch = req.Epoch
 	upstreamFillBefore := stats.bytesFetchedUpstream
-	pages := make([][]byte, 0, len(req.Pages))
+	var frameWriter *peerrouter.PageFrameWriter
+	responseCommitted := false
+	ensureFrameWriter := func() (*peerrouter.PageFrameWriter, error) {
+		if frameWriter != nil {
+			return frameWriter, nil
+		}
+		w.Header().Set("Content-Type", peerrouter.PageFrameContentType)
+		w.WriteHeader(http.StatusOK)
+		responseCommitted = true
+		var err error
+		frameWriter, err = peerrouter.NewPageFrameWriter(w)
+		return frameWriter, err
+	}
 	for _, pageIndex := range req.Pages {
 		body, ok, err := p.openCachedPage(r.Context(), target, obj, pageIndex, stats, true)
 		if err != nil {
 			status = http.StatusInternalServerError
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			if !responseCommitted {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+			}
 			return
 		}
-		if !ok {
-			data, err := p.fillMissingPageBytes(r.Context(), p.internalPageReadUpstreamRequest(r, req), target, obj, pageIndex, stats)
+		if ok {
+			size, err := internalPageFrameSize(pageIndex, req.PageSize, req.ObjectSize)
+			if err != nil {
+				status = http.StatusBadRequest
+				_ = body.Close()
+				if !responseCommitted {
+					http.Error(w, err.Error(), http.StatusBadRequest)
+				}
+				return
+			}
+			writer, err := ensureFrameWriter()
+			if err != nil {
+				_ = body.Close()
+				p.logger.WarnContext(r.Context(), "write internal page frame header failed",
+					slog.String("bucket", req.Bucket),
+					slog.String("key", req.Key),
+					slog.String("error", err.Error()),
+				)
+				return
+			}
+			if err := writer.WritePageFrom(pageIndex, size, body); err != nil {
+				_ = body.Close()
+				p.logger.WarnContext(r.Context(), "write internal page frame failed",
+					slog.String("bucket", req.Bucket),
+					slog.String("key", req.Key),
+					slog.Int64("page_index", pageIndex),
+					slog.String("error", err.Error()),
+				)
+				return
+			}
+			if err := body.Close(); err != nil {
+				status = http.StatusInternalServerError
+				p.logger.WarnContext(r.Context(), "close internal cached page failed",
+					slog.String("bucket", req.Bucket),
+					slog.String("key", req.Key),
+					slog.Int64("page_index", pageIndex),
+					slog.String("error", err.Error()),
+				)
+				return
+			}
+			bytesServed += size
+			continue
+		}
+
+		err = p.fillAndWriteMissingPageFrame(r.Context(), p.internalPageReadUpstreamRequest(r, req), target, obj, pageIndex, stats, ensureFrameWriter)
+		if err != nil {
 			if errors.Is(err, errObjectChanged) {
 				if _, deleteErr := p.invalidateObject(r.Context(), s3request.Target{Bucket: req.Bucket, Key: req.Key}); deleteErr != nil {
 					p.logger.WarnContext(r.Context(), "invalidate stale internal page identity failed",
@@ -571,30 +629,32 @@ func (p *Proxy) serveInternalPageRead(w http.ResponseWriter, r *http.Request) {
 					)
 				}
 				status = http.StatusPreconditionFailed
-				http.Error(w, "object identity changed upstream", http.StatusPreconditionFailed)
+				if !responseCommitted {
+					http.Error(w, "object identity changed upstream", http.StatusPreconditionFailed)
+				}
 				return
 			}
 			if errors.Is(err, errPeerFillOverloaded) {
 				status = http.StatusServiceUnavailable
-				http.Error(w, "peer fill concurrency limit exceeded", http.StatusServiceUnavailable)
+				if !responseCommitted {
+					http.Error(w, "peer fill concurrency limit exceeded", http.StatusServiceUnavailable)
+				}
 				return
 			}
 			if err != nil {
 				status = http.StatusBadGateway
-				http.Error(w, err.Error(), http.StatusBadGateway)
+				if !responseCommitted {
+					http.Error(w, err.Error(), http.StatusBadGateway)
+				}
 				return
 			}
-			pages = append(pages, data)
-			continue
 		}
-
-		data, err := readAndClosePage(body, req.PageSize)
+		size, err := internalPageFrameSize(pageIndex, req.PageSize, req.ObjectSize)
 		if err != nil {
-			status = http.StatusInternalServerError
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			status = http.StatusBadRequest
 			return
 		}
-		pages = append(pages, data)
+		bytesServed += size
 	}
 	if p.metrics != nil {
 		upstreamFillBytes := stats.bytesFetchedUpstream - upstreamFillBefore
@@ -602,29 +662,15 @@ func (p *Proxy) serveInternalPageRead(w http.ResponseWriter, r *http.Request) {
 			p.metrics.RecordPageOwnerUpstreamFillBytes(req.Bucket, p.localPeerID(), upstreamFillBytes)
 		}
 	}
-
-	w.Header().Set("Content-Type", peerrouter.PageFrameContentType)
-	w.WriteHeader(http.StatusOK)
-	frameWriter, err := peerrouter.NewPageFrameWriter(w)
-	if err != nil {
-		p.logger.WarnContext(r.Context(), "write internal page frame header failed",
-			slog.String("bucket", req.Bucket),
-			slog.String("key", req.Key),
-			slog.String("error", err.Error()),
-		)
-		return
-	}
-	for i, pageIndex := range req.Pages {
-		if err := frameWriter.WritePage(pageIndex, pages[i]); err != nil {
-			p.logger.WarnContext(r.Context(), "write internal page frame failed",
+	if frameWriter == nil {
+		if _, err := ensureFrameWriter(); err != nil {
+			p.logger.WarnContext(r.Context(), "write internal page frame header failed",
 				slog.String("bucket", req.Bucket),
 				slog.String("key", req.Key),
-				slog.Int64("page_index", pageIndex),
 				slog.String("error", err.Error()),
 			)
 			return
 		}
-		bytesServed += int64(len(pages[i]))
 	}
 	if err := frameWriter.WriteEnd(); err != nil {
 		p.logger.WarnContext(r.Context(), "write internal page frame end failed",
@@ -778,6 +824,14 @@ func readAndClosePage(body io.ReadCloser, maxBytes int64) ([]byte, error) {
 		return nil, fmt.Errorf("cached page exceeds page size %d", maxBytes)
 	}
 	return data, nil
+}
+
+func internalPageFrameSize(pageIndex, pageSize, objectSize int64) (int64, error) {
+	bounds, err := cacheplan.PageBounds(pageIndex, pageSize, objectSize)
+	if err != nil {
+		return 0, err
+	}
+	return bounds.End - bounds.Start + 1, nil
 }
 
 func (p *Proxy) validateInternalPeerHeaders(w http.ResponseWriter, r *http.Request) bool {
@@ -2561,7 +2615,6 @@ func closeCoordinatorPageBatches(batches map[string]*coordinatorPageBatch) {
 }
 
 func (p *Proxy) streamCoordinatorPageSpans(w http.ResponseWriter, r *http.Request, target s3request.Target, obj cache.Object, pages []cacheplan.PageSpan, batches map[string]*coordinatorPageBatch, stats *requestStats) (int64, error) {
-	readers := make(map[string]*coordinatorPageReader)
 	var total int64
 	for _, page := range pages {
 		owner := p.peerRouter.PageOwner(target.Bucket, target.Key, page.Index)
@@ -2573,7 +2626,7 @@ func (p *Proxy) streamCoordinatorPageSpans(w http.ResponseWriter, r *http.Reques
 			abortCommittedResponse(w, total)
 			return total, err
 		}
-		n, err := p.streamCoordinatorPageSpan(w, r, target, obj, page, batch, readers, stats)
+		n, err := p.streamCoordinatorPageSpan(w, r, target, obj, page, batch, stats)
 		stats.cacheResponseBytes += n
 		total += n
 		if err != nil {
@@ -2596,34 +2649,26 @@ func (p *Proxy) streamCoordinatorPageSpans(w http.ResponseWriter, r *http.Reques
 	return total, nil
 }
 
-func (p *Proxy) streamCoordinatorPageSpan(w http.ResponseWriter, r *http.Request, target s3request.Target, obj cache.Object, page cacheplan.PageSpan, batch *coordinatorPageBatch, readers map[string]*coordinatorPageReader, stats *requestStats) (int64, error) {
+func (p *Proxy) streamCoordinatorPageSpan(w http.ResponseWriter, r *http.Request, target s3request.Target, obj cache.Object, page cacheplan.PageSpan, batch *coordinatorPageBatch, stats *requestStats) (int64, error) {
 	if batch.owner.ID == p.peerRouter.LocalID() {
 		return p.streamPageSpan(w, r, target, obj, page, stats)
 	}
 
-	reader := readers[batch.owner.ID]
-	if reader == nil {
-		reader = &coordinatorPageReader{batch: batch}
-		readers[batch.owner.ID] = reader
+	readStart := time.Now()
+	frame, err := batch.reader.NextPageStream()
+	stats.peerResponseBodyReadDuration += time.Since(readStart)
+	if err != nil {
+		return 0, err
 	}
-	if !reader.loaded || reader.frame.Index != page.Index {
-		readStart := time.Now()
-		frame, err := batch.reader.NextPage()
-		stats.peerResponseBodyReadDuration += time.Since(readStart)
-		if err != nil {
-			return 0, err
-		}
-		stats.peerResponseBodyReadChunks++
-		stats.peerResponseBytes += int64(len(frame.Bytes))
-		reader.frame = frame
-		reader.loaded = true
-	}
-	if reader.frame.Index != page.Index {
-		return 0, fmt.Errorf("peer %s returned page %d while coordinator wanted page %d", batch.owner.ID, reader.frame.Index, page.Index)
+	defer frame.Body.Close()
+	stats.peerResponseBodyReadChunks++
+	stats.peerResponseBytes += frame.Size
+	if frame.Index != page.Index {
+		return 0, fmt.Errorf("peer %s returned page %d while coordinator wanted page %d", batch.owner.ID, frame.Index, page.Index)
 	}
 
 	copyStart := time.Now()
-	n, err := copyPageSpan(w, bytes.NewReader(reader.frame.Bytes), page, obj.PageSize)
+	n, err := copyPageSpan(w, frame.Body, page, obj.PageSize)
 	stats.cacheResponseCopyDuration += time.Since(copyStart)
 	return n, err
 }
@@ -2827,6 +2872,86 @@ func (p *Proxy) fillMissingPageBytes(ctx context.Context, r *http.Request, targe
 	close(call.done)
 
 	return data, err
+}
+
+func (p *Proxy) fillAndWriteMissingPageFrame(
+	ctx context.Context,
+	r *http.Request,
+	target s3request.Target,
+	obj cache.Object,
+	index int64,
+	stats *requestStats,
+	ensureFrameWriter func() (*peerrouter.PageFrameWriter, error),
+) error {
+	key := pageFillKey{
+		objectID: obj.ID,
+		index:    index,
+		etag:     obj.ETag,
+		epoch:    obj.Epoch,
+	}
+
+	p.pageFillMu.Lock()
+	if p.pageFills == nil {
+		p.pageFills = make(map[pageFillKey]*pageFillCall)
+	}
+	if call, ok := p.pageFills[key]; ok {
+		p.pageFillMu.Unlock()
+		select {
+		case <-call.done:
+			if call.err != nil {
+				p.recordFillCoalesced(target.Bucket, "error")
+				return call.err
+			}
+			body, ok, err := p.cache.OpenPage(ctx, obj.ID, index, obj.ETag, obj.Epoch)
+			if err != nil {
+				p.recordFillCoalesced(target.Bucket, "error")
+				return err
+			}
+			if !ok {
+				p.recordFillCoalesced(target.Bucket, "miss")
+				return p.fillAndWriteMissingPageFrame(ctx, r, target, obj, index, stats, ensureFrameWriter)
+			}
+			defer body.Close()
+			size, err := internalPageFrameSize(index, obj.PageSize, obj.Size)
+			if err != nil {
+				p.recordFillCoalesced(target.Bucket, "error")
+				return err
+			}
+			writer, err := ensureFrameWriter()
+			if err != nil {
+				p.recordFillCoalesced(target.Bucket, "error")
+				return err
+			}
+			p.recordFillCoalesced(target.Bucket, "hit")
+			return writer.WritePageFrom(index, size, body)
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	call := &pageFillCall{done: make(chan struct{})}
+	p.pageFills[key] = call
+	p.pageFillMu.Unlock()
+
+	release, acquired := p.tryAcquirePeerFill(obj.ID)
+	if !acquired {
+		err := errPeerFillOverloaded
+		call.err = err
+		p.pageFillMu.Lock()
+		delete(p.pageFills, key)
+		p.pageFillMu.Unlock()
+		close(call.done)
+		return err
+	}
+	err := p.fetchAndWritePageFrameBestEffort(ctx, r, target, obj, index, stats, ensureFrameWriter)
+	release()
+	call.err = err
+
+	p.pageFillMu.Lock()
+	delete(p.pageFills, key)
+	p.pageFillMu.Unlock()
+	close(call.done)
+
+	return err
 }
 
 func (p *Proxy) streamPageSpan(w http.ResponseWriter, r *http.Request, target s3request.Target, obj cache.Object, page cacheplan.PageSpan, stats *requestStats) (int64, error) {
@@ -3041,6 +3166,126 @@ func (p *Proxy) fetchPageBytesAndStoreBestEffort(ctx context.Context, r *http.Re
 		return data, nil
 	}
 	return data, nil
+}
+
+func (p *Proxy) fetchAndWritePageFrameBestEffort(
+	ctx context.Context,
+	r *http.Request,
+	target s3request.Target,
+	obj cache.Object,
+	index int64,
+	stats *requestStats,
+	ensureFrameWriter func() (*peerrouter.PageFrameWriter, error),
+) error {
+	bounds, err := cacheplan.PageBounds(index, obj.PageSize, obj.Size)
+	if err != nil {
+		return err
+	}
+	rangeHeader := fmt.Sprintf("bytes=%d-%d", bounds.Start, bounds.End)
+	req, err := p.newUpstreamRequest(ctx, r, http.MethodGet, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Range", rangeHeader)
+	req.Header.Set("If-Match", obj.ETag)
+	if err := p.sign(req); err != nil {
+		return err
+	}
+
+	start := time.Now()
+	resp, err := p.client.Do(req)
+	if err != nil {
+		stats.upstreamDuration += time.Since(start)
+		p.recordUpstreamFailure(target.Bucket, "fill")
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusPreconditionFailed {
+		stats.upstreamDuration += time.Since(start)
+		return errObjectChanged
+	}
+	if resp.StatusCode != http.StatusPartialContent {
+		stats.upstreamDuration += time.Since(start)
+		p.recordUpstreamFailure(target.Bucket, "fill")
+		bodySample, readErr := readCappedBody(resp.Body, upstreamErrorBodyLogLimit)
+		attrs := []slog.Attr{
+			slog.String("method", req.Method),
+			slog.String("bucket", target.Bucket),
+			slog.String("key", target.Key),
+			slog.String("upstream_path", req.URL.EscapedPath()),
+			slog.String("upstream_host", req.Host),
+			slog.String("upstream_url_host", req.URL.Host),
+			slog.String("range", rangeHeader),
+			slog.String("if_match", obj.ETag),
+			slog.Int64("page_index", index),
+			slog.Int("status", resp.StatusCode),
+			slog.String("response_body", bodySample),
+		}
+		if readErr != nil {
+			attrs = append(attrs, slog.String("response_body_read_error", readErr.Error()))
+		}
+		p.logger.LogAttrs(ctx, slog.LevelWarn, "upstream page fill returned non-206", attrs...)
+		return fmt.Errorf("fetch page %d: upstream status %d", index, resp.StatusCode)
+	}
+
+	expectedSize := bounds.End - bounds.Start + 1
+	writer, err := ensureFrameWriter()
+	if err != nil {
+		stats.upstreamDuration += time.Since(start)
+		return err
+	}
+	pageWriter, err := p.beginCachePageWriter(ctx, target, obj, index, stats)
+	var cacheWriter *bestEffortPageWriter
+	if err == nil {
+		defer pageWriter.Abort()
+		cacheWriter = &bestEffortPageWriter{writer: pageWriter}
+	}
+	src := io.Reader(resp.Body)
+	if cacheWriter != nil {
+		src = io.TeeReader(resp.Body, cacheWriter)
+	}
+	if err := writer.WritePageFrom(index, expectedSize, src); err != nil {
+		stats.upstreamDuration += time.Since(start)
+		return err
+	}
+	stats.upstreamDuration += time.Since(start)
+	stats.bytesFetchedUpstream += expectedSize
+	if p.metrics != nil {
+		p.metrics.RecordUpstreamFillBytes(target.Bucket, expectedSize)
+		p.metrics.ObserveUpstreamDuration(target.Bucket, "fill", time.Since(start))
+	}
+	if cacheWriter != nil {
+		if cacheWriter.err != nil {
+			p.recordCacheWriteFailure(ctx, target, index, cacheWriter.err, stats)
+			return nil
+		}
+		if _, err := pageWriter.Commit(ctx); err != nil {
+			p.recordCacheWriteFailure(ctx, target, index, err, stats)
+			return nil
+		}
+	}
+	return nil
+}
+
+type bestEffortPageWriter struct {
+	writer *cache.PageWriter
+	err    error
+}
+
+func (w *bestEffortPageWriter) Write(data []byte) (int, error) {
+	if w.err != nil {
+		return len(data), nil
+	}
+	n, err := w.writer.Write(data)
+	if err != nil {
+		w.err = err
+		return len(data), nil
+	}
+	if n != len(data) {
+		w.err = io.ErrShortWrite
+	}
+	return len(data), nil
 }
 
 func (p *Proxy) fetchAndStorePage(ctx context.Context, r *http.Request, target s3request.Target, obj cache.Object, index int64, stream *pageSpanStream, stats *requestStats) (io.ReadCloser, error) {

@@ -324,9 +324,10 @@ test. Until then, treat it as load-bearing.
 * **Why it matters:** Naive fanout can increase latency, socket churn, CPU, and
   internal network traffic enough to erase page-sharding throughput gains.
 * **Mitigation:** Group requested pages by page owner and batch them into bounded
-  internal requests. Bound per-peer and per-object fill concurrency. Use the
-  `object` read strategy for small objects and `auto` thresholds based on
-  effective page size.
+  internal requests, but stream page payloads through the internal frame protocol
+  instead of materializing full batches in memory. Bound per-peer and per-object
+  fill concurrency. Use the `object` read strategy for small objects and `auto`
+  thresholds based on effective page size.
 * **Watch:** Internal requests per client request, page batch sizes, peer request
   latency, fill concurrency, request amplification on small-object workloads.
 
@@ -340,8 +341,9 @@ test. Until then, treat it as load-bearing.
   never arrive.
 * **Mitigation:** Version the internal page protocol from day one. Each frame
   must identify page index and byte length, and coordinators must reject
-  unexpected, duplicate, truncated, or oversized frames. Cancellation and
-  backpressure must be explicit.
+  unexpected, duplicate, truncated, or oversized frames. Page payloads should be
+  consumed as streams so HTTP/file backpressure, not page-sized heap buffers,
+  controls memory use.
 * **Watch:** Internal page responses without protocol versioning; tests that only
   cover happy-path frames; handlers that stream page-owner bytes directly to
   clients without validating frame boundaries.
@@ -367,9 +369,9 @@ test. Until then, treat it as load-bearing.
 * **Why it matters:** A client could read internal page frames, trigger
   invalidation, bypass routing checks, or poison peer coordination.
 * **Mitigation:** Strip peer headers at public boundaries. Internal routes must
-  require peer headers and matching ring fingerprint, and should be kept under a
-  clearly internal path or listener. Never trust client-visible headers for
-  upstream page fills.
+  require peer headers, matching ring fingerprint, and a signed peer MAC before
+  touching cache state. They should be kept under a clearly internal path or
+  listener. Never trust client-visible headers for upstream page fills.
 * **Watch:** Public handlers that route `/internal/*`; gateway or peer code that
   forwards client-supplied internal headers; internal endpoints without tests for
   missing or mismatched peer identity.

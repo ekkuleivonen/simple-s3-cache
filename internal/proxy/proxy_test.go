@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -2675,6 +2676,72 @@ func TestProxyInternalPageReadFillsMissingPage(t *testing.T) {
 	}
 }
 
+func TestProxyInternalPageReadStreamsFirstPageBeforeLoadingFullBatch(t *testing.T) {
+	body := []byte("abcdefgh")
+	pageOneStarted := make(chan struct{})
+	releasePageOne := make(chan struct{})
+	var signalOnce sync.Once
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Header.Get("Range") {
+		case "bytes=0-3":
+			w.Header().Set("Content-Length", "4")
+			w.Header().Set("Content-Range", "bytes 0-3/8")
+			w.Header().Set("ETag", `"etag-stream-owner"`)
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(body[:4])
+		case "bytes=4-7":
+			signalOnce.Do(func() { close(pageOneStarted) })
+			<-releasePageOne
+			w.Header().Set("Content-Length", "4")
+			w.Header().Set("Content-Range", "bytes 4-7/8")
+			w.Header().Set("ETag", `"etag-stream-owner"`)
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(body[4:])
+		default:
+			t.Fatalf("Range = %q", r.Header.Get("Range"))
+		}
+	}))
+	defer upstream.Close()
+
+	p := testProxyWithPageSize(t, upstream.URL, 4)
+	router := enablePeerMode(t, p, "cache-0", []peerrouter.Peer{
+		{ID: "cache-0", URL: "http://cache-0.invalid"},
+		{ID: "cache-1", URL: "http://cache-1.invalid"},
+	})
+	key := keyWithPageOwners(t, router, "bucket", []string{"cache-0", "cache-0"})
+	rec := newThreadSafeRecorder()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		p.ServeHTTP(rec, internalPageReadHTTPRequest(t, router, internalPageReadRequest{
+			Bucket:     "bucket",
+			Key:        key,
+			ObjectSize: int64(len(body)),
+			PageSize:   4,
+			ETag:       `"etag-stream-owner"`,
+			Epoch:      0,
+			Pages:      []int64{0, 1},
+		}))
+	}()
+
+	select {
+	case <-pageOneStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for second page fill to start")
+	}
+	if !bytes.Contains(rec.bodyBytes(), body[:4]) {
+		close(releasePageOne)
+		t.Fatal("first page was not streamed before second page finished loading")
+	}
+	close(releasePageOne)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for internal page read to finish")
+	}
+	assertPageFrames(t, bytes.NewReader(rec.bodyBytes()), []int64{0, 1}, [][]byte{body[:4], body[4:]}, 4)
+}
+
 func TestProxyDistributedFallbackClearsLocalPlanningState(t *testing.T) {
 	body := []byte("abcdefghijkl")
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -3510,6 +3577,54 @@ func TestProxyCoordinatorPageReadClosesDownstreamOnPostCommitPeerFailure(t *test
 	}
 }
 
+func TestProxyCoordinatorPageReadRejectsTruncatedFrameAfterRequestedSpan(t *testing.T) {
+	body := []byte("ab")
+	peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", peerrouter.PageFrameContentType)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte{'S', '3', 'P', 'F'})
+		_ = binary.Write(w, binary.BigEndian, peerrouter.PageFrameVersion)
+		w.Write([]byte{1})
+		_ = binary.Write(w, binary.BigEndian, uint64(0))
+		_ = binary.Write(w, binary.BigEndian, uint64(4))
+		_, _ = w.Write(body)
+	}))
+	defer peer.Close()
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodHead {
+			t.Fatalf("upstream method = %q, want HEAD only", r.Method)
+		}
+		w.Header().Set("Content-Length", "4")
+		w.Header().Set("ETag", `"etag-truncated-after-span"`)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	p := testProxyWithPageSize(t, upstream.URL, 4)
+	p.readSharding = readShardingPage
+	router := enablePeerMode(t, p, "cache-0", []peerrouter.Peer{
+		{ID: "cache-0", URL: "http://cache-0.invalid"},
+		{ID: "cache-1", URL: peer.URL},
+	})
+	key := keyWithPageOwners(t, router, "bucket", []string{"cache-1"})
+	req := httptest.NewRequest(http.MethodGet, "/bucket/"+key, nil)
+	req.Header.Set("Range", "bytes=0-0")
+	rec := newHijackableRecorder()
+
+	p.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusPartialContent {
+		t.Fatalf("status = %d, want 206 before downstream close; body=%q", rec.Code, rec.Body.String())
+	}
+	if got := rec.Body.String(); got != "a" {
+		t.Fatalf("body before close = %q, want a", got)
+	}
+	if !rec.hijacked.Load() {
+		t.Fatal("downstream was not closed after remote frame truncated after requested span")
+	}
+}
+
 func TestProxyPeerModeRejectsForwardingLoop(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
 		t.Fatal("upstream should not receive looped peer request")
@@ -3764,6 +3879,44 @@ func (r *hijackableRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	r.hijacked.Store(true)
 	_ = client.Close()
 	return server, bufio.NewReadWriter(bufio.NewReader(server), bufio.NewWriter(server)), nil
+}
+
+type threadSafeRecorder struct {
+	mu     sync.Mutex
+	header http.Header
+	code   int
+	body   bytes.Buffer
+}
+
+func newThreadSafeRecorder() *threadSafeRecorder {
+	return &threadSafeRecorder{header: http.Header{}}
+}
+
+func (r *threadSafeRecorder) Header() http.Header {
+	return r.header
+}
+
+func (r *threadSafeRecorder) WriteHeader(status int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.code == 0 {
+		r.code = status
+	}
+}
+
+func (r *threadSafeRecorder) Write(data []byte) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.code == 0 {
+		r.code = http.StatusOK
+	}
+	return r.body.Write(data)
+}
+
+func (r *threadSafeRecorder) bodyBytes() []byte {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]byte(nil), r.body.Bytes()...)
 }
 
 func assertRequestSignatureMatchesFinalHeaders(t *testing.T, r *http.Request) {
