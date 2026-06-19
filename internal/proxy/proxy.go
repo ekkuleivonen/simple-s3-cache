@@ -1363,7 +1363,9 @@ func (p *Proxy) handle(w http.ResponseWriter, r *http.Request, target s3request.
 		stats.cacheResult = "pass_through"
 		status, bytesWritten, err := p.forward(w, r, stats)
 		if err == nil && isSuccessfulStatus(status) && shouldInvalidateAfterWrite(r, target) {
-			if _, deleteErr := p.invalidateObject(r.Context(), target); deleteErr != nil {
+			invalidationCtx, cancel := p.detachedInvalidationContext(r.Context())
+			defer cancel()
+			if _, deleteErr := p.invalidateObject(invalidationCtx, target); deleteErr != nil {
 				p.markDegradedWithContext("write invalidation failed", map[string]string{"bucket": target.Bucket})
 				p.logger.ErrorContext(r.Context(), "cache invalidation failed after successful write",
 					slog.String("bucket", target.Bucket),
@@ -1374,6 +1376,26 @@ func (p *Proxy) handle(w http.ResponseWriter, r *http.Request, target s3request.
 		}
 		return status, bytesWritten, err
 	}
+}
+
+func (p *Proxy) detachedInvalidationContext(parent context.Context) (context.Context, context.CancelFunc) {
+	ctx := context.WithoutCancel(parent)
+	if p.peerTimeout <= 0 {
+		return ctx, func() {}
+	}
+	timeout := p.peerTimeout
+	if p.peerRouter != nil {
+		peerCount := 0
+		for _, peer := range p.peerRouter.Peers() {
+			if peer.ID != p.peerRouter.LocalID() {
+				peerCount++
+			}
+		}
+		if peerCount > 0 {
+			timeout = p.peerTimeout * time.Duration(peerCount+1)
+		}
+	}
+	return context.WithTimeout(ctx, timeout)
 }
 
 func cacheInternalReadRequest(r *http.Request, classification s3request.Classification) *http.Request {

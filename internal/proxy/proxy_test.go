@@ -2263,6 +2263,50 @@ func TestProxyBroadcastsInvalidationToAllPeersAfterFailure(t *testing.T) {
 	}
 }
 
+func TestProxyPostWriteInvalidationIgnoresCanceledRequestContext(t *testing.T) {
+	var peerInvalidations int
+	peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/internal/v1/invalidate" {
+			t.Fatalf("peer path = %q, want /internal/v1/invalidate", r.URL.Path)
+		}
+		peerInvalidations++
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer peer.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	p := testProxy(t, "http://upstream.invalid")
+	p.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		cancel()
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader("")),
+			Request:    req,
+		}, nil
+	})}
+	enablePeerMode(t, p, "cache-0", []peerrouter.Peer{
+		{ID: "cache-0", URL: "http://cache-0.invalid"},
+		{ID: "cache-1", URL: peer.URL},
+	})
+
+	req := httptest.NewRequest(http.MethodPut, "/bucket/object.bin", strings.NewReader("updated"))
+	req = req.WithContext(ctx)
+	rec := httptest.NewRecorder()
+
+	p.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%q", rec.Code, rec.Body.String())
+	}
+	if peerInvalidations != 1 {
+		t.Fatalf("peer invalidations = %d, want 1", peerInvalidations)
+	}
+	if ready, reason := p.Readiness(); !ready || reason != "" {
+		t.Fatalf("Readiness() = (%v, %q), want ready", ready, reason)
+	}
+}
+
 func TestProxyDoesNotInvalidateCachedObjectAfterFailedWrite(t *testing.T) {
 	body := []byte("abcdefghijkl")
 	var headRequests int
@@ -4380,6 +4424,12 @@ func testProxyWithUpstreamHost(t *testing.T, endpoint, upstreamHost string) *Pro
 	p := testProxy(t, endpoint)
 	p.upstreamHost = upstreamHost
 	return p
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
 }
 
 func upstreamClient(_ string) *http.Client {
