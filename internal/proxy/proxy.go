@@ -63,6 +63,11 @@ const (
 )
 
 const (
+	peerInvalidationRetryInterval = 5 * time.Second
+	peerInvalidationRetryLimit    = 4096
+)
+
+const (
 	upstreamDialTimeout           = 10 * time.Second
 	upstreamKeepAlive             = 30 * time.Second
 	upstreamTLSHandshakeTimeout   = 10 * time.Second
@@ -83,6 +88,7 @@ var (
 	errSpoolLimit                = errors.New("upload body exceeds max spool size")
 	errRefetchedRangeUnsatisfied = errors.New("refetched object does not satisfy requested range")
 	errPeerFillOverloaded        = errors.New("peer page fill concurrency limit exceeded")
+	errPeerInvalidationFailed    = errors.New("peer invalidation failed")
 )
 
 type uploadOptions struct {
@@ -129,7 +135,27 @@ type Proxy struct {
 	objectFillLimit        int
 	degradedMu             sync.RWMutex
 	degraded               *ops.DegradedState
+	peerInvalidationRetry  peerInvalidationRetryState
 	internalPeerSuccessLog bool
+}
+
+type peerInvalidationRetryState struct {
+	mu      sync.Mutex
+	pending map[peerInvalidationRetryKey]pendingPeerInvalidation
+	stop    chan struct{}
+	started bool
+}
+
+type peerInvalidationRetryKey struct {
+	peerID string
+	bucket string
+	key    string
+}
+
+type pendingPeerInvalidation struct {
+	peer   peerrouter.Peer
+	target s3request.Target
+	epoch  int64
 }
 
 type readStrategySelection struct {
@@ -411,6 +437,7 @@ func (p *Proxy) PeerState() ops.PeerState {
 }
 
 func (p *Proxy) Close() error {
+	p.stopPeerInvalidationRetryWorker()
 	if p.cache == nil {
 		return nil
 	}
@@ -488,6 +515,9 @@ func (p *Proxy) markDegradedWithContext(reason string, context map[string]string
 	first := p.degraded == nil
 	if first {
 		p.degraded = &state
+	} else if p.degraded.Code == "peer_invalidation_failed" && state.Code != "peer_invalidation_failed" {
+		p.degraded = &state
+		first = true
 	}
 	p.degradedMu.Unlock()
 	if !first {
@@ -504,6 +534,19 @@ func (p *Proxy) markDegradedWithContext(reason string, context map[string]string
 			slog.String("ring_id", state.RingID),
 		)
 	}
+}
+
+func (p *Proxy) clearDegradedIfCode(code string) bool {
+	p.degradedMu.Lock()
+	defer p.degradedMu.Unlock()
+	if p.degraded == nil || p.degraded.Code != code {
+		return false
+	}
+	p.degraded = nil
+	if p.metrics != nil {
+		p.metrics.SetDegraded("")
+	}
+	return true
 }
 
 func (p *Proxy) newDegradedState(reason string, context map[string]string) ops.DegradedState {
@@ -1366,7 +1409,9 @@ func (p *Proxy) handle(w http.ResponseWriter, r *http.Request, target s3request.
 			invalidationCtx, cancel := p.detachedInvalidationContext(r.Context())
 			defer cancel()
 			if _, deleteErr := p.invalidateObject(invalidationCtx, target); deleteErr != nil {
-				p.markDegradedWithContext("write invalidation failed", map[string]string{"bucket": target.Bucket})
+				if !errors.Is(deleteErr, errPeerInvalidationFailed) {
+					p.markDegradedWithContext("write invalidation failed", map[string]string{"bucket": target.Bucket})
+				}
 				p.logger.ErrorContext(r.Context(), "cache invalidation failed after successful write",
 					slog.String("bucket", target.Bucket),
 					slog.String("key", target.Key),
@@ -1434,8 +1479,7 @@ func (p *Proxy) invalidateObject(ctx context.Context, target s3request.Target) (
 		return epoch, nil
 	}
 	if err := p.broadcastInvalidation(ctx, target, epoch); err != nil {
-		p.markDegradedWithContext("peer invalidation failed", map[string]string{"bucket": target.Bucket})
-		return epoch, err
+		return epoch, fmt.Errorf("%w: %w", errPeerInvalidationFailed, err)
 	}
 	return epoch, nil
 }
@@ -1452,6 +1496,8 @@ func (p *Proxy) broadcastInvalidation(ctx context.Context, target s3request.Targ
 				p.metrics.RecordInvalidationBroadcast(target.Bucket, peer.ID, "failure")
 				p.metrics.ObserveInvalidationBroadcastDuration(target.Bucket, peer.ID, "failure", time.Since(start))
 			}
+			p.markDegradedWithContext("peer invalidation failed", map[string]string{"bucket": target.Bucket})
+			p.enqueuePeerInvalidationRetry(peer, target, epoch)
 			p.logger.ErrorContext(ctx, "peer invalidation failed",
 				slog.String("bucket", target.Bucket),
 				slog.String("key", target.Key),
@@ -1471,6 +1517,170 @@ func (p *Proxy) broadcastInvalidation(ctx context.Context, target s3request.Targ
 		return errors.Join(failures...)
 	}
 	return nil
+}
+
+func (p *Proxy) enqueuePeerInvalidationRetry(peer peerrouter.Peer, target s3request.Target, epoch int64) {
+	if p.peerRouter == nil {
+		return
+	}
+	shouldStart := false
+	p.peerInvalidationRetry.mu.Lock()
+	if p.peerInvalidationRetry.pending == nil {
+		p.peerInvalidationRetry.pending = make(map[peerInvalidationRetryKey]pendingPeerInvalidation)
+	}
+	key := peerInvalidationRetryKey{peerID: peer.ID, bucket: target.Bucket, key: target.Key}
+	if pending, ok := p.peerInvalidationRetry.pending[key]; ok && pending.epoch >= epoch {
+		p.peerInvalidationRetry.mu.Unlock()
+		return
+	}
+	if _, ok := p.peerInvalidationRetry.pending[key]; !ok && len(p.peerInvalidationRetry.pending) >= peerInvalidationRetryLimit {
+		p.peerInvalidationRetry.mu.Unlock()
+		if p.logger != nil {
+			p.logger.Error("peer invalidation retry queue full",
+				slog.String("bucket", target.Bucket),
+				slog.String("key", target.Key),
+				slog.Int64("epoch", epoch),
+				slog.String("peer_id", peer.ID),
+			)
+		}
+		return
+	}
+	p.peerInvalidationRetry.pending[key] = pendingPeerInvalidation{
+		peer:   peer,
+		target: target,
+		epoch:  epoch,
+	}
+	if p.peerInvalidationRetry.stop == nil {
+		p.peerInvalidationRetry.stop = make(chan struct{})
+	}
+	if !p.peerInvalidationRetry.started {
+		p.peerInvalidationRetry.started = true
+		shouldStart = true
+	}
+	p.peerInvalidationRetry.mu.Unlock()
+	if shouldStart {
+		go p.runPeerInvalidationRetryWorker()
+	}
+}
+
+func (p *Proxy) stopPeerInvalidationRetryWorker() {
+	p.peerInvalidationRetry.mu.Lock()
+	stop := p.peerInvalidationRetry.stop
+	if stop != nil {
+		p.peerInvalidationRetry.stop = nil
+	}
+	p.peerInvalidationRetry.mu.Unlock()
+	if stop != nil {
+		close(stop)
+	}
+}
+
+func (p *Proxy) runPeerInvalidationRetryWorker() {
+	for {
+		p.peerInvalidationRetry.mu.Lock()
+		stop := p.peerInvalidationRetry.stop
+		p.peerInvalidationRetry.mu.Unlock()
+		if stop == nil {
+			return
+		}
+
+		select {
+		case <-time.After(peerInvalidationRetryInterval):
+		case <-stop:
+			return
+		}
+
+		ctx, cancel := p.detachedInvalidationContext(context.Background())
+		_ = p.retryPendingPeerInvalidations(ctx)
+		cancel()
+		if p.finishPeerInvalidationRetryWorkerIfIdle() {
+			return
+		}
+	}
+}
+
+func (p *Proxy) retryPendingPeerInvalidations(ctx context.Context) error {
+	pending := p.snapshotPendingPeerInvalidations()
+	if len(pending) == 0 {
+		p.clearPeerInvalidationDegradedIfRecovered()
+		return nil
+	}
+
+	var failures []error
+	for _, item := range pending {
+		start := time.Now()
+		if err := p.sendPeerInvalidation(ctx, item.peer, item.target, item.epoch); err != nil {
+			if p.metrics != nil {
+				p.metrics.RecordInvalidationBroadcast(item.target.Bucket, item.peer.ID, "failure")
+				p.metrics.ObserveInvalidationBroadcastDuration(item.target.Bucket, item.peer.ID, "failure", time.Since(start))
+			}
+			if p.logger != nil {
+				p.logger.WarnContext(ctx, "peer invalidation retry failed",
+					slog.String("bucket", item.target.Bucket),
+					slog.String("key", item.target.Key),
+					slog.Int64("epoch", item.epoch),
+					slog.String("peer_id", item.peer.ID),
+					slog.String("error", err.Error()),
+				)
+			}
+			failures = append(failures, err)
+			continue
+		}
+		if p.metrics != nil {
+			p.metrics.RecordInvalidationBroadcast(item.target.Bucket, item.peer.ID, "success")
+			p.metrics.ObserveInvalidationBroadcastDuration(item.target.Bucket, item.peer.ID, "success", time.Since(start))
+		}
+		p.removePendingPeerInvalidation(item)
+	}
+	p.clearPeerInvalidationDegradedIfRecovered()
+	if len(failures) > 0 {
+		return errors.Join(failures...)
+	}
+	return nil
+}
+
+func (p *Proxy) snapshotPendingPeerInvalidations() []pendingPeerInvalidation {
+	p.peerInvalidationRetry.mu.Lock()
+	defer p.peerInvalidationRetry.mu.Unlock()
+	pending := make([]pendingPeerInvalidation, 0, len(p.peerInvalidationRetry.pending))
+	for _, item := range p.peerInvalidationRetry.pending {
+		pending = append(pending, item)
+	}
+	return pending
+}
+
+func (p *Proxy) removePendingPeerInvalidation(done pendingPeerInvalidation) {
+	key := peerInvalidationRetryKey{peerID: done.peer.ID, bucket: done.target.Bucket, key: done.target.Key}
+	p.peerInvalidationRetry.mu.Lock()
+	defer p.peerInvalidationRetry.mu.Unlock()
+	current, ok := p.peerInvalidationRetry.pending[key]
+	if !ok || current.epoch > done.epoch {
+		return
+	}
+	delete(p.peerInvalidationRetry.pending, key)
+}
+
+func (p *Proxy) clearPeerInvalidationDegradedIfRecovered() {
+	p.peerInvalidationRetry.mu.Lock()
+	empty := len(p.peerInvalidationRetry.pending) == 0
+	p.peerInvalidationRetry.mu.Unlock()
+	if !empty {
+		return
+	}
+	if p.clearDegradedIfCode("peer_invalidation_failed") && p.logger != nil {
+		p.logger.Info("proxy peer invalidation recovered")
+	}
+}
+
+func (p *Proxy) finishPeerInvalidationRetryWorkerIfIdle() bool {
+	p.peerInvalidationRetry.mu.Lock()
+	defer p.peerInvalidationRetry.mu.Unlock()
+	if len(p.peerInvalidationRetry.pending) != 0 {
+		return false
+	}
+	p.peerInvalidationRetry.started = false
+	p.peerInvalidationRetry.stop = nil
+	return true
 }
 
 func (p *Proxy) sendPeerInvalidation(ctx context.Context, peer peerrouter.Peer, target s3request.Target, epoch int64) error {

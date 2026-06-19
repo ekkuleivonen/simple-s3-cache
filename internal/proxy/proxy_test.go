@@ -2234,6 +2234,7 @@ func TestProxyBroadcastsInvalidationToAllPeersAfterFailure(t *testing.T) {
 	defer failingPeer.Close()
 
 	p := testProxy(t, "http://upstream.invalid")
+	defer p.stopPeerInvalidationRetryWorker()
 	enablePeerMode(t, p, "cache-0", []peerrouter.Peer{
 		{ID: "cache-0", URL: "http://cache-0.invalid"},
 		{ID: "cache-1", URL: failingPeer.URL},
@@ -2260,6 +2261,84 @@ func TestProxyBroadcastsInvalidationToAllPeersAfterFailure(t *testing.T) {
 		if !strings.Contains(metricsBody, want) {
 			t.Fatalf("metrics missing %q:\n%s", want, metricsBody)
 		}
+	}
+}
+
+func TestProxyRetriesQueuedPeerInvalidationAndClearsReadiness(t *testing.T) {
+	var attempts atomic.Int64
+	peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/internal/v1/invalidate" {
+			t.Fatalf("peer path = %q, want /internal/v1/invalidate", r.URL.Path)
+		}
+		if attempts.Add(1) == 1 {
+			http.Error(w, "try again", http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer peer.Close()
+
+	p := testProxy(t, "http://upstream.invalid")
+	defer p.stopPeerInvalidationRetryWorker()
+	enablePeerMode(t, p, "cache-0", []peerrouter.Peer{
+		{ID: "cache-0", URL: "http://cache-0.invalid"},
+		{ID: "cache-1", URL: peer.URL},
+	})
+
+	_, err := p.invalidateObject(context.Background(), s3request.Target{Bucket: "bucket", Key: "object.bin"})
+	if !errors.Is(err, errPeerInvalidationFailed) {
+		t.Fatalf("invalidateObject() error = %v, want peer invalidation failure", err)
+	}
+	if ready, reason := p.Readiness(); ready || !strings.Contains(reason, "peer invalidation") {
+		t.Fatalf("Readiness() = (%v, %q), want peer invalidation degradation", ready, reason)
+	}
+
+	if err := p.retryPendingPeerInvalidations(context.Background()); err != nil {
+		t.Fatalf("retryPendingPeerInvalidations() error = %v, want nil", err)
+	}
+
+	if got := attempts.Load(); got != 2 {
+		t.Fatalf("peer invalidation attempts = %d, want 2", got)
+	}
+	if ready, reason := p.Readiness(); !ready || reason != "" {
+		t.Fatalf("Readiness() = (%v, %q), want recovered readiness", ready, reason)
+	}
+	metricsBody := renderProxyMetrics(t, p.metrics)
+	if !strings.Contains(metricsBody, `simple_s3_cache_degraded 0`) {
+		t.Fatalf("metrics missing recovered degraded gauge:\n%s", metricsBody)
+	}
+}
+
+func TestProxyPeerInvalidationRecoveryDoesNotClearOtherDegradation(t *testing.T) {
+	var attempts atomic.Int64
+	peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if attempts.Add(1) == 1 {
+			http.Error(w, "try again", http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer peer.Close()
+
+	p := testProxy(t, "http://upstream.invalid")
+	defer p.stopPeerInvalidationRetryWorker()
+	enablePeerMode(t, p, "cache-0", []peerrouter.Peer{
+		{ID: "cache-0", URL: "http://cache-0.invalid"},
+		{ID: "cache-1", URL: peer.URL},
+	})
+
+	_, err := p.invalidateObject(context.Background(), s3request.Target{Bucket: "bucket", Key: "object.bin"})
+	if !errors.Is(err, errPeerInvalidationFailed) {
+		t.Fatalf("invalidateObject() error = %v, want peer invalidation failure", err)
+	}
+	p.markDegraded("local cache corruption")
+
+	if err := p.retryPendingPeerInvalidations(context.Background()); err != nil {
+		t.Fatalf("retryPendingPeerInvalidations() error = %v, want nil", err)
+	}
+
+	if ready, reason := p.Readiness(); ready || !strings.Contains(reason, "local cache corruption") {
+		t.Fatalf("Readiness() = (%v, %q), want local cache corruption degradation", ready, reason)
 	}
 }
 

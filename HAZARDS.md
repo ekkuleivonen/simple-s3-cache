@@ -265,10 +265,11 @@ test. Until then, treat it as load-bearing.
   guarantee.
 * **Mitigation:** Invalidation must be idempotent and broadcast to all peers.
   If invalidation cannot be confirmed after upstream write success, the handling
-  peer must fail readiness, emit loud logs, and expose metrics. This is not
-  sufficient by itself: every peer must either apply the invalidation/epoch
-  advance or become not-ready. Page commits and serves must remain fenced by ETag
-  and epoch.
+  peer must fail readiness, emit loud logs, expose metrics, and queue the missed
+  peer invalidation for bounded background retry. Readiness may recover only
+  after the queued peer invalidations are confirmed; every peer must either apply
+  the invalidation/epoch advance or become not-ready. Page commits and serves
+  must remain fenced by ETag and epoch.
 * **Watch:** Write paths that treat invalidation failure as a warning-only event;
   peers that keep passing readiness after consistency uncertainty; missing tests
   for partial invalidation failure.
