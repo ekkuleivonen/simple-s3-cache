@@ -159,6 +159,21 @@ type pendingPeerInvalidation struct {
 	epoch  int64
 }
 
+type invalidationRequestIDContextKey struct{}
+
+type peerInvalidationRequestError struct {
+	err                error
+	cancellationSource string
+}
+
+func (e peerInvalidationRequestError) Error() string {
+	return e.err.Error()
+}
+
+func (e peerInvalidationRequestError) Unwrap() error {
+	return e.err
+}
+
 type readStrategySelection struct {
 	configuredStrategy string
 	strategy           string
@@ -1407,7 +1422,8 @@ func (p *Proxy) handle(w http.ResponseWriter, r *http.Request, target s3request.
 		stats.cacheResult = "pass_through"
 		status, bytesWritten, err := p.forward(w, r, stats)
 		if err == nil && isSuccessfulStatus(status) && shouldInvalidateAfterWrite(r, target) {
-			invalidationCtx, cancel := p.detachedInvalidationContext(r.Context())
+			invalidationCtx := contextWithInvalidationRequestID(r.Context(), requestIDFromRequest(r))
+			invalidationCtx, cancel := p.detachedInvalidationContext(invalidationCtx)
 			defer cancel()
 			if _, deleteErr := p.invalidateObject(invalidationCtx, target); deleteErr != nil {
 				if !errors.Is(deleteErr, errPeerInvalidationFailed) {
@@ -1422,6 +1438,29 @@ func (p *Proxy) handle(w http.ResponseWriter, r *http.Request, target s3request.
 		}
 		return status, bytesWritten, err
 	}
+}
+
+func contextWithInvalidationRequestID(ctx context.Context, requestID string) context.Context {
+	requestID = strings.TrimSpace(requestID)
+	if requestID == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, invalidationRequestIDContextKey{}, requestID)
+}
+
+func requestIDFromRequest(r *http.Request) string {
+	for _, header := range []string{
+		"X-Request-Id",
+		"X-Request-ID",
+		"X-Correlation-ID",
+		"X-Amz-Request-Id",
+		"X-Amz-Id-2",
+	} {
+		if value := strings.TrimSpace(r.Header.Get(header)); value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func (p *Proxy) detachedInvalidationContext(parent context.Context) (context.Context, context.CancelFunc) {
@@ -1493,18 +1532,15 @@ func (p *Proxy) broadcastInvalidation(ctx context.Context, target s3request.Targ
 		}
 		start := time.Now()
 		if err := p.sendPeerInvalidation(ctx, peer, target, epoch); err != nil {
+			duration := time.Since(start)
 			if p.metrics != nil {
 				p.metrics.RecordInvalidationBroadcast(target.Bucket, peer.ID, "failure")
-				p.metrics.ObserveInvalidationBroadcastDuration(target.Bucket, peer.ID, "failure", time.Since(start))
+				p.metrics.ObserveInvalidationBroadcastDuration(target.Bucket, peer.ID, "failure", duration)
 			}
 			p.markDegradedWithContext("peer invalidation failed", map[string]string{"bucket": target.Bucket})
 			p.enqueuePeerInvalidationRetry(peer, target, epoch)
-			p.logger.ErrorContext(ctx, "peer invalidation failed",
-				slog.String("bucket", target.Bucket),
-				slog.String("key", target.Key),
-				slog.Int64("epoch", epoch),
-				slog.String("peer_id", peer.ID),
-				slog.String("error", err.Error()),
+			p.logger.LogAttrs(ctx, slog.LevelError, "peer invalidation failed",
+				peerInvalidationFailureAttrs(ctx, target, peer, epoch, duration, err)...,
 			)
 			failures = append(failures, err)
 			continue
@@ -1612,17 +1648,14 @@ func (p *Proxy) retryPendingPeerInvalidations(ctx context.Context) error {
 	for _, item := range pending {
 		start := time.Now()
 		if err := p.sendPeerInvalidation(ctx, item.peer, item.target, item.epoch); err != nil {
+			duration := time.Since(start)
 			if p.metrics != nil {
 				p.metrics.RecordInvalidationBroadcast(item.target.Bucket, item.peer.ID, "failure")
-				p.metrics.ObserveInvalidationBroadcastDuration(item.target.Bucket, item.peer.ID, "failure", time.Since(start))
+				p.metrics.ObserveInvalidationBroadcastDuration(item.target.Bucket, item.peer.ID, "failure", duration)
 			}
 			if p.logger != nil {
-				p.logger.WarnContext(ctx, "peer invalidation retry failed",
-					slog.String("bucket", item.target.Bucket),
-					slog.String("key", item.target.Key),
-					slog.Int64("epoch", item.epoch),
-					slog.String("peer_id", item.peer.ID),
-					slog.String("error", err.Error()),
+				p.logger.LogAttrs(ctx, slog.LevelWarn, "peer invalidation retry failed",
+					peerInvalidationFailureAttrs(ctx, item.target, item.peer, item.epoch, duration, err)...,
 				)
 			}
 			failures = append(failures, err)
@@ -1687,6 +1720,7 @@ func (p *Proxy) finishPeerInvalidationRetryWorkerIfIdle() bool {
 }
 
 func (p *Proxy) sendPeerInvalidation(ctx context.Context, peer peerrouter.Peer, target s3request.Target, epoch int64) error {
+	parentCtx := ctx
 	body := internalInvalidateRequest{
 		Bucket: target.Bucket,
 		Key:    target.Key,
@@ -1718,13 +1752,69 @@ func (p *Proxy) sendPeerInvalidation(ctx context.Context, peer peerrouter.Peer, 
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return err
+		return peerInvalidationRequestError{
+			err:                err,
+			cancellationSource: classifyPeerInvalidationCancellation(parentCtx, ctx, err),
+		}
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		return fmt.Errorf("peer %s invalidation returned status %d", peer.ID, resp.StatusCode)
 	}
 	return nil
+}
+
+func peerInvalidationFailureAttrs(ctx context.Context, target s3request.Target, peer peerrouter.Peer, epoch int64, duration time.Duration, err error) []slog.Attr {
+	attrs := []slog.Attr{
+		slog.String("bucket", target.Bucket),
+		slog.String("key", target.Key),
+		slog.String("object_key_sha256", objectKeyHash(target)),
+		slog.Int64("epoch", epoch),
+		slog.String("peer_id", peer.ID),
+		slog.Int64("peer_invalidation_duration_ms", duration.Milliseconds()),
+		slog.String("cancellation_source", peerInvalidationCancellationSource(err)),
+		slog.String("error", err.Error()),
+	}
+	if requestID, ok := ctx.Value(invalidationRequestIDContextKey{}).(string); ok && strings.TrimSpace(requestID) != "" {
+		attrs = append(attrs, slog.String("request_id", strings.TrimSpace(requestID)))
+	}
+	return attrs
+}
+
+func objectKeyHash(target s3request.Target) string {
+	hash := sha256.Sum256([]byte(target.Bucket + "\x00" + target.Key))
+	return hex.EncodeToString(hash[:])
+}
+
+func classifyPeerInvalidationCancellation(parentCtx, requestCtx context.Context, err error) string {
+	switch {
+	case errors.Is(err, context.Canceled):
+		if errors.Is(parentCtx.Err(), context.Canceled) {
+			return "parent_context_canceled"
+		}
+		if errors.Is(requestCtx.Err(), context.Canceled) {
+			return "peer_request_canceled"
+		}
+		return "context_canceled"
+	case errors.Is(err, context.DeadlineExceeded):
+		if errors.Is(parentCtx.Err(), context.DeadlineExceeded) {
+			return "parent_context_deadline_exceeded"
+		}
+		if errors.Is(requestCtx.Err(), context.DeadlineExceeded) {
+			return "peer_timeout"
+		}
+		return "deadline_exceeded"
+	default:
+		return "none"
+	}
+}
+
+func peerInvalidationCancellationSource(err error) string {
+	var requestErr peerInvalidationRequestError
+	if errors.As(err, &requestErr) && requestErr.cancellationSource != "" {
+		return requestErr.cancellationSource
+	}
+	return "none"
 }
 
 func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, stats *requestStats) (int, int64, error) {

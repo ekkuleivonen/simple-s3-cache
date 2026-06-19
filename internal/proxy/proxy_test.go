@@ -2264,6 +2264,99 @@ func TestProxyBroadcastsInvalidationToAllPeersAfterFailure(t *testing.T) {
 	}
 }
 
+func TestProxyPeerInvalidationFailureLogsDiagnostics(t *testing.T) {
+	var logs bytes.Buffer
+	failingPeer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/internal/v1/invalidate" {
+			t.Fatalf("peer path = %q, want /internal/v1/invalidate", r.URL.Path)
+		}
+		http.Error(w, "nope", http.StatusInternalServerError)
+	}))
+	defer failingPeer.Close()
+
+	p := testProxy(t, "http://upstream.invalid")
+	defer p.stopPeerInvalidationRetryWorker()
+	p.logger = slog.New(slog.NewJSONHandler(&logs, nil))
+	enablePeerMode(t, p, "cache-0", []peerrouter.Peer{
+		{ID: "cache-0", URL: "http://cache-0.invalid"},
+		{ID: "cache-1", URL: failingPeer.URL},
+	})
+	target := s3request.Target{Bucket: "bucket", Key: "private/object.bin"}
+	ctx := contextWithInvalidationRequestID(context.Background(), "req-123")
+
+	_, err := p.invalidateObject(ctx, target)
+	if !errors.Is(err, errPeerInvalidationFailed) {
+		t.Fatalf("invalidateObject() error = %v, want peer invalidation failure", err)
+	}
+
+	logBody := logs.String()
+	for _, want := range []string{
+		`"msg":"peer invalidation failed"`,
+		`"bucket":"bucket"`,
+		`"key":"private/object.bin"`,
+		`"object_key_sha256":"` + objectKeyHash(target) + `"`,
+		`"epoch":1`,
+		`"peer_id":"cache-1"`,
+		`"request_id":"req-123"`,
+		`"cancellation_source":"none"`,
+		`"error":"peer cache-1 invalidation returned status 500"`,
+	} {
+		if !strings.Contains(logBody, want) {
+			t.Fatalf("logs missing %q:\n%s", want, logBody)
+		}
+	}
+}
+
+func TestProxyPeerInvalidationDiagnosticsClassifyCanceledParentContext(t *testing.T) {
+	var logs bytes.Buffer
+
+	p := testProxy(t, "http://upstream.invalid")
+	defer p.stopPeerInvalidationRetryWorker()
+	p.logger = slog.New(slog.NewJSONHandler(&logs, nil))
+	enablePeerMode(t, p, "cache-0", []peerrouter.Peer{
+		{ID: "cache-0", URL: "http://cache-0.invalid"},
+		{ID: "cache-1", URL: "http://cache-1.invalid"},
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := p.broadcastInvalidation(ctx, s3request.Target{Bucket: "bucket", Key: "object.bin"}, 7)
+	if err == nil {
+		t.Fatal("broadcastInvalidation() error = nil, want canceled context error")
+	}
+
+	if !strings.Contains(logs.String(), `"cancellation_source":"parent_context_canceled"`) {
+		t.Fatalf("logs missing parent context cancellation source:\n%s", logs.String())
+	}
+}
+
+func TestProxyPeerInvalidationDiagnosticsClassifyPeerTimeout(t *testing.T) {
+	var logs bytes.Buffer
+	peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(50 * time.Millisecond)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer peer.Close()
+
+	p := testProxy(t, "http://upstream.invalid")
+	defer p.stopPeerInvalidationRetryWorker()
+	p.logger = slog.New(slog.NewJSONHandler(&logs, nil))
+	enablePeerMode(t, p, "cache-0", []peerrouter.Peer{
+		{ID: "cache-0", URL: "http://cache-0.invalid"},
+		{ID: "cache-1", URL: peer.URL},
+	})
+	p.peerTimeout = time.Millisecond
+
+	err := p.broadcastInvalidation(context.Background(), s3request.Target{Bucket: "bucket", Key: "object.bin"}, 7)
+	if err == nil {
+		t.Fatal("broadcastInvalidation() error = nil, want timeout error")
+	}
+
+	if !strings.Contains(logs.String(), `"cancellation_source":"peer_timeout"`) {
+		t.Fatalf("logs missing peer timeout cancellation source:\n%s", logs.String())
+	}
+}
+
 func TestProxyRetriesQueuedPeerInvalidationAndClearsReadiness(t *testing.T) {
 	var attempts atomic.Int64
 	peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
