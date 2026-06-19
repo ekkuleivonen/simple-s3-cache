@@ -165,14 +165,22 @@ prometheusRule:
   enabled: false
   labels: {}
   rules:
+    - alert: SimpleS3CachePeerInvalidationDegraded
+      expr: simple_s3_cache_degraded{reason_code="peer_invalidation_failed"} > 0
+      for: 2m
+      labels:
+        severity: critical
+      annotations:
+        summary: simple-s3-cache peer is quarantined after invalidation uncertainty
+        description: A cache peer is not-ready because a peer invalidation could not be confirmed. Check failed invalidation broadcasts, writer pod logs, and peer readiness before treating this as peer unavailability; restart only if bounded retries do not recover readiness.
     - alert: SimpleS3CachePeerDegraded
-      expr: simple_s3_cache_degraded > 0
+      expr: simple_s3_cache_degraded{reason_code!="peer_invalidation_failed"} > 0
       for: 2m
       labels:
         severity: critical
       annotations:
         summary: simple-s3-cache peer is degraded
-        description: 'Peer {{ $labels.local_id }} is degraded with reason {{ $labels.reason_code }}.'
+        description: 'A cache peer is degraded with reason {{ $labels.reason_code }}.'
     - alert: SimpleS3CacheInvalidationFailures
       expr: increase(simple_s3_cache_invalidation_broadcasts_total{status="failure"}[5m]) > 0
       for: 1m
@@ -180,7 +188,7 @@ prometheusRule:
         severity: critical
       annotations:
         summary: simple-s3-cache invalidation broadcast failed
-        description: A cache peer failed to apply an invalidation broadcast.
+        description: 'A cache peer could not confirm invalidation with peer {{ $labels.peer_id }} for bucket {{ $labels.bucket }}. Correlate with simple_s3_cache_degraded{reason_code="peer_invalidation_failed"} and writer logs before restarting; readiness may recover after retry confirms the missed invalidation.'
     - alert: SimpleS3CachePeerReadFallbacks
       expr: increase(simple_s3_cache_peer_read_fallbacks_total[10m]) > 0
       for: 5m

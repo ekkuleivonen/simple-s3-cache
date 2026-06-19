@@ -166,10 +166,22 @@ Set `prometheusRule.enabled: true` to install starter alerts for degraded peers,
 invalidation failures, and peer-read fallbacks. Treat them as a baseline and tune
 durations/severity for your cluster.
 
+When `simple_s3_cache_degraded{reason_code="peer_invalidation_failed"}` fires,
+treat the peer as self-quarantined because a post-write invalidation could not be
+confirmed. First check `simple_s3_cache_invalidation_broadcasts_total{status="failure"}`
+by `peer_id` and `bucket`, then inspect the writer pod logs for the failed
+`/internal/v1/invalidate` request and whether the error was a parent request
+cancellation, peer timeout, ring mismatch, or peer-side rejection. Compare that
+with the target peer's `/readyz`, `/healthz`, and metrics before declaring the
+target peer unavailable. Restart the quarantined peer only if bounded retry does
+not clear readiness; restart is a safe recovery because cache state is
+disposable, but it also starts cold and can temporarily increase upstream load.
+
 Useful dashboard snippets:
 
 ```promql
-sum by (local_id, reason_code) (simple_s3_cache_degraded)
+sum by (reason_code) (simple_s3_cache_degraded)
+sum by (peer_id, bucket) (increase(simple_s3_cache_invalidation_broadcasts_total{status="failure"}[5m]))
 sum by (bucket, cache_status) (rate(simple_s3_cache_cache_bytes_total[5m]))
 sum by (owner_id, status_class) (rate(simple_s3_cache_page_owner_requests_total[5m]))
 histogram_quantile(0.95, sum by (le) (rate(simple_s3_cache_internal_peer_request_duration_seconds_bucket[5m])))
