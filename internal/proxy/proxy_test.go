@@ -2342,6 +2342,29 @@ func TestProxyPeerInvalidationRecoveryDoesNotClearOtherDegradation(t *testing.T)
 	}
 }
 
+func TestProxyPeerInvalidationRecoveryDoesNotClearUntrackedFailure(t *testing.T) {
+	p := testProxy(t, "http://upstream.invalid")
+	defer p.stopPeerInvalidationRetryWorker()
+	enablePeerMode(t, p, "cache-0", []peerrouter.Peer{
+		{ID: "cache-0", URL: "http://cache-0.invalid"},
+		{ID: "cache-1", URL: "http://cache-1.invalid"},
+	})
+	p.markDegraded("peer invalidation failed")
+
+	p.peerInvalidationRetry.mu.Lock()
+	p.peerInvalidationRetry.pending = make(map[peerInvalidationRetryKey]pendingPeerInvalidation)
+	p.peerInvalidationRetry.untracked = true
+	p.peerInvalidationRetry.mu.Unlock()
+
+	if err := p.retryPendingPeerInvalidations(context.Background()); err != nil {
+		t.Fatalf("retryPendingPeerInvalidations() error = %v, want nil", err)
+	}
+
+	if ready, reason := p.Readiness(); ready || !strings.Contains(reason, "peer invalidation") {
+		t.Fatalf("Readiness() = (%v, %q), want peer invalidation degradation", ready, reason)
+	}
+}
+
 func TestProxyPostWriteInvalidationIgnoresCanceledRequestContext(t *testing.T) {
 	var peerInvalidations int
 	peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

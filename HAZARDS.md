@@ -272,7 +272,8 @@ test. Until then, treat it as load-bearing.
   must remain fenced by ETag and epoch.
 * **Watch:** Write paths that treat invalidation failure as a warning-only event;
   peers that keep passing readiness after consistency uncertainty; missing tests
-  for partial invalidation failure.
+  for partial invalidation failure; retry queue overflow that clears readiness
+  without confirming every missed peer invalidation.
 
 ### H19. Distributed read fallback stores or reroutes incorrectly
 

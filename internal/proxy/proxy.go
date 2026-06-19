@@ -140,10 +140,11 @@ type Proxy struct {
 }
 
 type peerInvalidationRetryState struct {
-	mu      sync.Mutex
-	pending map[peerInvalidationRetryKey]pendingPeerInvalidation
-	stop    chan struct{}
-	started bool
+	mu        sync.Mutex
+	pending   map[peerInvalidationRetryKey]pendingPeerInvalidation
+	untracked bool
+	stop      chan struct{}
+	started   bool
 }
 
 type peerInvalidationRetryKey struct {
@@ -1534,6 +1535,7 @@ func (p *Proxy) enqueuePeerInvalidationRetry(peer peerrouter.Peer, target s3requ
 		return
 	}
 	if _, ok := p.peerInvalidationRetry.pending[key]; !ok && len(p.peerInvalidationRetry.pending) >= peerInvalidationRetryLimit {
+		p.peerInvalidationRetry.untracked = true
 		p.peerInvalidationRetry.mu.Unlock()
 		if p.logger != nil {
 			p.logger.Error("peer invalidation retry queue full",
@@ -1663,8 +1665,9 @@ func (p *Proxy) removePendingPeerInvalidation(done pendingPeerInvalidation) {
 func (p *Proxy) clearPeerInvalidationDegradedIfRecovered() {
 	p.peerInvalidationRetry.mu.Lock()
 	empty := len(p.peerInvalidationRetry.pending) == 0
+	untracked := p.peerInvalidationRetry.untracked
 	p.peerInvalidationRetry.mu.Unlock()
-	if !empty {
+	if !empty || untracked {
 		return
 	}
 	if p.clearDegradedIfCode("peer_invalidation_failed") && p.logger != nil {
